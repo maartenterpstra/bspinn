@@ -152,7 +152,7 @@ ul.plain { margin: 0; padding-left: 18px; display: grid; gap: 6px; color: var(--
 
   <section aria-labelledby="h-3d" id="sec-3d" hidden>
     <div class="sec-head"><div class="eyebrow">3-D encoding</div><h2 id="h-3d">Volumetric data</h2>
-      <p class="note">3-D Cartesian k-space, 3-D FFTs, a 12³ calibration block for every method, the field and its Laplace penalty fitted through the whole volume. SENSE uses 2-D undersampling over the two phase-encoding axes (R₁ × R₂, plus the ACS block).</p></div>
+      <p class="note">The two full-wave cases test the wave-aware (Helmholtz) model: fields that obey Maxwell's equations in conductive tissue, not the quasi-static Biot–Savart law. 3-D Cartesian k-space, 3-D FFTs, a 12³ calibration block for every method, the field and its Laplace penalty fitted through the whole volume. SENSE uses 2-D undersampling over the two phase-encoding axes (R₁ × R₂, plus the ACS block).</p></div>
     <div class="tabs" role="tablist" id="tabs3"></div>
     <p class="case-desc" id="case-desc3"></p>
     <div class="table-wrap"><table id="tbl3"></table></div>
@@ -223,7 +223,7 @@ python scripts/build_eval_report.py --eval runs/eval --findings runs/eval/findin
 const D = /*__DATA__*/null;
 const SLOT = {lowres: 1, walsh: 2, inati: 3, espirit: 4, nlinv: 5, free: 6, bs_wires: 7, bs_pinn: 8};
 const ABL = new Set(["bs_pinn_grid1"]);
-function colorOf(m) { if (m === "oracle") return "var(--ref-series)"; if (m === "bs_pinn_complex") return "var(--s8)"; if (ABL.has(m)) return "var(--abl-series)"; return `var(--s${SLOT[m]})`; }
+function colorOf(m) { if (m === "oracle") return "var(--ref-series)"; if (m === "bs_pinn_complex") return "var(--s8)"; if (m === "bs_helmholtz" || m === "bs_helmholtz_fixed") return "var(--s6)"; if (ABL.has(m)) return "var(--abl-series)"; return `var(--s${SLOT[m]})`; }
 function resolveColor(m) { const v = colorOf(m); const n = v.match(/var\((--[\w-]+)\)/); return n ? getComputedStyle(document.documentElement).getPropertyValue(n[1]).trim() : v; }
 const L = m => D.labels[m] || (D.three && D.three.labels[m]) || m;
 const get = (c, m, k) => { const r = D.metrics[c] && D.metrics[c][m]; return r ? r[k] : undefined; };
@@ -367,7 +367,7 @@ function lineChart(card, cfg) {
       if (!pts.length) return;
       const col = resolveColor(s.key);
       g("path", {d: pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(""), fill: "none", stroke: col,
-                 "stroke-width": s.key === "bs_pinn" ? 2.5 : 2, "stroke-dasharray": s.key === "oracle" ? "5 4" : ABL.has(s.key) ? "2 3" : s.key === "bs_pinn_complex" ? "7 3" : "none", "stroke-linejoin": "round", "stroke-linecap": "round"});
+                 "stroke-width": s.key === "bs_pinn" ? 2.5 : 2, "stroke-dasharray": s.key === "oracle" ? "5 4" : ABL.has(s.key) ? "2 3" : (s.key === "bs_pinn_complex" || s.key === "bs_helmholtz_fixed") ? "7 3" : "none", "stroke-linejoin": "round", "stroke-linecap": "round"});
       pts.forEach(p => g("circle", {cx: X(p[0]), cy: Y(p[1]), r: 3.2, fill: col, stroke: getComputedStyle(document.body).backgroundColor, "stroke-width": 1.5}));
     });
     const cross = g("line", {x1: 0, x2: 0, y1: m.t, y2: H - m.b, stroke: "currentColor", "stroke-opacity": 0, "stroke-width": 1});
@@ -556,8 +556,8 @@ function render3() {
   document.getElementById("figs3").innerHTML = im ? `<figure><img src="${im}" alt="3-D results for ${info.label}"><figcaption>Rows: SENSE at R = 2×2 with common support, central slice along the first axis and orthogonal slice (scaled to the reference, left); one coil's normalised map, magnitude and phase (object outline in white).</figcaption></figure>` : "";
 }
 function nameCell3(m) {
-  const col = m === "bs_pinn_complex" ? "var(--s8)" : colorOf(m);
-  const style = m === "bs_pinn_complex" ? `background:repeating-linear-gradient(90deg, ${col} 0 4px, transparent 4px 6px)` : `background:${col}`;
+  const col = colorOf(m);
+  const style = (m === "bs_pinn_complex" || m === "bs_helmholtz_fixed") ? `background:repeating-linear-gradient(90deg, ${col} 0 4px, transparent 4px 6px)` : `background:${col}`;
   return `<span class="mname"><span class="swatch${m === "oracle" ? " dash" : ""}" style="${style}"></span>${(D.three.labels[m] || m)}</span>`;
 }
 function logBars(cardEl, rows, label) {
@@ -568,7 +568,7 @@ function logBars(cardEl, rows, label) {
   for (let e = lo; e <= hi; e++) s += `<line class="grid" x1="${X(10 ** e)}" x2="${X(10 ** e)}" y1="${m.t}" y2="${H - m.b}"/><text x="${X(10 ** e)}" y="${H - m.b + 14}" text-anchor="middle">1e${e}</text>`;
   rows.forEach(([k, v], i) => { const y = m.t + i * rowH + 5;
     s += `<text x="${m.l - 8}" y="${y + 12}" text-anchor="end" style="font-family:var(--f-body);fill:var(--ink-2);font-size:11.5px">${D.three.labels[k] || k}</text>`;
-    s += `<rect x="${X(10 ** lo)}" y="${y}" width="${Math.max(1, X(v) - X(10 ** lo))}" height="${rowH - 10}" rx="3" fill="${resolveColor(k === "bs_pinn_complex" ? "bs_pinn" : k)}" ${k === "bs_pinn_complex" ? 'fill-opacity="0.55"' : ""}><title>${v.toExponential(2)}</title></rect>`;
+    s += `<rect x="${X(10 ** lo)}" y="${y}" width="${Math.max(1, X(v) - X(10 ** lo))}" height="${rowH - 10}" rx="3" fill="${resolveColor(k)}" ${(k === "bs_pinn_complex" || k === "bs_helmholtz_fixed") ? 'fill-opacity="0.55"' : ""}><title>${v.toExponential(2)}</title></rect>`;
     s += `<text x="${X(v) + 5}" y="${y + 12}">${fmtSci(v)}</text>`; });
   s += `<text class="axis-title" x="${(m.l + W - m.r) / 2}" y="${H - 4}" text-anchor="middle">${label}</text></svg>`;
   cardEl.insertAdjacentHTML("beforeend", s);

@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 import torch
+import torch.utils.checkpoint
 from torch import nn
 
 from .physics import biot_savart_polyline, grad, transverse_to_sensitivity
@@ -327,3 +330,210 @@ class FreeMaps(CoilModel):
         C = self._eval(x)
         g2 = grad(C.real, x).pow(2).sum(-1) + grad(C.imag, x).pow(2).sum(-1)
         return g2.mean() / (C.abs() ** 2).mean().detach().clamp_min(1e-12)
+
+
+# ======================================================================================
+class WaveWireLoopCoils(WireLoopCoils):
+    """Wire loops radiating in a homogeneous lossy medium (time-harmonic, e^{+i omega t}).
+
+    Each current element I dl contributes dB = (1 + i k R) e^{-ikR} (dl x R) / R^3 (units mu0 I / 4 pi):
+    the exact field of a current element in a medium of complex wavenumber k, so the total satisfies
+    div B = 0 and lap B + k^2 B = 0 everywhere away from the wires. Computed as the closed-form
+    Biot-Savart field plus a Gauss-Legendre quadrature of the (non-singular) difference; k^2 = 0 gives
+    exactly the quasi-static model. One complex k^2 for all coils, learnable. The k^2/(2r) term is also
+    closed form; only the bounded remainder is integrated numerically (and, in 3-D training, on a coarse grid)."""
+
+    def __init__(self, n_coils, loops_per_coil=1, verts_per_loop=12, handedness=1, k2_init: complex = 0j,
+                 learn_k2: bool = True, n_quad: int = 3, chunk: int = 2048):
+        super().__init__(n_coils, loops_per_coil, verts_per_loop, handedness)
+        self.k2_re = nn.Parameter(torch.tensor(float(complex(k2_init).real)), requires_grad=learn_k2)
+        self.k2_im = nn.Parameter(torch.tensor(float(complex(k2_init).imag)), requires_grad=learn_k2)
+        t, w = np.polynomial.legendre.leggauss(n_quad)
+        self.register_buffer("qt", torch.tensor((t + 1) / 2, dtype=torch.float32))
+        self.register_buffer("qw", torch.tensor(w / 2, dtype=torch.float32))
+        self.chunk = chunk
+        self.coarse = None      # (fine_points, coarse_points, fine_shape, coarse_shape): set by the 3-D problem
+
+    @property
+    def k2(self) -> complex:
+        return complex(float(self.k2_re.detach()), float(self.k2_im.detach()))
+
+    def _k(self):
+        k = torch.sqrt(torch.complex(self.k2_re, self.k2_im))
+        return torch.where(k.imag > 0, -k, k)                         # outgoing, decaying
+
+    def field(self, points, create_graph=True, verts=None):
+        """(N,P,3,2): real and imaginary parts of the complex field."""
+        static = super().field(points, create_graph, verts)[..., 0]  # (N,P,3) real
+        static = static + self._wave_1r(points, verts)                # closed-form k^2/(2r) term (complex)
+        if self.coarse is not None and points is self.coarse[0] and verts is None:
+            # the wave part is smooth (non-singular): evaluate it on the coarse grid, upsample trilinearly
+            _, pc, fs, cs = self.coarse
+            w = self._wave(pc, create_graph, None)                    # (N,Pc,3) complex
+            g = torch.view_as_real(w).reshape(w.shape[0], *cs, 6).permute(0, 4, 1, 2, 3)
+            g = torch.nn.functional.interpolate(g, size=fs, mode="trilinear", align_corners=True)
+            w = torch.view_as_complex(g.permute(0, 2, 3, 4, 1).reshape(w.shape[0], -1, 3, 2).contiguous())
+        else:
+            w = self._wave(points, create_graph, verts)
+        B = static + w
+        return torch.stack([B.real, B.imag], -1)
+
+    def _wave_1r(self, points, verts):
+        """Leading term of the wave kernel, k^2/(2r): along a straight segment dl x R = d x (P - A) is
+        constant, and int_0^1 dt / |P - A - t d| has a closed form (as Biot-Savart's segment formula)."""
+        V = self.verts if verts is None else verts
+        A = V.unsqueeze(-2)
+        d = (torch.roll(V, -1, dims=-2) - V).unsqueeze(-2)              # (N,L,M,1,3)
+        pts = points[:, None, None] if points.dim() == 3 else points
+        a = pts - A                                                    # (N,L,M,P,3) = P - A
+        b = a - d                                                      # P - B
+        nd = d.norm(dim=-1)
+        na, nb = a.norm(dim=-1), b.norm(dim=-1)
+        ad = (a * d).sum(-1)
+        I = torch.log((nd * nb + nd * nd - ad).clamp_min(1e-12) / (nd * na - ad).clamp_min(1e-12)) / nd
+        v = (torch.linalg.cross(d.expand_as(a), a) * I[..., None]).sum(-3)   # (N,L,P,3)
+        v = (v * self.amp[..., None, None]).sum(-3)                       # (N,P,3)
+        k2 = torch.complex(self.k2_re, self.k2_im)
+        return 0.5 * k2 * v
+
+    def _wave(self, points, create_graph, verts):
+        """Smooth remainder of the wave kernel, ((1 + ikr) e^{-ikr} - 1 - (kr)^2/2) / r^3 (bounded),
+        by Gauss-Legendre quadrature along each segment."""
+        V = self.verts if verts is None else verts                    # (N,L,M,3)
+        d = torch.roll(V, -1, dims=-2) - V
+        pos = V[..., None, :] + self.qt[:, None] * d[..., None, :]    # (N,L,M,Q,3)
+        dl = d[..., None, :] * self.qw[:, None]
+        k = self._k()
+        per_coil = points.dim() == 3
+        P = points.shape[-2]
+
+        def part(pts, pos, dl, k, amp):
+            R = pts - pos[..., None, :]                                            # (N,L,M,Q,p,3)
+            r = R.norm(dim=-1)
+            kr = k * r
+            f = ((1 + 1j * kr) * torch.exp(-1j * kr) - 1 - 0.5 * kr * kr) / r ** 3  # bounded remainder
+            cr = torch.linalg.cross(dl[..., None, :].expand_as(R), R)
+            dB = (f[..., None] * cr).sum((-4, -3))                                 # (N,L,p,3)
+            return (dB * amp[..., None, None]).sum(-3)                             # (N,p,3)
+
+        out = []
+        grad_on = torch.is_grad_enabled()
+        for i in range(0, P, self.chunk):
+            pts = points[:, i:i + self.chunk][:, None, None, None] if per_coil else points[i:i + self.chunk]
+            if grad_on and not create_graph:
+                out.append(torch.utils.checkpoint.checkpoint(part, pts, pos, dl, k, self.amp, use_reentrant=False))
+            else:   # recompute-in-backward keeps memory flat; double backward (physics) needs the plain graph
+                out.append(part(pts, pos, dl, k, self.amp))
+        return torch.cat(out, -2)
+
+
+# ======================================================================================
+def tissue_k2(b0_tesla: float, eps_r: float, sigma: float, half_fov_m: float) -> complex:
+    """Complex wavenumber squared of homogeneous tissue at the proton Larmor frequency, in the
+    normalised coordinates of the fit (lengths in units of the half field of view):
+    k^2 = (omega^2 mu0 eps0 eps_r - i omega mu0 sigma) * L^2   (time dependence e^{+i omega t})."""
+    mu0, eps0 = 4e-7 * math.pi, 8.8541878128e-12
+    w = 2 * math.pi * 42.577478e6 * b0_tesla
+    return complex(w * w * mu0 * eps0 * eps_r, -w * mu0 * sigma) * half_fov_m ** 2
+
+
+def k2_to_tissue(k2: complex, b0_tesla: float, half_fov_m: float):
+    """Inverse of ``tissue_k2``: (relative permittivity, conductivity S/m) of the homogeneous medium."""
+    mu0, eps0 = 4e-7 * math.pi, 8.8541878128e-12
+    w = 2 * math.pi * 42.577478e6 * b0_tesla
+    k2 = complex(k2) / half_fov_m ** 2
+    return k2.real / (w * w * mu0 * eps0), -k2.imag / (w * mu0)
+
+
+class HelmholtzPINN(CoilModel):
+    """Wave-aware coil field for heterogeneous-free (homogeneous) tissue.
+
+    B = B_wires + B_c. The wire field is the quasi-static (free-space) incident field of the fitted
+    loops, carrying the receive phase e^{i theta}; the network outputs the complex vector correction
+    B_c (the field scattered by the tissue's displacement and conduction currents) directly, so no
+    derivative is needed to evaluate the maps. Physics, at collocation points inside the object:
+
+        lap B_c + k^2 (B_c + B_wires) = 0     (vector Helmholtz for the total field; lap B_wires = 0)
+        div B_c = 0
+
+    with one complex k^2 for the object (learned from ``k2_init`` or fixed). Reduces to the complex-
+    field Laplace model for k^2 = 0."""
+
+    def __init__(self, n_coils: int, latent_dim: int = 16, width: int = 64, depth: int = 4, handedness: int = 1,
+                 base: WireLoopCoils | None = None, k2_init: complex = 0j, learn_k2: bool = True, lambda_div: float = 1.0):
+        super().__init__()
+        self.n_coils, self.handedness, self.field_mode = n_coils, handedness, "complex"
+        self.K = 2
+        self.base = base
+        self.codes = nn.Parameter(0.5 * torch.randn(n_coils, latent_dim))
+        self.net = make_trunk(3 + latent_dim, width, depth, 6)
+        nn.init.zeros_(self.net[-1].weight)
+        self.wave_base = base is not None and hasattr(base, "k2_re")
+        if self.wave_base:                      # one k^2 shared by the wave wires and the correction
+            self.k2_re, self.k2_im = base.k2_re, base.k2_im
+        else:
+            self.k2_re = nn.Parameter(torch.tensor(float(complex(k2_init).real)), requires_grad=learn_k2)
+            self.k2_im = nn.Parameter(torch.tensor(float(complex(k2_init).imag)), requires_grad=learn_k2)
+        self.lambda_div = lambda_div
+
+    @property
+    def k2(self) -> complex:
+        return complex(float(self.k2_re.detach()), float(self.k2_im.detach()))
+
+    def gain(self):
+        return torch.ones(self.n_coils, dtype=torch.complex64, device=self.codes.device)
+
+    def _base_field(self, x):
+        if self.base is None:
+            return None
+        Bw = self.base.field(x, create_graph=False)                      # (N,P,3,1) real or (N,P,3,2)
+        th = self.base.theta
+        c, s_ = torch.cos(th)[:, None, None], torch.sin(th)[:, None, None]
+        if Bw.shape[-1] == 1:
+            return torch.cat([Bw * c[..., None], Bw * s_[..., None]], -1)
+        re, im = Bw[..., 0], Bw[..., 1]
+        return torch.stack([re * c - im * s_, re * s_ + im * c], -1)
+
+    def _net(self, x):
+        z = self.codes[:, None, :].expand(-1, x.shape[1], -1)
+        out = self.net(torch.cat([x, z], dim=-1))                         # (N,P,6)
+        return out.reshape(*out.shape[:-1], 3, 2)
+
+    def correction_field(self, points, create_graph=True):
+        x = points.unsqueeze(0).expand(self.n_coils, -1, -1) if points.dim() == 2 else points
+        return self._net(x)
+
+    def field(self, points, create_graph=True):
+        x = points.unsqueeze(0).expand(self.n_coils, -1, -1) if points.dim() == 2 else points
+        Bc = self._net(x)
+        Bw = self._base_field(x)
+        return Bc if Bw is None else Bc + Bw
+
+    def physics_loss(self, points):
+        """mean|lap B_c + k^2 B_total|^2 / (mean|B_total|^2 max(|k^2|^2, 1)) + lambda_div mean|div B_c|^2 / mean|B_total|^2."""
+        from .physics import grad
+        x = points.detach().unsqueeze(0).repeat(self.n_coils, 1, 1).requires_grad_(True)
+        Bc = self._net(x)                                                  # (N,P,3,2)
+        Bw = self._base_field(x)
+        Bt = Bc if Bw is None else Bc + Bw.detach()
+        # wave wires already solve the Helmholtz equation: only the correction enters the residual;
+        # quasi-static wires are harmonic, so their k^2 B_w term remains as a source
+        Br = Bc if (Bw is None or self.wave_base) else Bt
+        a, b = self.k2_re, self.k2_im
+        res = 0.0
+        div = [0.0, 0.0]
+        for d in range(3):
+            lap = []
+            for p in range(2):
+                g = grad(Bc[..., d, p], x)
+                div[p] = div[p] + g[..., d]
+                lap.append(sum(grad(g[..., e], x)[..., e] for e in range(3)))
+            fr, fi = Br[..., d, 0], Br[..., d, 1]
+            rr = lap[0] + a * fr - b * fi
+            ri = lap[1] + a * fi + b * fr
+            res = res + rr.pow(2) + ri.pow(2)
+        den = Bt.pow(2).sum((-1, -2)).mean(1).detach().clamp_min(1e-12)       # per coil
+        kk = max(abs(self.k2) ** 2, 1.0)
+        helm = (res.mean(1) / (den * kk)).mean()
+        dv = ((div[0] ** 2 + div[1] ** 2).mean(1) / den).mean()
+        return helm + self.lambda_div * dv

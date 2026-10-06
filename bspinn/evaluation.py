@@ -141,6 +141,8 @@ def reference_image(C, case: EvalCase, obj):
     den = (np.abs(I) ** 2).sum(0) - case.N * s2
     eff = np.sqrt(np.clip(num, 0, None) / np.clip(den, 1e-30, None))
     good = obj & (den > 10 * case.N * s2)                        # debiasing is unreliable at very low SNR
+    if not good.any():
+        good = obj
     out = {"snr_efficiency_mean": float(np.clip(eff[good], 0, 1.2).mean()),
            "snr_efficiency_p05": float(np.quantile(eff[good], 0.05)),
            "snr_loss_db_mean": float(-20 * np.log10(np.clip(eff[good], 1e-3, None)).mean())}

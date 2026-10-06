@@ -386,3 +386,65 @@ def test_orientation_auto_finds_b0_axis():
     d.geom = VolumeGeometry(d.geom.shape, d.geom.voxel, "yxz")              # wrong guess on purpose
     best, scores = select_orientation(d, FitConfig(calib=8, iters_auto=80, threads=1), log=lambda *a: None)
     assert best == "zyx", scores
+
+
+# ----------------------------------------------------------------------------- Helmholtz (wave) model
+def test_wave_wires_reduce_to_biot_savart_and_match_full_wave_reference():
+    from bspinn.data import synthetic_array
+    from bspinn.models import WaveWireLoopCoils, WireLoopCoils, tissue_k2
+    from bspinn.volume import wave_loop_fields
+    verts, _ = synthetic_array(3, n_rings=2)
+    pts = torch.rand(200, 3) * 1.2 - 0.6
+    static = WireLoopCoils(3, 1, 48, 1)
+    w0 = WaveWireLoopCoils(3, 1, 48, 1, k2_init=0)
+    k2 = tissue_k2(3.0, 50, 0.6, 0.12)
+    wk = WaveWireLoopCoils(3, 1, 48, 1, k2_init=k2, n_quad=4)
+    for m in (static, w0, wk):
+        with torch.no_grad():
+            m.verts.copy_(torch.from_numpy(verts)); m.amp.fill_(1)
+    B0 = w0.field(pts).detach()
+    assert torch.allclose(B0[..., 0], static.field(pts)[..., 0].detach(), atol=1e-5) and B0[..., 1].abs().max() == 0
+    Bk = wk.field(pts).detach()
+    G = wave_loop_fields(verts, pts, k2, n_r=16, n_phi=64)
+    err = np.linalg.norm((Bk[..., 0] + 1j * Bk[..., 1]).numpy() - G) / np.linalg.norm(G)
+    assert err < 1e-2, err
+
+
+def test_full_wave_reference_solves_helmholtz_and_is_divergence_free():
+    from bspinn.data import synthetic_array
+    from bspinn.models import tissue_k2
+    from bspinn.volume import wave_loop_fields
+    verts, _ = synthetic_array(2, n_rings=2)
+    k2 = tissue_k2(3.0, 50, 0.6, 0.12)
+    p0, h = torch.tensor([[0.1, 0.2, -0.1]], dtype=torch.float64), 1e-3
+    f = lambda p: wave_loop_fields(verts, p, k2)[:, 0, :]
+    F0, lap, div = f(p0), 0, 0
+    for d in range(3):
+        e = torch.zeros(1, 3, dtype=torch.float64); e[0, d] = h
+        Fp, Fm = f(p0 + e), f(p0 - e)
+        lap = lap + (Fp - 2 * F0 + Fm) / h ** 2
+        div = div + (Fp[:, d] - Fm[:, d]) / (2 * h)
+    assert np.abs(lap + k2 * F0).max() < 1e-4 * np.abs(k2 * F0).max()
+    assert np.abs(div).max() < 1e-3 * np.abs(F0).max()
+
+
+def test_helmholtz_needs_3d_and_wave_maps_match_training():
+    from bspinn.fit import FitConfig, make_pinn
+    from bspinn.models import WaveWireLoopCoils, tissue_k2
+    from bspinn.volume import CoarseCorrection, Problem3D, make_synthetic3d, volume_maps
+    with pytest.raises(ValueError):
+        FitConfig(physics="helmholtz").validate("fit")
+    k2 = tissue_k2(3.0, 50, 0.6, 0.12)
+    d, gt, obj = make_synthetic3d(4, (16, 16, 16), noise=0.0, wave_k2=k2, voxel=(15, 15, 15))
+    cfg = FitConfig(calib=8, physics="helmholtz", correction_grid=8)
+    p = Problem3D(d, cfg)
+    w = WaveWireLoopCoils(4, 1, 12, 1, k2_init=k2)
+    with torch.no_grad():
+        w.verts.normal_(0, 0.3); w.verts.add_(torch.tensor([1.6, 0, 0])); w.amp.fill_(1)
+    w.coarse = (p.coords, p.coarse_coords, p.calib, p.coarse_shape)
+    pinn = make_pinn(p, cfg, w, 1)
+    assert pinn.wave_base and float(pinn.physics_loss(p.support_pts[:64])) < 1e-10      # zero correction: exact
+    torch.nn.init.normal_(pinn.net[-1].weight, std=0.05)
+    train = CoarseCorrection(pinn, p).sensitivity(p.coords, create_graph=False).detach()
+    ev_ = volume_maps(pinn, p, shape=p.calib).reshape(4, -1)
+    assert float((train - ev_).norm() / train.norm()) < 1e-5

@@ -27,6 +27,8 @@ CASE_ORDER = ["knee15", "brain8", "synth8", "synth8_noiselo", "synth8_noisehi", 
               "knee15_acs16", "knee15_acs32", "knee15_acs48"]
 
 CASE3D = {
+    "wave15": ("Full-wave 1.5 T", "48³, 240 mm FOV, 12 loops: exact time-harmonic fields in homogeneous tissue at 64 MHz (ε_r 70, σ 0.5 S/m; coils and object in one medium, which exaggerates wave effects), σ = 0.01 relative to the object signal, ACS 12³. The Helmholtz model starts from a generic prior (ε_r 60, σ 0.5)."),
+    "wave3": ("Full-wave 3 T", "As full-wave 1.5 T at 128 MHz (ε_r 50, σ 0.6 S/m). 'Helmholtz (true k²)' fixes k² at the true tissue value; 'k² learned' starts from the generic prior."),
     "synth3d": ("Synthetic 3-D", "48³ volume, 12 loops in two rings along B0, Biot–Savart ground truth, σ = 0.01, ACS 12³ for every method."),
     "synth3d_mismatch": ("Synthetic 3-D, mismatch", "As synthetic 3-D, each coil multiplied by its own smooth complex non-Biot–Savart factor (strength 0.3)."),
     "bart3d": ("BART 3-D phantom", "BART's 3-D phantom with its simulated 8-channel head-coil sensitivities (not Biot–Savart fields), σ = 0.01, ACS 12³. The B0 direction is selected from the data."),
@@ -66,7 +68,7 @@ def main():
             src = os.path.join(p3, f"fig3d_{c}.png")
             if os.path.exists(src):
                 shutil.copy(src, os.path.join(out_dir, "img", f"3d_{c}.png")); im3[c] = f"img/3d_{c}.png"
-        order3 = [c for c in ("synth3d", "synth3d_mismatch", "bart3d") if c in S3["cases"]]
+        order3 = [c for c in ("wave15", "wave3", "synth3d", "synth3d_mismatch", "bart3d") if c in S3["cases"]]
         data["three"] = {"cases": order3, "caseInfo": {c: {"label": CASE3D.get(c, (c, ""))[0], "desc": CASE3D.get(c, ("", ""))[1], **S3["cases"][c]} for c in order3},
                          "order": S3["order"], "labels": S3["labels"], "metrics": S3["metrics"], "images": im3}
     payload = json.dumps(_clean(data), separators=(",", ":")).replace("</", "<\\/")

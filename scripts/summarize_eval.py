@@ -101,8 +101,10 @@ def main():
     print(f"{len(results)} cases, {len(rows)} metric values -> {a.eval}/all_metrics.csv, summary.json, fig_*.png")
 
 
-LABEL3D = dict(LABEL, bs_pinn_complex="Biot–Savart PINN, complex field")
-ORDER3D = ["oracle", "lowres", "walsh", "inati", "espirit", "nlinv", "bs_wires", "bs_pinn", "bs_pinn_complex"]
+LABEL3D = dict(LABEL, bs_pinn_complex="Biot–Savart PINN, complex field", bs_helmholtz="Helmholtz (k² learned)",
+               bs_helmholtz_fixed="Helmholtz (true k²)")
+ORDER3D = ["oracle", "lowres", "walsh", "inati", "espirit", "nlinv", "bs_wires", "bs_pinn", "bs_pinn_complex", "bs_helmholtz",
+           "bs_helmholtz_fixed"]
 
 
 def summarize3d(out):

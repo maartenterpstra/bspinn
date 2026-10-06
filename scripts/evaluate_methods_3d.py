@@ -50,7 +50,21 @@ def bart3d(name="bart3d", noise=0.01, acs=12, seed=0):
                     meta={"noise": noise, "source": "BART phantom -3 -s 8 (simulated coils)", "orientation": "auto"})
 
 
-CASES = {"synth3d": lambda: synth("synth3d"), "synth3d_mismatch": lambda: synth("synth3d_mismatch", mismatch=0.3),
+def wave(name, b0, eps_r, sigma, noise=0.01, size=48, acs=12, voxel=5.0):
+    """Full-wave fields of the same loop array in homogeneous tissue (coils and object in one medium:
+    stronger wave effects than coils in air next to a body). FOV = size * voxel = 240 mm."""
+    from bspinn.models import tissue_k2
+    k2 = tissue_k2(b0, eps_r, sigma, size * voxel / 2000.0)
+    d, C, obj = make_synthetic3d(12, (size,) * 3, noise=noise, wave_k2=k2, voxel=(voxel,) * 3, normalise="object")
+    return EvalCase(name, d.kspace, np.ones((size,) * 3, bool), (acs,) * 3, sigma=noise, gt_maps=C, gt_object=obj,
+                    pe_axes=(1, 2), voxel=(voxel,) * 3,
+                    meta={"noise": noise, "true_k2": [k2.real, k2.imag], "orientation": "given",
+                          "tissue": {"b0_tesla": b0, "eps_r": 60.0, "sigma": 0.5},          # generic prior
+                          "tissue_true": {"b0_tesla": b0, "eps_r": eps_r, "sigma": sigma}})
+
+
+CASES = {"wave15": lambda: wave("wave15", 1.5, 70.0, 0.5), "wave3": lambda: wave("wave3", 3.0, 50.0, 0.6),
+         "synth3d": lambda: synth("synth3d"), "synth3d_mismatch": lambda: synth("synth3d_mismatch", mismatch=0.3),
          "bart3d": lambda: bart3d()}
 RS = [(2, 1), (2, 2), (3, 2), (4, 2), (3, 3)]
 
@@ -71,6 +85,10 @@ def run_case(case, methods, out, log=print):
     os.makedirs(cdir, exist_ok=True)
     maps, secs = estimate(case, methods, cache_dir=os.path.join(cdir, "maps"), log=log, threads=1,
                           cfg_overrides=dict(BS3D), orientation=case.meta.get("orientation", "given"))
+    for n in ("bs_helmholtz", "bs_helmholtz_fixed"):
+        p = os.path.join(cdir, "maps", f"{n}.k2.json")
+        if os.path.exists(p):
+            case.meta.setdefault("fitted_k2", {})[n] = json.load(open(p))
     obj = ev.object_mask(case)
     sup = binary_dilation(obj, iterations=2)
     ref = np.abs(case.gt_object) * np.sqrt((np.abs(case.gt_maps) ** 2).sum(0))

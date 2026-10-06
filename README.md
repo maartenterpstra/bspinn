@@ -10,7 +10,7 @@ scalar potential. Works for any number of coils, single or multiple slices, Cart
 python -m bspinn.cli fit ksp.cfl --out runs/mydata                     # any BART / fastMRI / npy dataset
 python -m bspinn.cli fit ksp.cfl --traj traj.cfl --noise noise.cfl --out runs/radial
 python -m bspinn.cli synthetic --coils 12 --out runs/synth            # validation with ground truth
-python -m pytest tests                                                 # 37 tests, ~12 min
+python -m pytest tests                                                 # 40 tests, ~12 min
 ```
 
 Requirements: Python ≥ 3.10, PyTorch ≥ 2.0, NumPy, matplotlib (figures), h5py (fastMRI only).
@@ -619,7 +619,61 @@ the phase-encoding plane; `runs/eval3d`, report section "3-D encoding"):
   (ΔB + k²B = 0, with k² estimated) instead of Laplace is the natural next step there.
 * No real 3-D multi-coil k-space was available in this environment (the public BART workshop and
   webinar data are 2-D, multi-slice or dynamic). Validating on real 3-D data is the main open item.
+* SNR caveat: these 3-D cases normalise the maps over the whole grid, including points close to the coils, so the
+  object is at a low SNR (median RSS signal about 3× the noise). The rankings hold, but the absolute errors are noise-limited.
 * Cost: about 15–18 min per 48³ volume on one CPU core for the PINN, against about 0.3–2 min for ESPIRiT and NLINV.
+
+### 8.1 Wave-aware physics (`--physics helmholtz`, 3-D)
+
+The quasi-static model ignores the tissue's displacement and conduction currents. Those currents
+leave div B = 0 intact but make curl B non-zero, and the field then follows
+∇²B + k²B = 0 with complex k² = ω²μ₀ε₀ε_r − iωμ₀σ (homogeneous tissue). `--physics helmholtz` is the level-1
+extension, with one complex k² for the object:
+
+* **Full-wave wires** (`WaveWireLoopCoils`). Each current element radiates with the Green's function of
+  the medium, dB = (1 + ikR) e^{−ikR} (dl × R)/R³, so the wire field solves the vector Helmholtz equation
+  exactly and is divergence-free. It is computed as closed-form Biot–Savart, plus a closed-form k²/(2R)
+  term, plus a Gauss–Legendre quadrature of the bounded remainder. The remainder is evaluated on the coarse
+  correction grid during training and at evaluation, so the two are identical. k² = 0 gives exactly the quasi-static model.
+* **Vector correction** (`HelmholtzPINN`). The network outputs the complex 3-vector correction B_c directly,
+  so no derivatives are needed for the maps. The physics penalty is ∇²B_c + k²B_c = 0 and div B_c = 0 inside the
+  object, with the same k² as the wires.
+* **k²** starts from a tissue prior (`--b0-tesla`, `--eps-r`, `--sigma`) and is learned (`--learn-k2`). The
+  report converts the fitted k² back to an equivalent homogeneous ε_r and σ.
+* **3-D only.** On one slice the ∂²/∂z² term is unobserved; `validate` refuses `--physics helmholtz` outside `fit3d`.
+
+```
+python -m bspinn.cli fit3d data.cfl --out runs/vol --calib 12 --physics helmholtz --b0-tesla 3 --eps-r 60 --sigma 0.5
+```
+
+**Ground truth for testing** (`wave_loop_fields`): the same loop array, each loop replaced by its
+equivalent magnetic-dipole sheet, with every dipole field an exact time-harmonic Maxwell solution in a
+homogeneous lossy medium. This verifies to 1e-6 (Helmholtz residual) and 1e-5 (divergence) by finite
+differences, and gives Biot–Savart at k = 0. Coils and object sit in one medium, which exaggerates wave
+effects relative to coils in air beside a body: relative Laplacian of the maps 4.1 (1.5 T) and 10.1
+(3 T), against 0.03 for quasi-static maps and 10.4 for BART's simulated coils.
+
+**Results** (48³, ACS 12³, 600 + 600 iterations, single run; `runs/eval3d/wave15`, `runs/eval3d/wave3`; report section "3-D encoding"):
+
+| case | metric | Helmholtz (k² learned) | Helmholtz (true k²) | Laplace PINN | Laplace, complex | ESPIRiT | NLINV | low-res |
+|---|---|---|---|---|---|---|---|---|
+| 1.5 T | subspace err | **4.4e-5** | – | 4.2e-3 | 2.8e-3 | 2.0e-3 | 2.7e-3 | 6.5e-3 |
+| | residual/floor outside ACS (truth 0.999) | **1.001** | – | 1.155 | 1.116 | 1.124 | 1.209 | 1.504 |
+| | SENSE 4×2 NRMSE, common support (truth 0.055) | **0.055** | – | 0.062 | 0.061 | 0.064 | 0.063 | 0.090 |
+| 3 T | subspace err | **3.1e-4** | 3.2e-4 | 1.1e-1 | 9.6e-2 | 3.0e-3 | 4.2e-3 | 8.4e-3 |
+| | residual/floor outside ACS (truth 0.999) | **1.010** | 1.009 | 2.348 | 2.017 | 1.161 | 1.320 | 1.646 |
+| | SENSE 4×2 NRMSE, common support (truth 0.044) | **0.045** | 0.045 | 0.090 | 0.080 | 0.056 | 0.055 | 0.081 |
+
+* With wave effects the quasi-static model breaks down at 3 T (map error 0.1). The Helmholtz model
+  is 10× (3 T) to 46× (1.5 T) more accurate than ESPIRiT. Its residual and SENSE error are at the level of the true maps.
+* k² is only loosely identified. Starting from a generic prior (ε_r 60, σ 0.5 S/m), the fit gives ε_r 84 / σ 0.49
+  at 1.5 T (true 70 / 0.5) and ε_r 60 / σ 0.53 at 3 T (true 50 / 0.6). The maps are as good as with the
+  true k² (3.1e-4 vs 3.2e-4): the correction absorbs the rest. Treat the fitted ε_r and σ as nuisance
+  parameters, not as tissue property estimates.
+* Limits of this test: the medium surrounds the coils and is homogeneous, the coils are ideal loops, and the
+  ground truth comes from the same family of physics as the model. Next would be heterogeneous tissue (piecewise
+  k², level 2), coils in air beside a body (a volume-integral or FDTD reference), and real 3 T or 7 T 3-D data.
+* Cost: about 42 min per 48³ volume on one CPU core (the Laplace PINN takes about 16 min).
 
 ## 9. Code map
 

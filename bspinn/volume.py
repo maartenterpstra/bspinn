@@ -382,12 +382,80 @@ def fit3d(data: VolumeData, cfg: FitConfig, log=print, orientation: str = "given
 
 
 def volume_maps(model, prob: Problem3D, shape=None, chunk=16384):
-    """Sensitivities of the data channels on the full (or any) grid: (N, D, H, W) complex."""
+    """Sensitivities of the data channels on the full (or any) grid: (N, D, H, W) complex.
+    Wave models (Helmholtz) are evaluated exactly as they were trained: closed-form parts at every
+    voxel, the smooth parts (wave-wire remainder, network correction) from the coarse grid, upsampled."""
+    from .models import HelmholtzPINN, WaveWireLoopCoils
     geom = prob.data.geom
-    shape = shape or geom.shape
+    shape = tuple(shape or geom.shape)
     pts = geom.grid(shape).reshape(-1, 3)
-    C = prob.mixC(model.sensitivity_batched(pts, chunk), -2)
+    if isinstance(model, (HelmholtzPINN, WaveWireLoopCoils)):
+        C = _wave_maps(model, prob, pts, shape, chunk)
+    else:
+        C = model.sensitivity_batched(pts, chunk)
+    C = prob.mixC(C, -2)
     return C.reshape(prob.N, *shape)
+
+
+def _upsample(F, cs, fs):
+    """(N, Pc, 3, 2) on the coarse grid -> (N, P, 3, 2) on grid ``fs`` (trilinear, same corners)."""
+    N = F.shape[0]
+    g = F.reshape(N, *cs, 6).permute(0, 4, 1, 2, 3)
+    g = F_interp(g, fs)
+    return g.permute(0, 2, 3, 4, 1).reshape(N, -1, 3, 2)
+
+
+def F_interp(g, fs):
+    return F.interpolate(g, size=fs, mode="trilinear", align_corners=True)
+
+
+@torch.no_grad()
+def _wave_maps(model, prob, pts, shape, chunk):
+    from .models import HelmholtzPINN
+    from .physics import transverse_to_sensitivity
+    wires = model.base if isinstance(model, HelmholtzPINN) else model
+    geom = prob.data.geom
+    cs = prob.coarse_shape
+    pc = prob.coarse_coords                                                        # training's coarse grid
+    # smooth parts on that grid
+    rem = torch.view_as_real(wires._wave(pc, False, None))                         # (N,Pc,3,2)
+    smooth = rem
+    if isinstance(model, HelmholtzPINN):
+        th = wires.theta
+        c, s_ = torch.cos(th)[:, None, None], torch.sin(th)[:, None, None]
+        re, im = rem[..., 0], rem[..., 1]
+        smooth = torch.stack([re * c - im * s_, re * s_ + im * c], -1) + model.correction_field(pc)
+    # trilinear lookup at every voxel (clamped at the coarse box edge), identical to training's upsampling
+    N = smooth.shape[0]
+    vol = smooth.reshape(N, *cs, 6).permute(0, 4, 1, 2, 3)                         # (N,6,cd,ch,cw)
+    pcg = pc.reshape(*cs, 3)
+    lohi = []
+    for a in range(3):
+        ph_ = AXES[geom.axes[a]]
+        lohi.append((float(pcg[..., ph_].min()), float(pcg[..., ph_].max()), ph_))
+    u = torch.stack([2 * (pts[:, ph_] - lo_) / (hi_ - lo_) - 1 for lo_, hi_, ph_ in lohi], -1)   # array order d,h,w
+    grid = u.flip(-1).reshape(1, -1, 1, 1, 3).expand(N, -1, -1, -1, -1)            # grid_sample wants (w,h,d)
+    up = F.grid_sample(vol, grid, mode="bilinear", padding_mode="border", align_corners=True)   # (N,6,P,1,1)
+    up = up[..., 0, 0].permute(0, 2, 1).reshape(N, -1, 3, 2)
+    out = []
+    for i in range(0, pts.shape[0], chunk):
+        p = pts[i:i + chunk]
+        st = WireLoopCoils_field(wires, p) + wires._wave_1r(p, None)                # complex (N,p,3)
+        stc = torch.view_as_real(st)
+        if isinstance(model, HelmholtzPINN):
+            th = wires.theta
+            c, s_ = torch.cos(th)[:, None, None], torch.sin(th)[:, None, None]
+            stc = torch.stack([stc[..., 0] * c - stc[..., 1] * s_, stc[..., 0] * s_ + stc[..., 1] * c], -1)
+        B = stc + up[:, i:i + chunk]
+        Bx = torch.complex(B[:, :, 0, 0], B[:, :, 0, 1]); By = torch.complex(B[:, :, 1, 0], B[:, :, 1, 1])
+        out.append(transverse_to_sensitivity(Bx, By, model.handedness) * model.gain()[:, None])
+    return torch.cat(out, 1)
+
+
+def WireLoopCoils_field(wires, p):
+    """Closed-form quasi-static (Biot-Savart) part of a wave-wire model, as complex (N,P,3)."""
+    from .models import WireLoopCoils
+    return WireLoopCoils.field(wires, p, False)[..., 0].to(torch.complex64)
 
 
 # ===================================================================================== synthetic data
@@ -405,17 +473,72 @@ def ellipsoid_phantom(shape, seed=0):
     return img
 
 
-def make_synthetic3d(n_coils=12, shape=(64, 64, 64), noise=0.01, mismatch=0.0, seed=0, n_rings=2):
+def wave_loop_fields(verts, points, k2, n_r=8, n_phi=32, chunk=2048):
+    """Full-wave field of planar circular current loops in a homogeneous lossy medium.
+
+    Each loop is replaced by the equivalent uniform magnetic-dipole sheet over its disc; every dipole
+    field is an exact time-harmonic Maxwell solution, B = 1/(4 pi) e^{-ikR} [k^2 (R^ x m) x R^ / R
+    + (3 R^ (R^.m) - m)(1/R^3 + i k / R^2)], so the sum satisfies div B = 0 and lap B + k^2 B = 0 (units mu0 I / 4 pi)
+    everywhere away from the coils. k^2 = 0 gives the quasi-static Biot-Savart field of the loops.
+    verts: (N, 1, M, 3) loop polygons (circles); points: (P, 3); k2 in normalised units.
+    Returns complex (N, P, 3)."""
+    k = complex(np.sqrt(complex(k2)))
+    if k.imag > 0:
+        k = -k                                                     # outgoing, decaying for e^{-ikR}
+    V = torch.as_tensor(verts, dtype=torch.float64)[:, 0]           # (N, M, 3)
+    c = V.mean(1)                                                   # loop centres
+    e1 = V[:, 0] - c
+    a = e1.norm(dim=-1, keepdim=True)
+    e1 = e1 / a
+    e2 = V[:, V.shape[1] // 4] - c
+    e2 = e2 - (e2 * e1).sum(-1, keepdim=True) * e1
+    e2 = e2 / e2.norm(dim=-1, keepdim=True)
+    n = torch.linalg.cross(e1, e2)
+    # orientation: same circulation as the polygon (right-hand rule)
+    circ = torch.linalg.cross(V[:, 0] - c, V[:, 1] - c)
+    n = n * torch.sign((circ * n).sum(-1, keepdim=True))
+    rho = (torch.arange(n_r, dtype=torch.float64) + 0.5) / n_r
+    phi = torch.arange(n_phi, dtype=torch.float64) * 2 * math.pi / n_phi
+    R_, P_ = torch.meshgrid(rho, phi, indexing="ij")
+    dA = (math.pi / n_phi) * ((R_ + 0.5 / n_r) ** 2 - (R_ - 0.5 / n_r) ** 2)          # annulus sector areas (unit radius)
+    pos = c[:, None, :] + a[:, None, :] * (R_.reshape(-1, 1) * torch.cos(P_).reshape(-1, 1) * e1[:, None, :]
+                                           + R_.reshape(-1, 1) * torch.sin(P_).reshape(-1, 1) * e2[:, None, :])  # (N, D, 3)
+    m = n[:, None, :] * (dA.reshape(1, -1, 1) * a[:, None, :] ** 2)                      # (N, D, 3), unit current
+    kk = torch.tensor(k, dtype=torch.complex128)
+    pts = torch.as_tensor(points, dtype=torch.float64)
+    res = np.zeros((pos.shape[0], pts.shape[0], 3), np.complex128)
+    for j in range(pos.shape[0]):                       # one coil at a time, points in chunks (memory)
+        for i in range(0, pts.shape[0], chunk):
+            R = pts[None, i:i + chunk, :] - pos[j][:, None, :]                          # (D, P, 3)
+            r = R.norm(dim=-1, keepdim=True)
+            u = R / r
+            mm = m[j][:, None, :].expand_as(u)
+            um = (u * mm).sum(-1, keepdim=True)
+            far = torch.linalg.cross(torch.linalg.cross(u, mm), u)
+            near = 3 * u * um - mm
+            ph = torch.exp(-1j * kk * r)                # units of mu0 I / 4 pi, as biot_savart_polyline
+            B = ph * (kk ** 2 * far / r + near * (1 / r ** 3 + 1j * kk / r ** 2))
+            res[j, i:i + chunk] = B.sum(0).numpy()
+    return res
+
+
+def make_synthetic3d(n_coils=12, shape=(64, 64, 64), noise=0.01, mismatch=0.0, seed=0, n_rings=2,
+                     wave_k2=None, voxel=(1.0, 1.0, 1.0), normalise="volume"):
     """3-D data whose sensitivities are Biot–Savart fields of loops on a cylinder around B0 (z),
     in ``n_rings`` rings along z. ``mismatch`` > 0 multiplies each coil by its own smooth complex
-    non-harmonic factor (model-mismatch test). Returns (VolumeData, gt_maps (N,D,H,W), object)."""
+    non-harmonic factor (model-mismatch test). ``wave_k2`` (normalised units, e.g. from
+    ``models.tissue_k2``) gives the full-wave fields of the same loops in homogeneous tissue instead
+    (``wave_loop_fields``). Returns (VolumeData, gt_maps (N,D,H,W), object)."""
     from .data import synthetic_array
     from .physics import biot_savart_polyline
-    geom = VolumeGeometry(shape, (1.0, 1.0, 1.0), "zyx")
+    geom = VolumeGeometry(shape, voxel, "zyx")
     pts = geom.grid().reshape(-1, 3)
     verts, ph = synthetic_array(n_coils, n_rings=n_rings, seed=seed)
-    B = np.concatenate([biot_savart_polyline(torch.from_numpy(verts), pts[i:i + 65536]).sum(1).numpy()
-                        for i in range(0, pts.shape[0], 65536)], axis=1)            # (N,P,3)
+    if wave_k2 is not None:
+        B = wave_loop_fields(verts, pts, wave_k2)                                       # complex (N,P,3)
+    else:
+        B = np.concatenate([biot_savart_polyline(torch.from_numpy(verts), pts[i:i + 65536]).sum(1).numpy()
+                            for i in range(0, pts.shape[0], 65536)], axis=1)            # (N,P,3)
     C = np.exp(1j * ph)[:, None] * (B[..., 0] + 1j * B[..., 1])
     if mismatch:
         rp = np.random.default_rng(seed + 99)
@@ -427,12 +550,16 @@ def make_synthetic3d(n_coils=12, shape=(64, 64, 64), noise=0.01, mismatch=0.0, s
             a, b = basis @ rp.normal(size=9), basis @ rp.normal(size=9)
             C[j] *= np.exp(mismatch * (a / a.std() + 1j * b / b.std()))
     C = C.reshape(n_coils, *shape)
-    C = C / np.sqrt((np.abs(C) ** 2).sum(0).mean())
     obj = ellipsoid_phantom(shape, seed)
+    # 'volume': mean sum|C|^2 = 1 over the whole grid (original 3-D cases); 'object': over the object,
+    # so the SNR is set by ``noise`` even when the field near the coils is much stronger than inside
+    ref = (np.abs(C) ** 2).sum(0)
+    C = C / np.sqrt(ref[obj > 0].mean() if normalise == "object" else ref.mean())
     rng = np.random.default_rng(seed + 1)
     k = fftnc_np(C * obj[None])
     k = k + noise * (rng.normal(size=k.shape) + 1j * rng.normal(size=k.shape)) / math.sqrt(2)
-    d = VolumeData(k.astype(np.complex64), geom, mask=np.ones(shape, bool), meta={"source": "synthetic3d"})
+    d = VolumeData(k.astype(np.complex64), geom, mask=np.ones(shape, bool),
+                   meta={"source": "synthetic3d", "wave_k2": None if wave_k2 is None else [complex(wave_k2).real, complex(wave_k2).imag]})
     return d, C.astype(np.complex64), obj
 
 
@@ -452,6 +579,13 @@ def evaluate3d(model, prob: Problem3D, extra: dict, out_dir=None, gt=None, obj=N
         sp = prob.support_pts[torch.randperm(prob.support_pts.shape[0])[:1500]]
         div, curl = maxwell_static_residual(lambda x: model.field(x, create_graph=True), sp, model.n_coils)
     rep["physics_rel_rms"] = {"div": float(div.mean()), "curl": float(curl.mean())}
+    if hasattr(model, "k2_re"):          # Helmholtz: curl B != 0 by design; report the fitted medium
+        from .models import k2_to_tissue
+        k2 = complex(float(model.k2_re), float(model.k2_im))
+        rep["k2_normalised"] = [k2.real, k2.imag]
+        b0 = getattr(prob.cfg, "b0_tesla", 3.0)
+        er, sg = k2_to_tissue(k2, b0, prob.data.geom.half_fov / 1000.0)
+        rep["homogeneous_medium_estimate"] = {"b0_tesla": b0, "eps_r": er, "sigma_S_per_m": sg}
     if gt is not None:
         o = obj if obj is not None else np.ones(C.shape[1:], bool)
         G = gt / np.sqrt((np.abs(gt) ** 2).sum(0, keepdims=True)).clip(1e-12)

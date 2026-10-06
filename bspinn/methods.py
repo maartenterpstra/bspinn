@@ -17,6 +17,8 @@ name                method
 ``free``            same pipeline without physics (Sobolev smoothness; ablation)
 ``bs_pinn_grid1``   ablation: ``bs_pinn`` with ``calib_oversample=1`` (maps and image on the ACS grid)
 ``bs_pinn_complex`` ``bs_pinn`` with ``field_mode='complex'`` (meaningful with 3-D data)
+``bs_helmholtz``    3-D: wires as incident field + vector Helmholtz correction, k^2 learned from a tissue prior
+``bs_helmholtz_fixed`` same with k^2 fixed at the tissue prior (case.meta['tissue'])
 ``oracle``          ground-truth maps (synthetic data only)
 ==================  =====================================================================
 """
@@ -232,6 +234,8 @@ def _bs(case: EvalCase, model="pinn", cfg_overrides=None, return_wires=False, lo
         mdl, prob, hist, extra = fit3d(vd, cfg, log=log or (lambda *a: None), orientation=kw.get("orientation", "given"))
         out = {model: volume_maps(mdl, prob).numpy(), "_history": hist, "_orientation": prob.data.geom.axes,
                "_n_params": int(sum(p.numel() for p in mdl.parameters() if p.requires_grad))}
+        if hasattr(mdl, "k2_re"):
+            out["_k2"] = [float(mdl.k2_re), float(mdl.k2_im)]
         if model == "pinn":     # the wire stage of the same run = a stand-alone wire fit (same seed/iters)
             out["wires"] = volume_maps(extra["wires_stage"], prob).numpy()
             out["_t_wires"] = extra["t_wires"]
@@ -289,6 +293,17 @@ def estimate(case: EvalCase, methods, cache_dir=None, log=print, **kw):
             out = _bs(case, "pinn", **kw); store("bs_pinn", out["pinn"], time.time() - t0)
             if "wires" in out and "bs_wires" in methods and not cached("bs_wires"):
                 store("bs_wires", out["wires"], out["_t_wires"])
+        elif name in ("bs_helmholtz", "bs_helmholtz_fixed"):
+            kw2 = dict(kw)
+            ov = {**(kw2.get("cfg_overrides") or {}), "physics": "helmholtz", "learn_k2": name == "bs_helmholtz"}
+            # learned: start from a generic tissue prior; fixed: the true tissue values when known
+            ov.update(case.meta.get("tissue", {}) if name == "bs_helmholtz" else case.meta.get("tissue_true", case.meta.get("tissue", {})))
+            kw2["cfg_overrides"] = ov
+            out = _bs(case, "pinn", **kw2); store(name, out["pinn"], time.time() - t0)
+            if "_k2" in out and cache_dir:
+                import json
+                with open(os.path.join(cache_dir, f"{name}.k2.json"), "w") as fh:
+                    json.dump(out["_k2"], fh)
         elif name == "bs_pinn_complex":
             kw2 = dict(kw)
             kw2["cfg_overrides"] = {**(kw2.get("cfg_overrides") or {}), "field_mode": "complex"}

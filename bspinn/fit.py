@@ -49,6 +49,12 @@ class FitConfig:
     lr_wires: float = 1e-2
     lambda_outside: float = 10.0
     lambda_curv: float = 1e-1
+    physics: str = "laplace"         # 'laplace' (quasi-static, default) | 'helmholtz' (3-D: wave-aware correction)
+    b0_tesla: float = 3.0            # helmholtz: field strength -> Larmor frequency
+    eps_r: float = 50.0              # helmholtz: initial relative permittivity of the object
+    sigma: float = 0.6               # helmholtz: initial conductivity (S/m)
+    learn_k2: bool = True            # helmholtz: fit the complex k^2 (else keep the tissue value)
+    lambda_div: float = 1.0          # helmholtz: weight of div B_c = 0 relative to the Helmholtz residual
     correction_grid: int = 12        # 3-D only: the PINN correction is evaluated on this many points per
                                      #   axis and upsampled (trilinear) to the calibration grid in training
     init_z_offset: float = 0.15      # +/- out-of-plane offset of initial loops (breaks z-mirror symmetry; 0 = off)
@@ -124,6 +130,13 @@ class FitConfig:
                 err.append("dynamic: needs --model pinn --init wires --field-mode real")
             if self.multiset:
                 err.append("dynamic: multiple map sets are not implemented together with dynamics")
+        if self.physics not in ("laplace", "helmholtz"):
+            err.append("--physics must be laplace|helmholtz")
+        if self.physics == "helmholtz":
+            if context != "fit3d":
+                err.append("--physics helmholtz needs 3-D data (fit3d): on one slice the d^2/dz^2 term is unobserved")
+            if self.model not in ("pinn", "wires") or self.init != "wires" or self.pretrained:
+                err.append("--physics helmholtz needs --model pinn|wires --init wires")
         if context == "fit3d":
             if self.model not in ("pinn", "wires"):
                 err.append("3-D: --model pinn|wires (the no-physics ablation is 2-D only)")
@@ -437,7 +450,15 @@ def _image_param(prob, C0, K, m_prev=None):
 def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=print, tag="wires"):
     torch.manual_seed(cfg.seed)
     gen = torch.Generator().manual_seed(cfg.seed + 5)
-    wires = WireLoopCoils(prob.N_model, cfg.loops_per_coil, cfg.verts_per_loop, handedness)
+    if getattr(cfg, "physics", "laplace") == "helmholtz":
+        from .models import WaveWireLoopCoils, tissue_k2
+        k2 = tissue_k2(cfg.b0_tesla, cfg.eps_r, cfg.sigma, prob.data.geom.half_fov / 1000.0)
+        wires = WaveWireLoopCoils(prob.N_model, cfg.loops_per_coil, cfg.verts_per_loop, handedness,
+                                  k2_init=k2, learn_k2=cfg.learn_k2)
+        if getattr(prob, "coarse_coords", None) is not None and prob.coarse_shape != prob.calib:
+            wires.coarse = (prob.coords, prob.coarse_coords, prob.calib, prob.coarse_shape)
+    else:
+        wires = WireLoopCoils(prob.N_model, cfg.loops_per_coil, cfg.verts_per_loop, handedness)
     wires.init_from_data(prob.coords, prob.weights_model, prob.support_pts,
                          standoff=max(0.15, cfg.outside_margin + 0.05), seed=cfg.seed,
                          normal_axis=prob.normal_axis, z_offset=cfg.init_z_offset)
@@ -482,6 +503,12 @@ def load_trunk(path, device="cpu"):
 
 
 def make_pinn(prob, cfg, wires, h):
+    if getattr(cfg, "physics", "laplace") == "helmholtz":
+        from .models import HelmholtzPINN, tissue_k2
+        L = prob.data.geom.half_fov / 1000.0                                 # mm -> m
+        k2 = tissue_k2(cfg.b0_tesla, cfg.eps_r, cfg.sigma, L)
+        return HelmholtzPINN(prob.N_model, cfg.latent, cfg.width, cfg.depth, h, base=wires, k2_init=k2,
+                             learn_k2=cfg.learn_k2, lambda_div=cfg.lambda_div).to(prob.device)
     net = None
     codes_init = None
     if cfg.pretrained:
@@ -501,7 +528,11 @@ def make_pinn(prob, cfg, wires, h):
 def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None):
     iters = iters or cfg.iters_pinn
     gen = torch.Generator().manual_seed(cfg.seed + 2)
-    params = [{"params": model.parameters(), "lr": cfg.lr_pinn}]
+    named = list(model.named_parameters())
+    k2p = [q for n, q in named if n.endswith(("k2_re", "k2_im")) and q.requires_grad]
+    params = [{"params": [q for n, q in named if not n.endswith(("k2_re", "k2_im"))], "lr": cfg.lr_pinn}]
+    if k2p:                                    # helmholtz: k^2 is O(1-10) in normalised units -> its own step size
+        params.append({"params": k2p, "lr": 2e-2})
     K = getattr(model, "n_sets", 1)
     if prob.data_term == "kspace":
         C0 = model.sensitivity(prob.coords, create_graph=False).detach() if m is None else None
