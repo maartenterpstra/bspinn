@@ -1,0 +1,586 @@
+<title>Coil Map Benchmark</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: one reading column (max 1180px); per-dataset explorer = tab row + table + two charts + figure strip. */
+:root {
+  --bg: #f4f5f7; --surface: #ffffff; --ink: #12151b; --ink-2: #474d59; --muted: #747b89;
+  --rule: #dde1e7; --accent: #2b4c8c; --accent-ink: #ffffff; --hi: #e3ebf9; --ref-row: #f1f2f5;
+  --good: #0a7d36; --bad: #b3261e;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  --ref-series: #474d59; --abl-series: #9aa0ab;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #111317; --surface: #191c21; --ink: #eceef2; --ink-2: #b8bdc7; --muted: #8b92a0;
+  --rule: #2b2f37; --accent: #8eaee8; --accent-ink: #0d1424; --hi: #20304e; --ref-row: #1e2127;
+  --good: #4cc274; --bad: #f08079;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --ref-series: #b8bdc7; --abl-series: #6d7380; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #111317; --surface: #191c21; --ink: #eceef2; --ink-2: #b8bdc7; --muted: #8b92a0;
+  --rule: #2b2f37; --accent: #8eaee8; --accent-ink: #0d1424; --hi: #20304e; --ref-row: #1e2127;
+  --good: #4cc274; --bad: #f08079;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --ref-series: #b8bdc7; --abl-series: #6d7380; color-scheme: dark; }
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font-family: var(--f-body); font-size: 15px; line-height: 1.55; }
+.wrap { max-width: 1180px; margin: 0 auto; padding-inline: 20px; padding-block: 36px 80px; display: grid; gap: 56px; }
+h1, h2, h3 { font-family: var(--f-display); font-weight: 600; text-wrap: balance; margin: 0; letter-spacing: -0.005em; }
+h1 { font-size: clamp(30px, 4.4vw, 44px); line-height: 1.08; }
+h2 { font-size: 26px; line-height: 1.15; }
+h3 { font-size: 18px; line-height: 1.25; }
+p { margin: 0; max-width: 72ch; }
+.eyebrow { font-family: var(--f-mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.lede { color: var(--ink-2); font-size: 16.5px; }
+section { display: grid; gap: 18px; min-width: 0; }
+.sec-head { display: grid; gap: 6px; border-top: 1px solid var(--rule); padding-top: 18px; }
+.mono, td.num, .tick { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+code { font-family: var(--f-mono); font-size: 0.9em; background: var(--ref-row); padding: 1px 5px; border-radius: 4px; }
+
+header { display: grid; gap: 16px; }
+.facts { display: flex; flex-wrap: wrap; gap: 10px 28px; margin-top: 4px; }
+.fact { display: grid; }
+.fact b { font-family: var(--f-mono); font-size: 22px; font-weight: 500; }
+.fact span { font-size: 12.5px; color: var(--muted); }
+
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.finding { background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 16px 18px; display: grid; gap: 6px; align-content: start; }
+.finding h3 { font-size: 16.5px; }
+.finding p { color: var(--ink-2); font-size: 14.5px; }
+
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.tab { font: 500 13.5px var(--f-body); color: var(--ink-2); background: var(--surface); border: 1px solid var(--rule); border-radius: 999px; padding: 6px 13px; cursor: pointer; }
+.tab:hover { border-color: var(--ink-2); }
+.tab[aria-selected="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.tab:focus-visible, button:focus-visible, .legend-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tab-group-label { font-size: 12px; color: var(--muted); align-self: center; margin-right: 4px; }
+.case-desc { color: var(--ink-2); font-size: 14.5px; }
+.controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 13.5px; color: var(--ink-2); }
+.controls label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+.seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+.seg button { font: 500 12.5px var(--f-body); background: var(--surface); color: var(--ink-2); border: 0; padding: 5px 10px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--rule); }
+.seg button[aria-pressed="true"] { background: var(--hi); color: var(--ink); }
+
+.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--rule); }
+th:first-child, td:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); z-index: 1; }
+thead th { font-weight: 500; font-size: 12px; color: var(--ink-2); vertical-align: bottom; white-space: normal; min-width: 84px; line-height: 1.3; }
+thead tr.group th { font-family: var(--f-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); border-bottom: 0; text-align: center; padding-bottom: 0; }
+thead tr.group th.g { border-left: 1px solid var(--rule); }
+td.gstart, th.gstart { border-left: 1px solid var(--rule); }
+tbody tr:last-child td { border-bottom: 0; }
+tr.ref td { background: var(--ref-row); color: var(--ink-2); }
+tr.ref td:first-child { background: var(--ref-row); }
+tr.abl td { color: var(--muted); }
+td.best { background: var(--hi); font-weight: 600; }
+td.best::after { content: " ●"; font-size: 8px; vertical-align: 2px; color: var(--accent); }
+.mname { display: inline-flex; align-items: center; gap: 8px; }
+.swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; flex: none; }
+.swatch.dash { background: repeating-linear-gradient(90deg, var(--ref-series) 0 4px, transparent 4px 7px) !important; }
+.note { font-size: 13px; color: var(--muted); max-width: 90ch; }
+.unit { color: var(--muted); font-weight: 400; }
+
+.charts.two-col { grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+.chart-card { align-content: start; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 14px 10px; display: grid; gap: 8px; min-width: 0; position: relative; }
+.chart-card h3 { font-size: 15.5px; }
+.chart-card .sub { font-size: 12.5px; color: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--ink-2); }
+.legend-item { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; border-radius: 4px; padding: 1px 2px; }
+.legend-item.off { opacity: 0.35; }
+svg.chart { width: 100%; height: auto; display: block; overflow: visible; }
+svg.chart text { fill: var(--muted); font-family: var(--f-mono); font-size: 10.5px; }
+svg.chart .axis-title { fill: var(--ink-2); font-family: var(--f-body); font-size: 11.5px; }
+svg.chart .grid { stroke: var(--rule); stroke-width: 1; }
+svg.chart .floor { stroke: var(--ink-2); stroke-width: 1; stroke-dasharray: 2 3; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 7px 9px; font-size: 12px; box-shadow: 0 4px 14px rgb(0 0 0 / 0.12); display: grid; gap: 2px; min-width: 170px; z-index: 5; }
+.tip[hidden] { display: none; }
+.tip .row { display: flex; justify-content: space-between; gap: 12px; }
+.tip .row span:last-child { font-family: var(--f-mono); }
+.tip .hd { font-weight: 600; margin-bottom: 2px; }
+
+figure { margin: 0; display: grid; gap: 6px; }
+figure img { width: 100%; border-radius: 6px; border: 1px solid var(--rule); background: #000; }
+figcaption { font-size: 12.5px; color: var(--muted); max-width: 100ch; }
+.figs { display: grid; gap: 16px; }
+
+dl.defs { display: grid; grid-template-columns: minmax(180px, 260px) 1fr; gap: 10px 22px; margin: 0; }
+dl.defs dt { font-weight: 600; font-size: 14px; }
+dl.defs dd { margin: 0; color: var(--ink-2); font-size: 14px; max-width: 80ch; }
+@media (max-width: 640px) { dl.defs { grid-template-columns: 1fr; } dl.defs dd { margin-bottom: 8px; } .wrap { gap: 44px; } }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+pre { font-family: var(--f-mono); font-size: 12.5px; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin: 0; }
+ul.plain { margin: 0; padding-left: 18px; display: grid; gap: 6px; color: var(--ink-2); max-width: 90ch; }
+.rho { display: inline-block; min-width: 46px; }
+.rho.pos { color: var(--good); } .rho.neg { color: var(--bad); }
+@media (prefers-reduced-motion: no-preference) { .legend-item, .tab { transition: background .12s, opacity .12s, border-color .12s; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">bspinn · coil sensitivity estimation · method comparison</div>
+    <h1>Coil Map Benchmark</h1>
+    <p class="lede">Eight ways to estimate receive-coil sensitivities, compared on identical calibration data across synthetic phantoms with known ground truth, a fully sampled 15-channel knee and a prospectively undersampled 8-channel brain. Every map set is scored on how well it explains the measured k-space after combining and re-expanding, on the quality and SNR of the combined reference image, on SENSE reconstructions at R = 2–6, and on the maps themselves.</p>
+    <div class="facts" id="facts"></div>
+  </header>
+
+  <section aria-labelledby="h-find">
+    <div class="sec-head"><div class="eyebrow">Summary</div><h2 id="h-find">What the numbers say</h2></div>
+    <div class="findings" id="findings"></div>
+  </section>
+
+  <section aria-labelledby="h-res">
+    <div class="sec-head"><div class="eyebrow">Results by dataset</div><h2 id="h-res">Explorer</h2>
+      <p class="note">Pick a dataset. The highlighted cell (●) is the best non-reference value in its column; the ground-truth row is shown for scale and excluded. All errors are lower-is-better unless marked ↑.</p></div>
+    <div class="tabs" role="tablist" id="tabs"></div>
+    <p class="case-desc" id="case-desc"></p>
+    <div class="controls">
+      <label><input type="checkbox" id="show-abl"> Show ablation (Biot–Savart on the ACS grid, v4)</label>
+    </div>
+    <div class="table-wrap"><table id="tbl"></table></div>
+    <p class="note" id="tbl-note"></p>
+    <div class="charts" id="charts"></div>
+    <div class="figs" id="figs"></div>
+  </section>
+
+  <section aria-labelledby="h-3d" id="sec-3d" hidden>
+    <div class="sec-head"><div class="eyebrow">3-D encoding</div><h2 id="h-3d">Volumetric data</h2>
+      <p class="note">3-D Cartesian k-space, 3-D FFTs, a 12³ calibration block for every method, the field and its Laplace penalty fitted through the whole volume. SENSE uses 2-D undersampling over the two phase-encoding axes (R₁ × R₂, plus the ACS block).</p></div>
+    <div class="tabs" role="tablist" id="tabs3"></div>
+    <p class="case-desc" id="case-desc3"></p>
+    <div class="table-wrap"><table id="tbl3"></table></div>
+    <div class="charts" id="charts3"></div>
+    <div class="figs" id="figs3"></div>
+  </section>
+
+  <section aria-labelledby="h-sens">
+    <div class="sec-head"><div class="eyebrow">Sensitivity analyses</div><h2 id="h-sens">Calibration size and noise</h2>
+      <p class="note">Knee: the same data with ACS blocks of 16–48 lines. Synthetic: the same phantom at three noise levels.</p></div>
+    <div class="charts two-col" id="sens"></div>
+  </section>
+
+  <section aria-labelledby="h-abl">
+    <div class="sec-head"><div class="eyebrow">Ablations</div><h2 id="h-abl">Which part of the Biot–Savart model matters</h2>
+      <p class="note">Biot–Savart PINN (default) against its hard-constrained wire stage alone, the same pipeline without physics, and the v4 model that worked pixel-wise on the ACS grid. NLINV is shown as the strongest classical reference.</p></div>
+    <div class="table-wrap"><table id="abl"></table></div>
+  </section>
+
+  <section aria-labelledby="h-val">
+    <div class="sec-head"><div class="eyebrow">Meta-evaluation</div><h2 id="h-val">Do ground-truth-free metrics rank methods correctly?</h2>
+      <p class="note">On the synthetic cases the true maps are known. Spearman rank correlation, across all methods, between each metric you could compute on real data (signed so that “better” is larger) and the ground-truth outcome (signed the same way). +1 = identical ranking, 0 = no relation, negative = misleading.</p></div>
+    <div class="table-wrap"><table id="val"></table></div>
+  </section>
+
+  <section aria-labelledby="h-def">
+    <div class="sec-head"><div class="eyebrow">Definitions</div><h2 id="h-def">Metrics</h2></div>
+    <dl class="defs">
+      <dt>Combine → expand residual / noise floor</dt>
+      <dd>Coil images I from the acquired k-space are combined with the maps (per-pixel least squares, m = Cᴴ I / Cᴴ C), re-expanded to C·m and transformed back. The residual energy at the acquired samples is divided by the residual that perfect maps would leave, which is pure noise and is computed exactly by passing whitened noise through the same combine/expand (≈ (N−1)σ² per sample). 1.00 = indistinguishable from the true maps. Reported separately <em>outside</em> the ACS block, which no estimator saw (a held-out test), and <em>inside</em> it, where values below 1 mean the maps absorbed noise.</dd>
+      <dt>Radial residual profile</dt>
+      <dd>The same ratio in rings of |k|, showing at which spatial frequencies the maps fail to explain the data.</dd>
+      <dt>SNR efficiency ↑</dt>
+      <dd>Noise-debiased |ĉᴴ i| / ‖i‖ per pixel for RSS-normalised maps ĉ: the fraction of the optimal (Roemer) combined SNR that the reference image reaches. Equals 1 for the true maps; averaged over the object.</dd>
+      <dt>Reference image NRMSE</dt>
+      <dd>Magnitude of the fully sampled SENSE-1 combination with normalised maps against |ρ|‖c_true‖ (synthetic) or the RSS image (real), after one least-squares scale, within the object.</dd>
+      <dt>SENSE at R</dt>
+      <dd>Uniform 1-D undersampling along phase encoding plus the ACS lines, Tikhonov CG-SENSE (λ = 10⁻³, 40 iterations) with normalised maps. “Common support”: all methods solve only inside the same dilated object mask, so background map values cannot help or hurt conditioning; “as delivered” uses the maps as returned. Image NRMSE / SSIM against the method-independent reference; missing-k NRMSE compares the predicted k-space at the dropped lines with the measured data (noise floor shown in the tooltip).</dd>
+      <dt>g-factor</dt>
+      <dd>Analytic SENSE g-factor for uniform R = 4 from the normalised maps (mean over the object). It is the noise amplification of an unregularised recon with these maps; low values are only good if the unfolding is also correct.</dd>
+      <dt>Held-out k-space (prospective)</dt>
+      <dd>Brain only: 20 % of the acquired samples outside the ACS are withheld (two folds), CG-SENSE on the rest, NRMSE of the predicted withheld samples; noise floor = √(N σ² · #samples)/‖y‖.</dd>
+      <dt>Ground-truth map errors</dt>
+      <dd>Subspace error 1 − |ĉᴴ ĉ_true|² (gauge-free); relative-phase error after removing the per-pixel common phase, |c|²-weighted, in degrees; magnitude error of the normalised maps.</dd>
+      <dt>Vortices, roughness, coverage</dt>
+      <dd>Phase singularities of the maps as delivered inside the object; gauge-invariant roughness = mean ‖P(r) − P(r+1)‖_F of the projector P = ĉĉᴴ between neighbouring pixels; coverage = fraction of the object where the maps are non-zero (ESPIRiT crops).</dd>
+    </dl>
+  </section>
+
+  <section aria-labelledby="h-proto">
+    <div class="sec-head"><div class="eyebrow">Protocol</div><h2 id="h-proto">How it was run, and its limits</h2></div>
+    <ul class="plain" id="caveats">
+      <li>All data are pre-whitened (knee: covariance from signal-free background; brain: from the k-space periphery; synthetic: white by construction), so noise floors are exact.</li>
+      <li>Calibration-only protocol: on the knee and synthetic cases every estimator receives exactly the same ACS block, zero elsewhere. Classical baselines use their standard settings: ESPIRiT = BART <code>ecalib -m1</code> with its default eigenvalue crop, NLINV = BART <code>ncalib</code>, Walsh and Inati with a smoothing window of one low-resolution pixel.</li>
+      <li>Biot–Savart fits: 1000 wire + 1500 PINN iterations, λ<sub>phys</sub> = 0.1, calibration modelled on a 2× oversampled grid. One run each; no tuning per dataset.</li>
+      <li>The knee FOV cuts through the leg along the readout, so the object touches the top and bottom edge. FFT-based estimators wrap structure across that edge; this affects every method and is visible in the last rows of the error maps.</li>
+      <li>Synthetic truth is a Biot–Savart field, which favours the physics model; the mismatch case removes that advantage. The knee is the decisive real test because its fully sampled data give a reference for every metric.</li>
+      <li>Runtimes are single-threaded CPU and include BART process start-up for ESPIRiT and NLINV.</li>
+    </ul>
+    <pre>python scripts/prepare_eval_data.py --knee &lt;kspace_fs&gt; --brain &lt;pics-brain/ksp&gt;
+BART=/path/to/bart ./run_eval.sh
+python scripts/summarize_eval.py --eval runs/eval
+python scripts/build_eval_report.py --eval runs/eval --findings runs/eval/findings.json</pre>
+  </section>
+</div>
+
+<script>
+const D = /*__DATA__*/null;
+const SLOT = {lowres: 1, walsh: 2, inati: 3, espirit: 4, nlinv: 5, free: 6, bs_wires: 7, bs_pinn: 8};
+const ABL = new Set(["bs_pinn_grid1"]);
+function colorOf(m) { if (m === "oracle") return "var(--ref-series)"; if (m === "bs_pinn_complex") return "var(--s8)"; if (ABL.has(m)) return "var(--abl-series)"; return `var(--s${SLOT[m]})`; }
+function resolveColor(m) { const v = colorOf(m); const n = v.match(/var\((--[\w-]+)\)/); return n ? getComputedStyle(document.documentElement).getPropertyValue(n[1]).trim() : v; }
+const L = m => D.labels[m] || (D.three && D.three.labels[m]) || m;
+const get = (c, m, k) => { const r = D.metrics[c] && D.metrics[c][m]; return r ? r[k] : undefined; };
+function fmtSci(v) { if (v == null || !isFinite(v)) return "–"; if (v === 0) return "0"; const e = Math.floor(Math.log10(Math.abs(v))); if (e >= -2 && e < 3) return v.toFixed(Math.max(0, 3 - Math.max(e, 0) - 1)); const m = v / 10 ** e; return `${m.toFixed(1)}e${e}`; }
+const F = {
+  r3: v => v == null ? "–" : v.toFixed(3), r2: v => v == null ? "–" : v.toFixed(2), r1: v => v == null ? "–" : v.toFixed(1),
+  pct: v => v == null ? "–" : (100 * v).toFixed(1), sci: fmtSci, int: v => v == null ? "–" : String(Math.round(v)),
+  sec: v => v == null ? "–" : (v < 1 ? v.toFixed(2) : v < 10 ? v.toFixed(1) : Math.round(v).toString()),
+};
+let state = { c: D.cases[0], abl: false, senseMode: "sense_support" };
+
+// ------------------------------------------------------------------ header facts + findings
+(function () {
+  const methods = new Set(); D.cases.forEach(c => Object.keys(D.metrics[c]).forEach(m => methods.add(m)));
+  const n = Object.values(D.metrics).reduce((a, c) => a + Object.values(c).reduce((b, m) => b + Object.keys(m).length, 0), 0);
+  const facts = [[[...methods].filter(m => m !== "oracle" && !ABL.has(m)).length, "estimators"], [D.cases.length, "dataset configurations"],
+                 [D.cases.filter(c => D.caseInfo[c].kind !== "synthetic").length, "on real scanner data"], [n.toLocaleString("en"), "metric values"]];
+  document.getElementById("facts").innerHTML = facts.map(([b, s]) => `<div class="fact"><b>${b}</b><span>${s}</span></div>`).join("");
+  document.getElementById("findings").innerHTML = (D.findings || []).map(f => `<article class="finding"><h3>${f.title}</h3><p>${f.text}</p></article>`).join("");
+})();
+
+// ------------------------------------------------------------------ tabs
+function buildTabs() {
+  const el = document.getElementById("tabs");
+  el.innerHTML = D.cases.map(c => `<button class="tab" role="tab" id="tab-${c}" aria-selected="${c === state.c}" data-c="${c}">${D.caseInfo[c].label}</button>`).join("");
+  el.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => { state.c = b.dataset.c; try { localStorage.setItem("cmb-case", state.c); } catch (e) {} render(); }));
+}
+document.getElementById("show-abl").addEventListener("change", e => { state.abl = e.target.checked; render(); });
+
+// ------------------------------------------------------------------ columns
+function columns(c) {
+  const kind = D.caseInfo[c].kind;
+  if (kind === "prospective") return [
+    {g: "Held-out k-space", k: "prospective.heldout_nrmse", l: "Held-out NRMSE", f: F.r3, b: "low"},
+    {g: "Held-out k-space", k: "prospective.heldout_noise_floor_nrmse", l: "noise floor", f: F.r3, b: null},
+    {g: "Held-out k-space", k: "prospective.acquired_nrmse", l: "Acquired-sample NRMSE", f: F.r3, b: null},
+    {g: "Maps", k: "maps.phase_vortices", l: "Vortices", f: F.int, b: null},
+    {g: "Maps", k: "maps.projector_roughness", l: "Roughness ×10³", f: v => v == null ? "–" : (1e3 * v).toFixed(1), b: null},
+    {g: "Maps", k: "maps.coverage", l: "Coverage %", f: F.pct, b: "high"},
+    {g: "Cost", k: "runtime_s", l: "Runtime s", f: F.sec, b: null},
+  ];
+  const syn = kind === "synthetic";
+  const sm = state.senseMode;
+  const cols = [
+    {g: "Combine → expand", k: "kspace_consistency.outside_acs.residual_over_noise_floor", l: "Residual / floor, outside ACS", f: F.r3, b: "low"},
+    {g: "Combine → expand", k: "kspace_consistency.acs.residual_over_noise_floor", l: "inside ACS", f: F.r3, b: null},
+    {g: "Reference image", k: "reference_image.snr_efficiency_mean", l: "SNR efficiency % ↑", f: F.pct, b: "high"},
+    {g: "Reference image", k: "reference_image.snr_efficiency_p05", l: "5th pct % ↑", f: F.pct, b: "high"},
+    {g: "Reference image", k: syn ? "reference_image.vs_truth.nrmse" : "reference_image.vs_rss.nrmse", l: syn ? "NRMSE vs truth" : "NRMSE vs RSS", f: F.r3, b: "low"},
+    {g: `SENSE R = 4 (${sm === "sense" ? "as delivered" : "common support"})`, k: `${sm}.4.vs_reference.nrmse`, l: "Image NRMSE", f: F.r3, b: "low"},
+    {g: `SENSE R = 4 (${sm === "sense" ? "as delivered" : "common support"})`, k: `${sm}.4.vs_reference.ssim`, l: "SSIM ↑", f: F.r3, b: "high"},
+    {g: `SENSE R = 4 (${sm === "sense" ? "as delivered" : "common support"})`, k: `${sm}.4.missing_kspace_nrmse`, l: "Missing-k NRMSE", f: F.r3, b: "low"},
+    {g: `SENSE R = 4 (${sm === "sense" ? "as delivered" : "common support"})`, k: `${sm}.4.gfactor.mean`, l: "g mean", f: F.r2, b: null},
+  ];
+  if (syn) cols.push(
+    {g: "Maps vs truth", k: "maps.gt_subspace_err", l: "Subspace err", f: F.sci, b: "low"},
+    {g: "Maps vs truth", k: "maps.gt_rel_phase_err_deg", l: "Rel. phase err °", f: F.r2, b: "low"},
+    {g: "Maps vs truth", k: "maps.gt_magnitude_err", l: "Magnitude err", f: F.r3, b: "low"});
+  cols.push(
+    {g: "Maps", k: "maps.phase_vortices", l: "Vortices", f: F.int, b: null},
+    {g: "Maps", k: "maps.coverage", l: "Coverage %", f: F.pct, b: "high"},
+    {g: "Cost", k: "runtime_s", l: "Runtime s", f: F.sec, b: null});
+  return cols;
+}
+
+function methodsFor(c) {
+  return D.order.filter(m => D.metrics[c][m] && (state.abl || !ABL.has(m)));
+}
+function nameCell(m) {
+  const dash = m === "oracle" ? " dash" : "";
+  return `<span class="mname"><span class="swatch${dash}" style="background:${colorOf(m)}"></span>${L(m)}</span>`;
+}
+
+function renderTable(c) {
+  const cols = columns(c), ms = methodsFor(c);
+  const groups = []; cols.forEach((col, i) => { if (!groups.length || groups[groups.length - 1].g !== col.g) groups.push({g: col.g, n: 1, i}); else groups[groups.length - 1].n++; });
+  const starts = new Set(groups.map(g => g.i));
+  const best = {};
+  cols.forEach(col => {
+    if (!col.b) return;
+    const vals = ms.filter(m => m !== "oracle" && !ABL.has(m)).map(m => [m, get(c, m, col.k)]).filter(([, v]) => v != null && isFinite(v));
+    if (!vals.length) return;
+    const t = col.b === "low" ? Math.min(...vals.map(v => v[1])) : Math.max(...vals.map(v => v[1]));
+    best[col.k] = new Set(vals.filter(([, v]) => Math.abs(v - t) <= 1e-12 + 5e-4 * Math.abs(t)).map(([m]) => m));
+  });
+  let h = `<thead><tr class="group"><th></th>${groups.map(g => `<th colspan="${g.n}" class="g">${g.g}</th>`).join("")}</tr>`;
+  h += `<tr><th>Method</th>${cols.map((col, i) => `<th class="${starts.has(i) ? "gstart" : ""}">${col.l}</th>`).join("")}</tr></thead><tbody>`;
+  ms.forEach(m => {
+    const cls = m === "oracle" ? "ref" : ABL.has(m) ? "abl" : "";
+    h += `<tr class="${cls}"><td>${nameCell(m)}</td>${cols.map((col, i) => {
+      const v = get(c, m, col.k); const b = best[col.k] && best[col.k].has(m) ? " best" : "";
+      return `<td class="num${b}${starts.has(i) ? " gstart" : ""}">${col.f(v)}</td>`; }).join("")}</tr>`;
+  });
+  document.getElementById("tbl").innerHTML = h + "</tbody>";
+  const kind = D.caseInfo[c].kind;
+  document.getElementById("tbl-note").textContent = kind === "prospective"
+    ? "No fully sampled reference exists for this scan, so only held-out prediction and map properties are reported."
+    : "Residual / floor of 1.000 means the maps explain the data down to the noise. SENSE columns follow the toggle on the R chart below.";
+}
+
+// ------------------------------------------------------------------ SVG line chart
+function lineChart(card, cfg) {
+  const W = 520, H = 280, m = {l: 54, r: 14, t: 10, b: 40};
+  const svgNS = "http://www.w3.org/2000/svg";
+  const legend = document.createElement("div"); legend.className = "legend"; card.appendChild(legend);
+  const svg = document.createElementNS(svgNS, "svg"); svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.classList.add("chart");
+  svg.setAttribute("role", "img"); svg.setAttribute("aria-label", cfg.aria || cfg.title || "chart"); card.appendChild(svg);
+  const tip = document.createElement("div"); tip.className = "tip"; tip.hidden = true; card.appendChild(tip);
+  const hidden = new Set(cfg.hidden || []);
+  const xs = [...new Set(cfg.series.flatMap(s => s.points.map(p => p[0])))].sort((a, b) => a - b);
+  const xsc = cfg.logX ? (v => Math.log10(v)) : (v => v);
+  const x0 = xsc(cfg.xmin ?? xs[0]), x1 = xsc(cfg.xmax ?? xs[xs.length - 1]);
+  const X = v => m.l + (xsc(v) - x0) / (x1 - x0 || 1) * (W - m.l - m.r);
+  function draw() {
+    svg.innerHTML = "";
+    const vis = cfg.series.filter(s => !hidden.has(s.key));
+    let ys = vis.flatMap(s => s.points.map(p => p[1])).filter(v => v != null && isFinite(v) && (!cfg.logY || v > 0));
+    (cfg.refLines || []).forEach(r => ys.push(r.y));
+    if (!ys.length) ys = [0, 1];
+    let y0, y1, ticks;
+    if (cfg.logY) {
+      y0 = Math.floor(Math.log10(Math.min(...ys))); y1 = Math.ceil(Math.log10(Math.max(...ys)));
+      if (y1 === y0) y1 = y0 + 1; ticks = []; for (let e = y0; e <= y1; e++) ticks.push(10 ** e);
+    } else {
+      let lo = cfg.yMin != null ? cfg.yMin : Math.min(...ys), hi = Math.max(...ys); if (hi === lo) hi = lo + 1;
+      const pad = (hi - lo) * 0.06; lo = cfg.yMin != null ? lo : lo - pad; hi += pad;
+      const step = niceStep((hi - lo) / 5); y0 = Math.floor(lo / step) * step; y1 = Math.ceil(hi / step) * step;
+      ticks = []; for (let v = y0; v <= y1 + step / 2; v += step) ticks.push(+v.toFixed(10));
+    }
+    const Y = v => cfg.logY ? H - m.b - (Math.log10(v) - y0) / (y1 - y0) * (H - m.t - m.b) : H - m.b - (v - y0) / (y1 - y0) * (H - m.t - m.b);
+    const g = (tag, attrs, parent = svg) => { const e = document.createElementNS(svgNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent.appendChild(e); return e; };
+    ticks.forEach(t => { g("line", {x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), class: "grid"});
+      const tx = g("text", {x: m.l - 6, y: Y(t) + 3.5, "text-anchor": "end"}); tx.textContent = cfg.logY ? `1e${Math.round(Math.log10(t))}` : (cfg.yFmt || fmtSci)(t); });
+    (cfg.xTicks || xs).forEach(v => { const tx = g("text", {x: X(v), y: H - m.b + 15, "text-anchor": "middle"}); tx.textContent = cfg.xFmt ? cfg.xFmt(v) : v; });
+    const xt = g("text", {x: (m.l + W - m.r) / 2, y: H - 6, "text-anchor": "middle", class: "axis-title"}); xt.textContent = cfg.xLabel;
+    const yt = g("text", {x: 12, y: (m.t + H - m.b) / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 12 ${(m.t + H - m.b) / 2})`}); yt.textContent = cfg.yLabel;
+    (cfg.refLines || []).forEach(r => { g("line", {x1: m.l, x2: W - m.r, y1: Y(r.y), y2: Y(r.y), class: "floor"});
+      const tx = g("text", {x: W - m.r, y: Y(r.y) - 4, "text-anchor": "end"}); tx.textContent = r.label; });
+    vis.forEach(s => {
+      const pts = s.points.filter(p => p[1] != null && isFinite(p[1]) && (!cfg.logY || p[1] > 0));
+      if (!pts.length) return;
+      const col = resolveColor(s.key);
+      g("path", {d: pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(""), fill: "none", stroke: col,
+                 "stroke-width": s.key === "bs_pinn" ? 2.5 : 2, "stroke-dasharray": s.key === "oracle" ? "5 4" : ABL.has(s.key) ? "2 3" : s.key === "bs_pinn_complex" ? "7 3" : "none", "stroke-linejoin": "round", "stroke-linecap": "round"});
+      pts.forEach(p => g("circle", {cx: X(p[0]), cy: Y(p[1]), r: 3.2, fill: col, stroke: getComputedStyle(document.body).backgroundColor, "stroke-width": 1.5}));
+    });
+    const cross = g("line", {x1: 0, x2: 0, y1: m.t, y2: H - m.b, stroke: "currentColor", "stroke-opacity": 0, "stroke-width": 1});
+    const hit = g("rect", {x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent"});
+    hit.addEventListener("mousemove", ev => {
+      const r = svg.getBoundingClientRect(); const px = (ev.clientX - r.left) / r.width * W;
+      let best = xs[0]; xs.forEach(v => { if (Math.abs(X(v) - px) < Math.abs(X(best) - px)) best = v; });
+      cross.setAttribute("x1", X(best)); cross.setAttribute("x2", X(best)); cross.setAttribute("stroke-opacity", 0.25); cross.style.color = "var(--ink-2)";
+      const rows = vis.map(s => [s, (s.points.find(p => p[0] === best) || [])[1]]).filter(([, v]) => v != null).sort((a, b) => a[1] - b[1]);
+      tip.innerHTML = `<div class="hd">${cfg.xFmt ? cfg.xFmt(best) : best} <span class="unit">${cfg.xUnit || ""}</span></div>` + rows.map(([s, v]) =>
+        `<div class="row"><span class="mname"><span class="swatch${s.key === "oracle" ? " dash" : ""}" style="background:${colorOf(s.key)}"></span>${L(s.key)}</span><span>${(cfg.tipFmt || fmtSci)(v)}</span></div>`).join("") +
+        (cfg.tipExtra ? cfg.tipExtra(best) : "");
+      tip.hidden = false;
+      const cr = card.getBoundingClientRect(); let lx = ev.clientX - cr.left + 14; if (lx + 220 > cr.width) lx = ev.clientX - cr.left - 230;
+      tip.style.left = Math.max(4, lx) + "px"; tip.style.top = (ev.clientY - cr.top + 10) + "px";
+    });
+    hit.addEventListener("mouseleave", () => { tip.hidden = true; cross.setAttribute("stroke-opacity", 0); });
+  }
+  legend.innerHTML = cfg.series.map(s => `<span class="legend-item${hidden.has(s.key) ? " off" : ""}" tabindex="0" role="button" aria-pressed="${!hidden.has(s.key)}" data-k="${s.key}"><span class="swatch${s.key === "oracle" ? " dash" : ""}" style="background:${colorOf(s.key)}"></span>${L(s.key)}</span>`).join("");
+  legend.querySelectorAll(".legend-item").forEach(it => { const t = () => { const k = it.dataset.k; hidden.has(k) ? hidden.delete(k) : hidden.add(k); it.classList.toggle("off"); it.setAttribute("aria-pressed", !hidden.has(k)); draw(); };
+    it.addEventListener("click", t); it.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); t(); } }); });
+  draw();
+  return draw;
+}
+function niceStep(s) { const e = 10 ** Math.floor(Math.log10(s)); const f = s / e; return (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) * e; }
+function card(parent, title, sub) { const d = document.createElement("div"); d.className = "chart-card"; d.innerHTML = `<h3>${title}</h3>${sub ? `<div class="sub">${sub}</div>` : ""}`; parent.appendChild(d); return d; }
+
+// bar chart (horizontal) for prospective held-out
+function barChart(cardEl, rows, refVal, label) {
+  const W = 520, rowH = 26, m = {l: 150, r: 46, t: 6, b: 30}, H = m.t + m.b + rows.length * rowH;
+  const max = Math.max(...rows.map(r => r[1]), refVal || 0) * 1.05;
+  const X = v => m.l + v / max * (W - m.l - m.r);
+  let s = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${label}">`;
+  const step = niceStep(max / 4);
+  for (let v = 0; v <= max; v += step) s += `<line class="grid" x1="${X(v)}" x2="${X(v)}" y1="${m.t}" y2="${H - m.b}"/><text x="${X(v)}" y="${H - m.b + 14}" text-anchor="middle">${v.toFixed(2)}</text>`;
+  rows.forEach(([k, v], i) => { const y = m.t + i * rowH + 5;
+    s += `<text x="${m.l - 8}" y="${y + 12}" text-anchor="end" style="font-family:var(--f-body);fill:var(--ink-2);font-size:11.5px">${L(k)}</text>`;
+    s += `<rect x="${m.l}" y="${y}" width="${Math.max(1, X(v) - m.l)}" height="${rowH - 10}" rx="3" fill="${resolveColor(k)}"><title>${L(k)}: ${v.toFixed(4)}</title></rect>`;
+    s += `<text x="${X(v) + 5}" y="${y + 12}">${v.toFixed(3)}</text>`; });
+  if (refVal) s += `<line class="floor" x1="${X(refVal)}" x2="${X(refVal)}" y1="${m.t}" y2="${H - m.b}"/><text x="${X(refVal) + 4}" y="${m.t + 9}">noise floor</text>`;
+  s += `<text class="axis-title" x="${(m.l + W - m.r) / 2}" y="${H - 4}" text-anchor="middle">${label}</text></svg>`;
+  cardEl.insertAdjacentHTML("beforeend", s);
+}
+
+// ------------------------------------------------------------------ per-case charts
+function renderCharts(c) {
+  const el = document.getElementById("charts"); el.innerHTML = "";
+  const ms = methodsFor(c);
+  const kind = D.caseInfo[c].kind;
+  if (kind === "prospective") {
+    const rows = ms.filter(m => get(c, m, "prospective.heldout_nrmse") != null).map(m => [m, get(c, m, "prospective.heldout_nrmse")]).sort((a, b) => a[1] - b[1]);
+    const cd = card(el, "Held-out k-space prediction", "20 % of acquired samples outside the ACS withheld; CG-SENSE on the rest predicts them. Lower is better.");
+    barChart(cd, rows, get(c, rows[0][0], "prospective.heldout_noise_floor_nrmse"), "held-out NRMSE");
+    return;
+  }
+  const cd = card(el, "SENSE image error vs acceleration", "Uniform undersampling + ACS lines, CG-SENSE, magnitude NRMSE in the object.");
+  const seg = document.createElement("div"); seg.className = "seg";
+  seg.innerHTML = `<button aria-pressed="${state.senseMode === "sense_support"}" data-m="sense_support">Common support</button><button aria-pressed="${state.senseMode === "sense"}" data-m="sense">As delivered</button>`;
+  cd.insertBefore(seg, cd.children[1]);
+  seg.querySelectorAll("button").forEach(b => b.addEventListener("click", () => { state.senseMode = b.dataset.m; render(); }));
+  const Rs = [2, 3, 4, 5, 6];
+  lineChart(cd, {series: ms.map(m => ({key: m, points: Rs.map(R => [R, get(c, m, `${state.senseMode}.${R}.vs_reference.nrmse`)])})),
+                 xLabel: "nominal acceleration R", yLabel: "image NRMSE", xUnit: "× acceleration", yFmt: v => v.toFixed(2), tipFmt: v => v.toFixed(4),
+                 aria: "SENSE NRMSE versus acceleration for each method"});
+  const cd2 = card(el, "Where the maps fail to explain the data", "Combine → expand residual divided by the noise floor, per ring of |k|. 1 = as good as the true maps.");
+  const prof = D.profiles[c] || {};
+  const pm = ms.filter(m => prof[m]);
+  lineChart(cd2, {series: pm.map(m => ({key: m, points: prof[m].map(b => [+(((b.r0 + b.r1) / 2).toFixed(3)), b.residual_over_noise_floor])})),
+                  xLabel: "k-space radius (fraction of Nyquist)", yLabel: "residual / noise floor (log)", logY: true, tipFmt: v => v.toFixed(3),
+                  xFmt: v => v.toFixed(2), refLines: [{y: 1, label: "true maps"}], aria: "Radial residual profile",
+                  tipExtra: x => { const b = prof[pm[0]].find(b => Math.abs((b.r0 + b.r1) / 2 - x) < 1e-3); return b ? `<div class="row"><span class="unit">signal / noise in ring</span><span>${(1 / Math.max(b.rel_noise_floor, 1e-12)).toFixed(1)}</span></div>` : ""; }});
+}
+
+function renderFigs(c) {
+  const el = document.getElementById("figs"); el.innerHTML = "";
+  const im = D.images[c] || {};
+  const kind = D.caseInfo[c].kind;
+  if (im.recon) el.insertAdjacentHTML("beforeend", `<figure><img src="${im.recon}" alt="Reconstructions for ${D.caseInfo[c].label}"><figcaption>${kind === "prospective"
+    ? "CG-SENSE from all acquired samples with each method's maps; left: zero-filled RSS for orientation."
+    : "Top: SENSE R = 4 with common support, scaled to the reference (left). Bottom: absolute error ×4 contrast within the object."}</figcaption></figure>`);
+  if (im.maps) el.insertAdjacentHTML("beforeend", `<figure><img src="${im.maps}" alt="Sensitivity maps for ${D.caseInfo[c].label}"><figcaption>One coil, RSS-normalised: magnitude (0–1), phase (−π…π, as delivered; object outline in white)${kind === "prospective" ? "" : ", g-factor at R = 4 (1–4)"}.</figcaption></figure>`);
+}
+
+// ------------------------------------------------------------------ sensitivity analyses
+function renderSens() {
+  const el = document.getElementById("sens"); el.innerHTML = "";
+  const acs = [["knee15_acs16", 16], ["knee15", 24], ["knee15_acs32", 32], ["knee15_acs48", 48]].filter(([c]) => D.metrics[c]);
+  const main = D.order.filter(m => m !== "oracle" && !ABL.has(m) && m !== "free");
+  if (acs.length > 1) {
+    const c1 = card(el, "Knee: k-space residual vs ACS size", "Combine → expand residual / noise floor outside the ACS block.");
+    lineChart(c1, {series: main.map(m => ({key: m, points: acs.map(([c, a]) => [a, get(c, m, "kspace_consistency.outside_acs.residual_over_noise_floor")])})),
+                   xLabel: "ACS size (lines)", yLabel: "residual / noise floor", yFmt: v => v.toFixed(2), tipFmt: v => v.toFixed(3), xUnit: "ACS lines", refLines: [{y: 1, label: "true maps"}]});
+    const c2 = card(el, "Knee: SENSE R = 4 vs ACS size", "Image NRMSE against the fully sampled RSS, common support.");
+    lineChart(c2, {series: main.map(m => ({key: m, points: acs.map(([c, a]) => [a, get(c, m, "sense_support.4.vs_reference.nrmse")])})),
+                   xLabel: "ACS size (lines)", yLabel: "image NRMSE", yFmt: v => v.toFixed(3), tipFmt: v => v.toFixed(4), xUnit: "ACS lines"});
+  }
+  const nz = [["synth8_noiselo", 0.003], ["synth8", 0.01], ["synth8_noisehi", 0.03]].filter(([c]) => D.metrics[c]);
+  if (nz.length > 1) {
+    const c3 = card(el, "Synthetic: map error vs noise", "Ground-truth subspace error (log scale).");
+    lineChart(c3, {series: main.map(m => ({key: m, points: nz.map(([c, s]) => [s, get(c, m, "maps.gt_subspace_err")])})),
+                   xLabel: "noise σ", yLabel: "subspace error", logY: true, logX: true, xFmt: v => String(v), xUnit: "σ"});
+    const c4 = card(el, "Synthetic: SENSE R = 4 vs noise", "Image NRMSE against the truth, common support.");
+    lineChart(c4, {series: [{key: "oracle", points: nz.map(([c, s]) => [s, get(c, "oracle", "sense_support.4.vs_reference.nrmse")])}].concat(main.map(m => ({key: m, points: nz.map(([c, s]) => [s, get(c, m, "sense_support.4.vs_reference.nrmse")])}))),
+                   xLabel: "noise σ", yLabel: "image NRMSE", logX: true, xFmt: v => String(v), yFmt: v => v.toFixed(2), tipFmt: v => v.toFixed(4), xUnit: "σ"});
+  }
+}
+
+// ------------------------------------------------------------------ ablation + validity tables
+function renderAbl() {
+  const ms = ["bs_pinn", "bs_pinn_grid1", "bs_wires", "free", "nlinv"];
+  const rows = D.cases.filter(c => D.caseInfo[c].kind !== "prospective");
+  const met = [["maps.gt_subspace_err", "Subspace err (synthetic)", F.sci], ["kspace_consistency.outside_acs.residual_over_noise_floor", "Residual / floor outside ACS", F.r3], ["sense_support.4.vs_reference.nrmse", "SENSE R4 NRMSE", F.r3]];
+  let h = `<thead><tr class="group"><th></th>${met.map(([, l]) => `<th colspan="${ms.length}" class="g">${l}</th>`).join("")}</tr><tr><th>Dataset</th>${met.map(() => ms.map((m, i) => `<th class="${i === 0 ? "gstart" : ""}">${nameCell(m)}</th>`).join("")).join("")}</tr></thead><tbody>`;
+  rows.forEach(c => {
+    h += `<tr><td>${D.caseInfo[c].label}</td>`;
+    met.forEach(([k, , f]) => {
+      const vals = ms.map(m => get(c, m, k)); const ok = vals.filter(v => v != null && isFinite(v)); const best = ok.length ? Math.min(...ok) : null;
+      h += vals.map((v, i) => `<td class="num${v != null && v === best ? " best" : ""}${i === 0 ? " gstart" : ""}">${f(v)}</td>`).join("");
+    });
+    h += "</tr>";
+  });
+  document.getElementById("abl").innerHTML = h + "</tbody>";
+}
+function renderVal() {
+  const cs = Object.keys(D.validity);
+  if (!cs.length) return;
+  const targets = Object.keys(D.validity[cs[0]]);
+  const metrics = [...new Set(cs.flatMap(c => targets.flatMap(t => Object.keys(D.validity[c][t]))))];
+  let h = `<thead><tr class="group"><th></th>${targets.map(t => `<th colspan="${cs.length}" class="g">vs ${t}</th>`).join("")}</tr><tr><th>GT-free metric</th>${targets.map(() => cs.map((c, i) => `<th class="${i === 0 ? "gstart" : ""}">${D.caseInfo[c] ? D.caseInfo[c].label.replace("Synthetic, ", "") : c}</th>`).join("")).join("")}</tr></thead><tbody>`;
+  metrics.forEach(mt => {
+    h += `<tr><td>${mt}</td>` + targets.map(t => cs.map((c, i) => { const v = D.validity[c][t][mt];
+      return `<td class="num${i === 0 ? " gstart" : ""}"><span class="rho ${v == null ? "" : v > 0.3 ? "pos" : v < -0.3 ? "neg" : ""}">${v == null ? "–" : (v > 0 ? "+" : "") + v.toFixed(2)}</span></td>`; }).join("")).join("") + "</tr>";
+  });
+  document.getElementById("val").innerHTML = h + "</tbody>";
+}
+
+function render() {
+  document.querySelectorAll(".tab").forEach(t => t.setAttribute("aria-selected", t.dataset.c === state.c));
+  const info = D.caseInfo[state.c];
+  document.getElementById("case-desc").textContent = `${info.desc} ${info.n_coils} channels, ${info.shape.join("×")}, object ${info.object_pixels.toLocaleString("en")} px.`;
+  renderTable(state.c); renderCharts(state.c); renderFigs(state.c);
+}
+try { const s = localStorage.getItem("cmb-case"); if (s && D.cases.includes(s)) state.c = s; } catch (e) {}
+// ------------------------------------------------------------------ 3-D section
+let state3 = null;
+function render3() {
+  const T = D.three; if (!T) return;
+  const c = state3;
+  document.querySelectorAll("#tabs3 .tab").forEach(t => t.setAttribute("aria-selected", t.dataset.c === c));
+  const info = T.caseInfo[c];
+  document.getElementById("case-desc3").textContent = `${info.desc} ${info.n_coils} channels, object ${info.object_voxels.toLocaleString("en")} voxels.`;
+  const g3 = (m, k) => (T.metrics[c][m] || {})[k];
+  const cols = [
+    {g: "Combine → expand", k: "kspace_consistency.outside_acs.residual_over_noise_floor", l: "Residual / floor, outside ACS", f: F.r3, b: "low"},
+    {g: "Reference image", k: "reference_image.snr_efficiency_mean", l: "SNR efficiency % ↑", f: F.pct, b: "high"},
+    {g: "Reference image", k: "reference_image.vs_truth.nrmse", l: "NRMSE vs truth", f: F.r3, b: "low"},
+    {g: "SENSE R = 4×2", k: "sense_support.4x2.vs_reference.nrmse", l: "NRMSE, common support", f: F.r3, b: "low"},
+    {g: "SENSE R = 4×2", k: "sense_support.4x2.vs_reference.ssim", l: "SSIM ↑", f: F.r3, b: "high"},
+    {g: "SENSE R = 4×2", k: "sense.4x2.vs_reference.nrmse", l: "NRMSE, as delivered", f: F.r3, b: "low"},
+    {g: "SENSE R = 4×2", k: "sense_support.4x2.gfactor.mean", l: "g mean", f: F.r2, b: null},
+    {g: "Maps vs truth", k: "maps.gt_subspace_err", l: "Subspace err", f: F.sci, b: "low"},
+    {g: "Maps vs truth", k: "maps.gt_rel_phase_err_deg", l: "Rel. phase err °", f: F.r2, b: "low"},
+    {g: "Maps", k: "maps.phase_vortices", l: "Vortices (all slices)", f: F.int, b: null},
+    {g: "Cost", k: "runtime_s", l: "Runtime s", f: F.sec, b: null}];
+  const ms = T.order.filter(m => T.metrics[c][m]);
+  const groups = []; cols.forEach((col, i) => { if (!groups.length || groups[groups.length - 1].g !== col.g) groups.push({g: col.g, n: 1, i}); else groups[groups.length - 1].n++; });
+  const starts = new Set(groups.map(g => g.i));
+  const best = {};
+  cols.forEach(col => { if (!col.b) return; const vals = ms.filter(m => m !== "oracle").map(m => [m, g3(m, col.k)]).filter(([, v]) => v != null);
+    if (!vals.length) return; const t = col.b === "low" ? Math.min(...vals.map(v => v[1])) : Math.max(...vals.map(v => v[1]));
+    best[col.k] = new Set(vals.filter(([, v]) => Math.abs(v - t) <= 1e-12 + 5e-4 * Math.abs(t)).map(([m]) => m)); });
+  let h = `<thead><tr class="group"><th></th>${groups.map(g => `<th colspan="${g.n}" class="g">${g.g}</th>`).join("")}</tr>`;
+  h += `<tr><th>Method</th>${cols.map((col, i) => `<th class="${starts.has(i) ? "gstart" : ""}">${col.l}</th>`).join("")}</tr></thead><tbody>`;
+  ms.forEach(m => { h += `<tr class="${m === "oracle" ? "ref" : ""}"><td>${nameCell3(m)}</td>${cols.map((col, i) => { const v = g3(m, col.k);
+    return `<td class="num${best[col.k] && best[col.k].has(m) ? " best" : ""}${starts.has(i) ? " gstart" : ""}">${col.f(v)}</td>`; }).join("")}</tr>`; });
+  document.getElementById("tbl3").innerHTML = h + "</tbody>";
+  const el = document.getElementById("charts3"); el.innerHTML = "";
+  const Rs = [["2x1", 2], ["2x2", 4], ["3x2", 6], ["4x2", 8], ["3x3", 9]];
+  const cd = card(el, "SENSE image error vs acceleration (3-D)", "R₁ × R₂ over the phase-encoding plane, common support; x = total R.");
+  lineChart(cd, {series: ms.map(m => ({key: m, points: Rs.map(([k, r]) => [r, g3(m, `sense_support.${k}.vs_reference.nrmse`)])})),
+                 xLabel: "total acceleration R₁·R₂", yLabel: "image NRMSE", xUnit: "× acceleration", yFmt: v => v.toFixed(2), tipFmt: v => v.toFixed(4)});
+  const cd2 = card(el, "Map error (3-D)", "Ground-truth subspace error, log scale. Lower is better.");
+  const rows = ms.filter(m => m !== "oracle" && g3(m, "maps.gt_subspace_err") != null).map(m => [m, g3(m, "maps.gt_subspace_err")]).sort((a, b) => a[1] - b[1]);
+  logBars(cd2, rows, "subspace error");
+  const im = T.images[c];
+  document.getElementById("figs3").innerHTML = im ? `<figure><img src="${im}" alt="3-D results for ${info.label}"><figcaption>Rows: SENSE at R = 2×2 with common support, central slice along the first axis and orthogonal slice (scaled to the reference, left); one coil's normalised map, magnitude and phase (object outline in white).</figcaption></figure>` : "";
+}
+function nameCell3(m) {
+  const col = m === "bs_pinn_complex" ? "var(--s8)" : colorOf(m);
+  const style = m === "bs_pinn_complex" ? `background:repeating-linear-gradient(90deg, ${col} 0 4px, transparent 4px 6px)` : `background:${col}`;
+  return `<span class="mname"><span class="swatch${m === "oracle" ? " dash" : ""}" style="${style}"></span>${(D.three.labels[m] || m)}</span>`;
+}
+function logBars(cardEl, rows, label) {
+  const W = 520, rowH = 26, m = {l: 190, r: 56, t: 6, b: 30}, H = m.t + m.b + rows.length * rowH;
+  const lo = Math.floor(Math.log10(Math.min(...rows.map(r => r[1])))), hi = Math.ceil(Math.log10(Math.max(...rows.map(r => r[1]))));
+  const X = v => m.l + (Math.log10(v) - lo) / Math.max(hi - lo, 1) * (W - m.l - m.r);
+  let s = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${label}">`;
+  for (let e = lo; e <= hi; e++) s += `<line class="grid" x1="${X(10 ** e)}" x2="${X(10 ** e)}" y1="${m.t}" y2="${H - m.b}"/><text x="${X(10 ** e)}" y="${H - m.b + 14}" text-anchor="middle">1e${e}</text>`;
+  rows.forEach(([k, v], i) => { const y = m.t + i * rowH + 5;
+    s += `<text x="${m.l - 8}" y="${y + 12}" text-anchor="end" style="font-family:var(--f-body);fill:var(--ink-2);font-size:11.5px">${D.three.labels[k] || k}</text>`;
+    s += `<rect x="${X(10 ** lo)}" y="${y}" width="${Math.max(1, X(v) - X(10 ** lo))}" height="${rowH - 10}" rx="3" fill="${resolveColor(k === "bs_pinn_complex" ? "bs_pinn" : k)}" ${k === "bs_pinn_complex" ? 'fill-opacity="0.55"' : ""}><title>${v.toExponential(2)}</title></rect>`;
+    s += `<text x="${X(v) + 5}" y="${y + 12}">${fmtSci(v)}</text>`; });
+  s += `<text class="axis-title" x="${(m.l + W - m.r) / 2}" y="${H - 4}" text-anchor="middle">${label}</text></svg>`;
+  cardEl.insertAdjacentHTML("beforeend", s);
+}
+if (D.three) {
+  document.getElementById("sec-3d").hidden = false;
+  state3 = D.three.cases[0];
+  document.getElementById("tabs3").innerHTML = D.three.cases.map(c => `<button class="tab" role="tab" aria-selected="${c === state3}" data-c="${c}">${D.three.caseInfo[c].label}</button>`).join("");
+  document.querySelectorAll("#tabs3 .tab").forEach(b => b.addEventListener("click", () => { state3 = b.dataset.c; render3(); }));
+}
+
+buildTabs(); render(); renderSens(); renderAbl(); renderVal(); render3();
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { render(); renderSens(); render3(); });
+new MutationObserver(() => { render(); renderSens(); render3(); }).observe(document.documentElement, {attributes: true, attributeFilter: ["data-theme"]});
+</script>

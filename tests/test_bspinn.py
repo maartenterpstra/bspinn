@@ -1,0 +1,388 @@
+import math
+
+import numpy as np
+import torch
+
+from bspinn.encoding import NUDFTOp
+from bspinn.geometry import SliceGeometry, fft2c
+from bspinn.models import HarmonicPINN, WireLoopCoils
+from bspinn.physics import biot_savart_polyline, maxwell_static_residual
+
+torch.manual_seed(0)
+
+
+def test_biot_savart_on_axis_loop():
+    a, M = 0.5, 600
+    t = torch.linspace(0, 2 * math.pi, M + 1)[:-1]
+    v = torch.stack([a * torch.cos(t), a * torch.sin(t), torch.zeros(M)], -1).double()
+    z = torch.tensor([0.0, 0.3, 1.0]).double()
+    B = biot_savart_polyline(v, torch.stack([0 * z, 0 * z, z], -1))
+    ref = 2 * math.pi * a ** 2 / (a ** 2 + z ** 2) ** 1.5      # mu0 I / 4pi units
+    assert torch.allclose(B[:, 2], ref, rtol=1e-4)
+    assert B[:, :2].abs().max() < 1e-8
+
+
+def test_wire_field_is_source_free():
+    m = WireLoopCoils(3)
+    with torch.no_grad():
+        m.verts.normal_(); m.verts.mul_(0.3); m.verts[..., 0] += 2.0; m.amp.fill_(1.0)
+    pts = torch.rand(400, 3) * 2 - 1
+    div, curl = maxwell_static_residual(m.field, pts, 3)
+    assert div.max() < 1e-4 and curl.max() < 1e-4
+
+
+class _Fixed(HarmonicPINN):
+    def __init__(self, f):
+        super().__init__(2)
+        self.f = f
+
+    def potential(self, x):
+        return self.f(x)[..., None]
+
+
+def test_pinn_operators_on_known_potentials():
+    pts = torch.rand(300, 3) * 2 - 1
+    harmonic = _Fixed(lambda x: x[..., 0] ** 2 - x[..., 1] ** 2 + x[..., 2] * x[..., 0])
+    assert harmonic.physics_loss(pts) < 1e-10
+    nonharm = _Fixed(lambda x: x[..., 0] ** 2 + x[..., 1] ** 2)
+    assert nonharm.physics_loss(pts) > 0.1
+    div, curl = maxwell_static_residual(nonharm.field, pts, 2)
+    assert curl.max() < 1e-5 and div.min() > 0.1        # B = -grad(phi): curl-free by construction
+
+
+def test_pinn_variable_coils_and_correction_starts_at_wires():
+    for n in (3, 11):
+        w = WireLoopCoils(n)
+        with torch.no_grad():
+            w.verts.normal_(); w.verts[..., 0] += 2.0; w.amp.fill_(1.0); w.theta.uniform_(-3, 3)
+        p = HarmonicPINN(n, base=w)
+        pts = torch.rand(50, 3) - 0.5
+        assert torch.allclose(p.sensitivity(pts), w.sensitivity(pts), atol=1e-6)
+        assert p.physics_loss(pts) == 0
+
+
+def test_nudft_matches_fft_on_grid_and_is_adjoint():
+    h = w = 8
+    kr, kc = torch.meshgrid(torch.arange(h) - h // 2, torch.arange(w) - w // 2, indexing="ij")
+    traj = torch.stack([kr.flatten(), kc.flatten()], -1).float()
+    op = NUDFTOp(traj, (h, w))
+    x = torch.randn(2, h, w, dtype=torch.complex64)
+    assert torch.allclose(op.forward(x), fft2c(x).reshape(2, -1), atol=1e-4)
+    tr = torch.rand(37, 2) * 8 - 4
+    op = NUDFTOp(tr, (h, w))
+    y = torch.randn(2, 37, dtype=torch.complex64)
+    lhs = (op.forward(x).conj() * y).sum()
+    rhs = (x.conj() * op.adjoint(y)).sum()
+    assert torch.allclose(lhs, rhs, rtol=1e-4)
+
+
+def test_lowres_grid_spans_same_fov():
+    g = SliceGeometry((64, 80), (1.0, 1.0), np.array([0.0]))
+    full, low = g.grid(), g.grid((16, 20))
+    assert torch.allclose(full[0, 32, 40], low[0, 8, 10])          # centred-FFT origin pixel
+    assert abs(float(full[..., 0].max() - low[..., 0].max())) < 0.1
+
+
+def test_end_to_end_synthetic_beats_baseline():
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig, fit
+    from bspinn.report import evaluate
+    data, gt, _ = make_synthetic(6, (48, 48), noise=0.005, seed=1)
+    cfg = FitConfig(model="wires", calib=24, iters_wires=300, iters_auto=100, log_every=10 ** 9)
+    model, prob, hist, extra = fit(data, cfg, log=lambda *a: None)
+    rep, _, _ = evaluate(model, prob, extra, gt=gt, log=lambda *a: None)
+    v = rep["vs_ground_truth"]
+    assert v["biot_savart_model"]["absolute_err"] < v["lowres_division_baseline"]["absolute_err"]
+    assert rep["physics_rel_rms"]["div"] < 1e-3
+
+
+def test_batched_nudft_adjoint():
+    from bspinn.encoding import NUDFTOpBatched
+    t = torch.rand(3, 20, 2) * 8 - 4
+    v = torch.rand(3, 20) > 0.2
+    op = NUDFTOpBatched(t, v, (8, 8))
+    x = torch.randn(3, 2, 8, 8, dtype=torch.complex64)
+    y = torch.randn(3, 2, 20, dtype=torch.complex64)
+    assert torch.allclose((op.forward(x).conj() * y).sum(), (x.conj() * op.adjoint(y)).sum(), rtol=1e-4)
+
+
+def test_varpro_multiset_reduces_to_single():
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig, Problem
+    data, gt, _ = make_synthetic(4, (32, 32), noise=0.0, seed=2)
+    p = Problem(data, FitConfig(calib=16, calib_oversample=1))      # varpro path
+    C = torch.randn(4, p.coords.shape[0], dtype=torch.complex64)
+    one = p.data_loss(C)
+    # a second set that is identically zero must not change the residual
+    two = p.data_loss(torch.stack([C, torch.zeros_like(C)]))
+    assert torch.allclose(one, two, rtol=1e-3)
+
+
+def test_fold_sets_beat_single_set_on_folded_data():
+    from bspinn.data import make_folded_synthetic
+    from bspinn.fit import FitConfig, fit
+    from bspinn.report import evaluate
+    errs = {}
+    for fs in (0, 1):
+        data, gt, _ = make_folded_synthetic(6, (48, 48), noise=0.005, seed=1)
+        cfg = FitConfig(model="wires", calib=24, iters_wires=250, iters_auto=60, fold_sets=fs, log_every=10 ** 9)
+        model, prob, hist, extra = fit(data, cfg, log=lambda *a: None)
+        rep, _, _ = evaluate(model, prob, extra, gt=gt, log=lambda *a: None)
+        errs[fs] = rep["vs_ground_truth"]["biot_savart_model"]["absolute_err"]
+    assert errs[1] < errs[0]
+
+
+def test_fastmri_roundtrip(tmp_path):
+    from bspinn.fastmri import load_fastmri, write_fake_fastmri
+    p = str(tmp_path / "file_knee_CORPD_000.h5")
+    write_fake_fastmri(p, n_coils=5, n_slices=3, shape=(40, 40), acquisition="CORPD_FBK")
+    d = load_fastmri(p, calib=16)
+    assert d.kspace.shape == (3, 5, 16, 16) and d.geom.shape == (40, 40)
+    assert d.geom.plane == "coronal" and d.meta["calib_only"]
+
+
+def test_dynamic_frames_are_biot_savart():
+    from bspinn.dynamic import DynamicCoils
+    from bspinn.physics import divergence_and_curl
+    w = WireLoopCoils(3)
+    with torch.no_grad():
+        w.verts.normal_(); w.verts.mul_(0.2); w.verts[..., 0] += 2.0; w.amp.fill_(1.0)
+    st = HarmonicPINN(3, base=w)
+    dyn = DynamicCoils(st, T=5, K=2)
+    with torch.no_grad():
+        dyn.V.normal_(); dyn.V.mul_(0.05)
+    # moved wires (frame 3) must still give a source-free field: point-wise autograd check
+    xx = (torch.rand(60, 3) - 0.5).requires_grad_(True)
+    F = dyn.frame_field(xx, [3])[0, 1]
+    d, c = divergence_and_curl(F, xx)
+    assert d.abs().max() < 1e-3 * F.norm(dim=-1).max() and c.norm(dim=-1).max() < 1e-3 * F.norm(dim=-1).max()
+
+
+# ---------------------------------------------------------------- modularity & phase handling
+import pytest  # noqa: E402
+
+
+def test_phase_reference_keeps_relative_phase_and_signal():
+    from bspinn.recon import phase_reference, virtual_body_coil
+    g = torch.Generator().manual_seed(0)
+    C = torch.randn(2, 5, 12, 12, dtype=torch.complex64, generator=g)
+    m = torch.randn(2, 12, 12, dtype=torch.complex64, generator=g)
+    for mode in ("inati", "coil", "model"):
+        Cr, mr, info, Phi = phase_reference(C, mode, None, m)
+        rel = lambda X: X[:, :, None] * X[:, None].conj()             # all C_j C_k^*
+        assert torch.allclose(rel(Cr), rel(C), atol=1e-4)            # inter-coil phases unchanged
+        assert torch.allclose(Cr * mr[:, None], C * m[:, None], atol=1e-4)   # signal model unchanged
+    d = virtual_body_coil(C)
+    Cr, _, _, _ = phase_reference(C, "inati", None, None, d)
+    T = torch.einsum("n,snhw->shw", d.conj(), Cr)
+    assert T.imag.abs().max() < 1e-4 and T.real.min() > 0           # virtual body coil is real positive
+    # the robust weights never make the reference weaker than Inati's eigenvector weights
+    s = lambda d: (torch.einsum("n,snhw->shw", d.conj(), C).abs() / C.abs().pow(2).sum(1).sqrt()).min()
+    assert s(virtual_body_coil(C, robust=True)) >= s(virtual_body_coil(C, robust=False)) - 1e-4
+
+
+def test_invalid_option_combinations_are_rejected():
+    from bspinn.fit import FitConfig
+    with pytest.raises(ValueError):
+        FitConfig(model="free", fold_sets=1).validate()
+    with pytest.raises(ValueError):
+        FitConfig(model="wires", free_sets=1).validate()
+    with pytest.raises(ValueError):
+        FitConfig(fold_sets=1).validate("dynamic")
+    with pytest.raises(ValueError):
+        FitConfig(model="wires").validate("shared")
+    FitConfig().validate("fit"); FitConfig().validate("dynamic"); FitConfig().validate("shared")
+
+
+@pytest.mark.parametrize("opts", [
+    dict(model="wires"),
+    dict(model="pinn"),
+    dict(model="pinn", field_mode="complex"),
+    dict(model="free"),
+    dict(model="wires", fold_sets=1),
+    dict(model="pinn", shift_sets=1),
+    dict(model="pinn", free_sets=1),
+    dict(model="pinn", slice_batch=1, phase_ref="coil"),
+    dict(model="pinn", phase_ref="model", data_term="kspace"),
+    dict(model="pinn", phase_ref="inati-eig", init="wires", loops_per_coil=2),
+])
+def test_option_matrix(opts):
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig, fit
+    from bspinn.report import evaluate
+    data, gt, _ = make_synthetic(4, (32, 32), n_slices=2, noise=0.005, seed=3)
+    cfg = FitConfig(calib=16, iters_auto=10, iters_wires=20, iters_pinn=10, iters_free_init=10,
+                    n_colloc=64, log_every=10 ** 9, **opts)
+    model, prob, hist, extra = fit(data, cfg, log=lambda *a: None)
+    rep, C, img = evaluate(model, prob, extra, gt=gt, log=lambda *a: None)
+    assert torch.is_complex(C) and torch.isfinite(C).all() and C.shape == (2, 4, 32, 32)
+    assert rep["phase_reference"]["phase_ref"] == cfg.phase_ref
+    assert (rep["physics_rel_rms"] is None) == (cfg.model == "free")
+
+
+def test_channel_mixing_is_exact():
+    """Whitening + compression record a mixing matrix; a physical-coil model evaluated through it
+    gives exactly the data loss of the mixed (virtual-channel) maps."""
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig, Problem
+    data, gt, _ = make_synthetic(6, (32, 32), noise=0.01, noise_corr=1.0, seed=4)
+    raw = data.kspace.copy()
+    data.prewhiten(); data.compress(4, calib=16)
+    M = data.meta["mix"]
+    assert M.shape == (4, 6)
+    assert np.allclose(data.kspace, np.einsum("vn,sn...->sv...", M, raw), atol=1e-4)
+    p_phys = Problem(data, FitConfig(calib=16, model_channels="physical", calib_oversample=1))
+    p_data = Problem(data, FitConfig(calib=16, model_channels="data", calib_oversample=1))
+    assert p_phys.N_model == 6 and p_data.N_model == 4 and p_phys.N == 4
+    C = torch.randn(6, p_phys.coords.shape[0], dtype=torch.complex64)
+    Cv = torch.as_tensor(M) @ C
+    assert torch.allclose(p_phys.data_loss(C), p_data.data_loss(Cv), rtol=1e-4)
+
+
+def test_fit_with_whitening_and_compression_runs():
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig, fit
+    from bspinn.report import evaluate
+    data, gt, _ = make_synthetic(6, (32, 32), noise=0.01, noise_corr=1.0, seed=5)
+    cfg = FitConfig(calib=16, iters_auto=10, iters_wires=20, iters_pinn=10, n_colloc=64, compress=4, log_every=10 ** 9)
+    model, prob, hist, extra = fit(data, cfg, log=lambda *a: None)
+    rep, C, img = evaluate(model, prob, extra, gt=gt, log=lambda *a: None)
+    assert C.shape[1] == 4 and model.n_coils == 6
+    assert "biot_savart_model_physical_channels" in rep["vs_ground_truth"]
+
+
+def test_phase_vortex_counter():
+    from bspinn.recon import phase_vortices
+    y, x = torch.meshgrid(torch.linspace(-1, 1, 41), torch.linspace(-1, 1, 41), indexing="ij")
+    sup = torch.ones(41, 41, dtype=torch.bool)
+    C = torch.stack([(x + 0.03) + 1j * (y + 0.02),            # one +1 vortex (field zero)
+                     ((x + 0.03) - 1j * (y + 0.02)) * ((x - 0.51) + 1j * (y + 0.02)),  # -1 and +1
+                     torch.exp(1j * 3 * x) * (2 + x)])[None]    # smooth phase ramp, no zero
+    v = phase_vortices(C, sup)
+    assert v["per_coil"] == [1, 2, 0] and v["net_winding"] == [1, 0, 0]
+
+
+def test_init_z_offset_breaks_mirror_symmetry():
+    """In-plane loops get zero gradient w.r.t. their out-of-plane position (z -> -z symmetry)."""
+    w = WireLoopCoils(2, 1, 16, 1)
+    P = torch.stack(torch.meshgrid(torch.linspace(-.5, .5, 9), torch.linspace(-.5, .5, 9), indexing="ij"), -1).reshape(-1, 2)
+    pts = torch.cat([P, torch.zeros(len(P), 1)], 1)
+    wts = torch.ones(2, len(P))
+    for off, expect_zero in ((0.0, True), (0.15, False)):
+        w.init_from_data(pts, wts, pts, normal_axis=2, z_offset=off)
+        v = w.verts.detach().clone().requires_grad_(True)
+        (w.field(pts, verts=v)[..., :2] ** 2).sum().backward()
+        g = v.grad.sum((-2, -3))                                  # rigid translation gradient (N,3)
+        gz = (g[:, 2].abs() / g[:, :2].norm(dim=-1)).max().item()
+        assert (gz < 1e-3) == expect_zero, (off, gz)
+
+
+def _small_case(noise=0.01):
+    from bspinn.data import make_synthetic
+    from bspinn.methods import EvalCase
+    d, C, obj = make_synthetic(6, (64, 64), noise=noise, seed=0)
+    return EvalCase("t", d.kspace[0], np.ones((64, 64), bool), (16, 16), sigma=noise, gt_maps=C[0], gt_object=obj[0])
+
+
+def test_evaluation_oracle_sits_on_noise_floor_and_gfactor_is_one_at_R1():
+    from bspinn import evaluation as ev
+    from bspinn.methods import lowres
+    case = _small_case()
+    obj = ev.object_mask(case)
+    k_or = ev.kspace_consistency(case.gt_maps, case)
+    assert abs(k_or["outside_acs"]["residual_over_noise_floor"] - 1) < 0.05
+    k_lr = ev.kspace_consistency(lowres(case), case)
+    assert k_lr["outside_acs"]["residual_over_noise_floor"] > k_or["outside_acs"]["residual_over_noise_floor"]
+    g, _ = ev.gfactor(ev.normalise(case.gt_maps), 1, 1, obj)
+    assert abs(g["mean"] - 1) < 1e-4 and abs(g["max"] - 1) < 1e-4
+    props = ev.map_properties(case.gt_maps, case, obj)
+    assert props["gt_subspace_err"] < 1e-6 and props["gt_rel_phase_err_deg"] < 1e-3 and props["coverage"] == 1.0
+
+
+def test_cg_sense_fully_sampled_equals_combination():
+    from bspinn import evaluation as ev
+    from bspinn.methods import ifft2c
+    case = _small_case(0.0)
+    Cn = ev.normalise(case.gt_maps)
+    x = ev.cg_sense(case.ksp, np.ones(case.shape, bool), Cn, lam=0.0, iters=60)
+    m = (Cn.conj() * ifft2c(case.ksp)).sum(0)
+    assert np.linalg.norm(x - m) / np.linalg.norm(m) < 1e-4
+
+
+def test_walsh_and_inati_recover_synthetic_subspace():
+    from bspinn import evaluation as ev
+    from bspinn.methods import inati, walsh
+    case = _small_case(0.001)
+    obj = ev.object_mask(case)
+    for f in (walsh, inati):
+        assert ev.map_properties(f(case), case, obj)["gt_subspace_err"] < 5e-3
+
+
+def test_oversampled_calibration_grid_setup():
+    """calib_oversample=2: maps/image live on a 2x grid over the same FOV; only the central
+    calibration box of that grid's k-space is observed, so the k-space data term is used."""
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig, Problem
+    data, gt, obj = make_synthetic(4, (32, 32), noise=0.0, seed=1)
+    p = Problem(data, FitConfig(calib=16, calib_oversample=2))
+    assert p.data_term == "kspace" and p.calib == (32, 32) and p.kcalib == (16, 16)
+    assert float(p.mk.sum()) == 16 * 16 * p.mk.shape[0]
+
+
+# ----------------------------------------------------------------------------- 3-D
+def test_volume_grid_maps_array_axes_to_physical_axes():
+    from bspinn.volume import VolumeGeometry
+    g = VolumeGeometry((8, 6, 4), (2.0, 1.0, 1.0), "zyx").grid()
+    assert g.shape == (8, 6, 4, 3)
+    assert torch.allclose(g[:, 0, 0, 2], torch.linspace(float(g[0, 0, 0, 2]), float(g[-1, 0, 0, 2]), 8))   # z along axis 0
+    assert float(g[..., 0].std()) > 0 and float(g[:, :, 0, 0].std()) == 0                                    # x along axis 2
+
+
+def test_gfactor_3d_is_one_without_acceleration():
+    from bspinn import evaluation as ev
+    rng = np.random.default_rng(0)
+    C = ev.normalise(rng.normal(size=(6, 8, 8, 8)) + 1j * rng.normal(size=(6, 8, 8, 8)))
+    obj = np.ones((8, 8, 8), bool)
+    g, _ = ev.gfactor(C, (1, 1), (1, 2), obj)
+    assert abs(g["mean"] - 1) < 1e-5
+    g2, _ = ev.gfactor(C, (2, 2), (1, 2), obj)
+    assert g2["mean"] >= 1
+
+
+def test_coarse_correction_matches_exact_network():
+    from bspinn.fit import FitConfig, make_pinn
+    from bspinn.models import WireLoopCoils
+    from bspinn.volume import CoarseCorrection, Problem3D, make_synthetic3d
+    d, gt, obj = make_synthetic3d(4, (16, 16, 16), noise=0.0)
+    for cg, tol in ((8, 0.05), (16, 1e-5)):
+        cfg = FitConfig(calib=8, calib_oversample=2, correction_grid=cg)
+        p = Problem3D(d, cfg)
+        w = WireLoopCoils(4, 1, 8, 1)
+        with torch.no_grad():
+            w.verts.normal_(0, 0.3); w.verts.add_(torch.tensor([1.6, 0, 0])); w.amp.fill_(1)
+        pinn = make_pinn(p, cfg, w, 1)
+        torch.nn.init.normal_(pinn.net[-1].weight, std=0.05)
+        exact = pinn.correction_field(p.coords, create_graph=False)
+        wrapped = CoarseCorrection(pinn, p).field(p.coords, create_graph=False) - pinn._base_field(p.coords)
+        err = float((wrapped - exact).norm() / exact.norm())
+        assert err < tol, (cg, err)
+
+
+def test_fit3d_recovers_synthetic_volume_and_cli_runs(tmp_path):
+    import json
+    from bspinn.cli import main
+    main(["fit3d", "--synthetic", "--size", "24", "--coils", "6", "--noise-level", "0.003", "--out", str(tmp_path),
+          "--calib", "8", "--iters-auto", "40", "--iters-wires", "200", "--iters-pinn", "40", "--threads", "1",
+          "--correction-grid", "8", "--model", "pinn"])
+    rep = json.load(open(tmp_path / "report.json"))
+    assert rep["vs_ground_truth"]["subspace_err"] < 2e-2
+    assert np.load(tmp_path / "maps.npy").shape == (6, 24, 24, 24)
+
+
+def test_orientation_auto_finds_b0_axis():
+    from bspinn.fit import FitConfig
+    from bspinn.volume import VolumeGeometry, make_synthetic3d, select_orientation
+    d, gt, obj = make_synthetic3d(6, (20, 20, 20), noise=0.003)
+    d.geom = VolumeGeometry(d.geom.shape, d.geom.voxel, "yxz")              # wrong guess on purpose
+    best, scores = select_orientation(d, FitConfig(calib=8, iters_auto=80, threads=1), log=lambda *a: None)
+    assert best == "zyx", scores

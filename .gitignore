@@ -1,0 +1,10 @@
+data/
+__pycache__/
+.pytest_cache/
+*.npy
+*.npz
+*.pt
+runs/eval/*/maps/
+runs/eval/*/maps_lowresgrid/
+runs/eval3d/*/maps/
+runs/eval3d_test/
