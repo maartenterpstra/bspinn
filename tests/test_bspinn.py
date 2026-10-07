@@ -498,3 +498,24 @@ def test_api_image_conventions():
     assert abs(r / np.sqrt(info["data_loss"]) - 1) < 0.1, (r, info["data_loss"])     # same residual as the fit
     with pytest.raises(ValueError):
         estimate_maps(k, "2d", compress=2, verbose=False)
+
+
+def test_api_mask_maps():
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    d, _, _ = make_synthetic(4, (32, 32), noise=0.01)
+    k = d.kspace[0]
+    few = dict(calib=12, verbose=False, iters_auto=2, iters_wires=3, iters_pinn=3)
+    C, img, info = estimate_maps(k, "2d", return_image=True, mask_maps=True, **few)
+    sup = info["support"]
+    assert info["maps_masked"] and 0 < sup.mean() < 1
+    assert np.all(C[:, ~sup] == 0) and np.all(img[~sup] == 0) and np.all(info["image_joint"][~sup] == 0)
+    assert np.allclose((np.abs(C[:, sup]) ** 2).sum(0), 1, atol=1e-4)
+    own = np.zeros((32, 32), bool); own[8:24, 8:24] = True
+    C2, info2 = estimate_maps(k, "2d", mask_maps=own, **few)
+    assert np.array_equal(info2["support"], own) and np.all(C2[:, ~own] == 0)
+    loose = estimate_maps(k, "2d", mask_maps=True, support_threshold=0.02, support_dilate=4, **few)[1]["support"]
+    assert loose.sum() >= sup.sum()
+    kd = np.stack([k] * 3, -1)
+    Cd, infod = estimate_maps(kd, "dynamic", mask_maps=True, rank=0, **few)
+    assert Cd.shape == kd.shape and np.all(Cd[:, ~infod["support"]] == 0)

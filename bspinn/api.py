@@ -30,7 +30,8 @@ PRESETS = {      # iterations: (handedness/orientation probe, wire stage, PINN s
 def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, plane="axial", axes="auto",
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
-                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-3, **cfg_overrides):
+                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-3, mask_maps=False, support_threshold=0.1,
+                  support_dilate=2, **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
     Parameters
@@ -64,6 +65,14 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     return_image : also return the full-resolution image reconstructed with the estimated maps
         (SENSE: closed form for fully sampled data, CG-SENSE with Tikhonov ``sense_lambda`` otherwise;
         per frame for dynamic data). Returns (maps, image, info).
+    mask_maps : False (default; maps cover the whole FOV) | True (zero the maps, and the images, outside
+        the estimated object support ``info['support']``, as ESPIRiT's cropped maps; CG-SENSE is then
+        support-constrained) | a bool array of the spatial shape (your own support; also used for the
+        phase reference).
+    support_threshold, support_dilate : the estimated support is a low-resolution root-sum-of-squares
+        image (calibration region, Hann window, 5-pixel smoothing) above ``support_threshold`` x its
+        99th percentile, holes filled, dilated by ``support_dilate`` pixels. Lower the threshold or
+        dilate more if the mask clips the object edge (masked maps make SENSE zero there).
     cfg_overrides : any other FitConfig field (e.g. lambda_phys=0.1, field_mode='complex').
 
     Returns
@@ -139,7 +148,12 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
              else np.einsum("ij,j...->i...", Minv, C))
     C_raw = C
     # common phase + normalisation (per-pixel complex scalars, identical for all coils)
-    sup = _support(ksp, mask, layout, cfg.calib)
+    if isinstance(mask_maps, (bool, np.bool_)) or mask_maps is None:
+        sup = _support(ksp, mask, layout, cfg.calib, support_threshold, support_dilate)
+    else:
+        sup = np.asarray(mask_maps, bool)
+        if sup.shape != ksp.shape[1:3 if layout == "dynamic" else None]:
+            raise ValueError(f"mask_maps array must have the spatial shape {ksp.shape[1:3 if layout == 'dynamic' else None]}")
     C = _finish(C, sup, layout, phase_ref, normalise)
     # joint-fit image, interpolated to the full matrix, in the convention of the returned maps
     info["image_joint"] = _joint_image(info.pop("_m", None), prob, C_raw, C, layout)
@@ -147,7 +161,13 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         C = np.moveaxis(C, 0, -1)                       # (T,N,X,Y) -> (N,X,Y,T)
         if info["image_joint"] is not None:
             info["image_joint"] = np.moveaxis(info["image_joint"], 0, -1)
-    info.update(support=sup, seconds=time.time() - t0, config=_cfg_dict(cfg))
+    if mask_maps is not False and mask_maps is not None:
+        sx = sup[..., None] if layout == "dynamic" else sup         # dynamic: same support for all frames
+        C = C * sx[None]
+        if info["image_joint"] is not None:
+            info["image_joint"] = info["image_joint"] * sx
+    info.update(support=sup, maps_masked=mask_maps is not False and mask_maps is not None,
+                seconds=time.time() - t0, config=_cfg_dict(cfg))
     log(f"maps {C.shape} in {info['seconds']:.0f}s")
     C = C.astype(np.complex64)
     if not return_image:
@@ -249,7 +269,7 @@ def _cfg_dict(cfg):
     return {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)}
 
 
-def _support(ksp, mask, layout, calib):
+def _support(ksp, mask, layout, calib, thresh=0.1, dilate=2):
     """Object mask from a Hann-windowed low-resolution root-sum-of-squares image (used only to choose
     the phase reference)."""
     from scipy.ndimage import binary_dilation, binary_fill_holes, uniform_filter
@@ -269,9 +289,9 @@ def _support(ksp, mask, layout, calib):
     img = np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(k * win, axes=ax), axes=ax), axes=ax)
     rss = np.sqrt((np.abs(img) ** 2).sum(0))
     rss = uniform_filter(rss, 5)
-    s = rss > 0.1 * np.quantile(rss, 0.99)
+    s = rss > thresh * np.quantile(rss, 0.99)
     s = binary_fill_holes(s)
-    return binary_dilation(s, iterations=2)
+    return binary_dilation(s, iterations=dilate) if dilate > 0 else s
 
 
 def _finish(C, sup, layout, phase_ref, normalise):

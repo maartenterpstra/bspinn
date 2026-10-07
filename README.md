@@ -282,7 +282,7 @@ same options (`.npy`, `.npz` with `ksp`/`mask`/`noise`, or BART `.cfl` with `--c
 ```
 python -m bspinn.cli maps ksp.npy --layout 2d|3d|dynamic --out maps.npy [--spacing ...] [--plane ...]
        [--axes auto|xyz] [--calib 24] [--noise noise.npy] [--quality fast] [--rank 2]
-       [--physics helmholtz --b0 3] [--image img.npy] [--set iters_pinn=1000 lambda_phys=0.1]
+       [--physics helmholtz --b0 3] [--image img.npy] [--mask-maps [sup.npy]] [--set iters_pinn=1000 lambda_phys=0.1]
 ```
 
 What matters:
@@ -294,6 +294,13 @@ What matters:
   2-D/dynamic `plane` tells the model where B0 points (axial = through the slice; coronal/sagittal =
   along the first image axis). If unsure, run both and keep the lower `info["data_loss"]`. In 3-D
   `axes="auto"` finds the B0 axis from the data.
+* **Masked maps**: `mask_maps=True` zeros maps and images outside the estimated object support
+  (`info["support"]`; tune with `support_threshold=0.1`, `support_dilate=2`), or pass your own bool
+  mask (`mask_maps=sup`; CLI `--mask-maps [sup.npy]`). By default the maps cover the whole FOV, since
+  the physics model extrapolates smoothly. On a 64² synthetic at R ≈ 3 the default support covered
+  the whole object (72 % of the FOV), and support-constrained CG-SENSE lowered the in-object error
+  from 16.2 % to 14.9 % and the energy outside the object from 1.15 to 0.65. If the mask clips the
+  object edge, SENSE is zero there, so lower the threshold or dilate more.
 * **Noise**: pass noise-only samples `(n, coils)` for pre-whitening if you have them; maps come back
   for the original channels (the SENSE image whitens data and maps alike). With strongly correlated
   channels use `quality="default"`: the fit converges more slowly after whitening.

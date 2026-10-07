@@ -123,6 +123,10 @@ def main(argv=None):
     pm.add_argument("--device", default="cpu")
     pm.add_argument("--threads", type=int, default=0)
     pm.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="any FitConfig field, e.g. iters_pinn=1000")
+    pm.add_argument("--mask-maps", nargs="?", const=True, default=False, metavar="SUPPORT.npy",
+                    help="zero the maps (and images) outside the object support: estimated, or your own bool .npy")
+    pm.add_argument("--support-threshold", type=float, default=0.1, help="estimated support: fraction of the 99th pct")
+    pm.add_argument("--support-dilate", type=int, default=2, help="estimated support: dilation in pixels")
     pm.add_argument("--image", "--combined", dest="image", default=None,
                     help="also write the full-resolution image (SENSE with the estimated maps; CG if undersampled) "
                          "here, and the joint-fit (calibration-resolution) image next to it as *_joint.npy")
@@ -225,7 +229,9 @@ def _run_maps(a):
     res = estimate_maps(k, a.layout, return_image=bool(a.image), coil_axis=a.coil_axis, mask=mask, spacing=a.spacing, plane=a.plane,
                                axes=a.axes, calib=calib, noise=noise, physics=a.physics, b0_tesla=a.b0,
                                model=a.model, rank=a.rank, quality=a.quality, normalise=a.normalise,
-                               phase_ref=a.phase_ref, device=a.device, threads=a.threads, **over)
+                               phase_ref=a.phase_ref, device=a.device, threads=a.threads,
+                               mask_maps=np.load(a.mask_maps) if isinstance(a.mask_maps, str) else a.mask_maps,
+                               support_threshold=a.support_threshold, support_dilate=a.support_dilate, **over)
     maps, info = (res[0], res[2]) if a.image else res
     maps = np.moveaxis(maps, 0, a.coil_axis)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
