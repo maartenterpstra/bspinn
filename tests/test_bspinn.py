@@ -448,3 +448,28 @@ def test_helmholtz_needs_3d_and_wave_maps_match_training():
     train = CoarseCorrection(pinn, p).sensitivity(p.coords, create_graph=False).detach()
     ev_ = volume_maps(pinn, p, shape=p.calib).reshape(4, -1)
     assert float((train - ev_).norm() / train.norm()) < 1e-5
+
+
+@pytest.mark.parametrize("layout,shape", [("2d", (4, 24, 20)), ("3d", (4, 12, 12, 10)), ("dynamic", (4, 20, 20, 3))])
+def test_api_shapes_and_coil_axis(layout, shape):
+    from bspinn.api import coil_combine, estimate_maps
+    from bspinn.volume import make_synthetic3d
+    if layout == "3d":
+        d, _, _ = make_synthetic3d(4, shape[1:], noise=0.0)
+        k = d.kspace
+    else:
+        from bspinn.data import make_synthetic
+        d, _, _ = make_synthetic(4, shape[1:3], noise=0.0)
+        k = d.kspace[0]
+        if layout == "dynamic":
+            k = np.stack([k] * shape[3], -1)
+    few = dict(iters_auto=2, iters_wires=3, iters_pinn=3, iters_dynamic=2, rank=1) if layout == "dynamic" else \
+        dict(iters_auto=2, iters_wires=3, iters_pinn=3)
+    kw = dict(calib=8, verbose=False, axes="xyz") if layout == "3d" else dict(calib=8, verbose=False)
+    C, info = estimate_maps(np.moveaxis(k, 0, -1), layout, coil_axis=-1, **kw, **few)
+    assert C.shape == k.shape and C.dtype == np.complex64 and np.isfinite(C).all()
+    assert np.allclose((np.abs(C) ** 2).sum(0), 1, atol=1e-4)                     # rss normalisation
+    assert info["support"].shape == k.shape[1:] if layout != "dynamic" else info["support"].shape == k.shape[1:3]
+    assert coil_combine(k, C, layout).shape == k.shape[1:]
+    with pytest.raises(ValueError):
+        estimate_maps(k[0], layout, verbose=False)

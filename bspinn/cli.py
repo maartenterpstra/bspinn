@@ -102,7 +102,33 @@ def main(argv=None):
     p3.add_argument("--mismatch", type=float, default=0.0)
     _add_cfg_args(p3)
 
+    pm = sub.add_parser("maps", help="simplest path: k-space array file -> maps file (2-D, 3-D or dynamic)")
+    pm.add_argument("path", help=".npy (complex array), .npz (key 'ksp', optional 'mask', 'noise') or BART .cfl")
+    pm.add_argument("--layout", required=True, choices=["2d", "3d", "dynamic"],
+                    help="2d: (coils,x,y); 3d: (coils,x,y,z); dynamic: (coils,x,y,time)")
+    pm.add_argument("--out", required=True, help="output .npy (maps, same shape/axis order as the input)")
+    pm.add_argument("--coil-axis", type=int, default=0, help="axis of the coils in the input (BART .cfl: last)")
+    pm.add_argument("--spacing", type=float, nargs="+", default=None, help="pixel/voxel size in mm per spatial axis")
+    pm.add_argument("--plane", default="axial", choices=["axial", "coronal", "sagittal"])
+    pm.add_argument("--axes", default="auto", help="3-D: physical axes of x,y,z array axes (e.g. xyz) or auto")
+    pm.add_argument("--calib", type=int, nargs="+", default=None, help="ACS size (one value or one per axis)")
+    pm.add_argument("--noise", default=None, help="noise-only samples (.npy, (n, coils)) for pre-whitening")
+    pm.add_argument("--physics", default="laplace", choices=["laplace", "helmholtz"])
+    pm.add_argument("--b0", type=float, default=3.0, help="field strength in T (helmholtz)")
+    pm.add_argument("--model", default="pinn", choices=["pinn", "wires"])
+    pm.add_argument("--rank", type=int, default=2, help="dynamic: temporal modes (0 = static maps)")
+    pm.add_argument("--quality", default="default", choices=["fast", "default"])
+    pm.add_argument("--normalise", default="rss", choices=["rss", "none"])
+    pm.add_argument("--phase-ref", default="inati", choices=["inati", "model", "coil"])
+    pm.add_argument("--device", default="cpu")
+    pm.add_argument("--threads", type=int, default=0)
+    pm.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="any FitConfig field, e.g. iters_pinn=1000")
+    pm.add_argument("--combined", default=None, help="also write the coil-combined image (fully sampled data) here")
+
     a = ap.parse_args(argv)
+    if a.cmd == "maps":
+        _run_maps(a)
+        return
     if a.cmd == "fit3d":
         from .volume import evaluate3d, fit3d, load_volume, make_synthetic3d
         cfg = FitConfig(**{f.name: getattr(a, f.name) for f in dataclasses.fields(FitConfig)})
@@ -165,6 +191,53 @@ def main(argv=None):
     model, prob, hist, extra = fit(data, cfg)
     evaluate(model, prob, extra, out_dir=a.out, cfg=cfg, history=hist, gt=gt,
              recon_size=getattr(a, "recon_size", 128), seed=cfg.seed, ref_maps=refs)
+
+
+def _run_maps(a):
+    import os
+    from .api import coil_combine, estimate_maps
+    mask = noise = None
+    if a.path.endswith(".npy"):
+        k = np.load(a.path)
+    elif a.path.endswith(".npz"):
+        z = np.load(a.path)
+        k = z["ksp"]
+        mask = z["mask"] if "mask" in z else None
+        noise = z["noise"] if "noise" in z else None
+    else:
+        from .data import _read_cfl
+        k = np.squeeze(_read_cfl(a.path))
+    if a.noise:
+        noise = np.load(a.noise)
+    if mask is not None:
+        mask = np.moveaxis(np.asarray(mask), a.coil_axis, 0)[0] if mask.ndim == k.ndim else mask
+    over = {}
+    defaults = {f.name: f.default for f in dataclasses.fields(FitConfig)}
+    for kv in a.set:
+        key, val = kv.split("=", 1)
+        if key not in defaults:
+            raise SystemExit(f"unknown option {key}")
+        t = type(defaults[key])
+        over[key] = (val.lower() in ("1", "true", "yes")) if t is bool else t(val)
+    calib = None if a.calib is None else (a.calib[0] if len(a.calib) == 1 else tuple(a.calib))
+    maps, info = estimate_maps(k, a.layout, coil_axis=a.coil_axis, mask=mask, spacing=a.spacing, plane=a.plane,
+                               axes=a.axes, calib=calib, noise=noise, physics=a.physics, b0_tesla=a.b0,
+                               model=a.model, rank=a.rank, quality=a.quality, normalise=a.normalise,
+                               phase_ref=a.phase_ref, device=a.device, threads=a.threads, **over)
+    maps = np.moveaxis(maps, 0, a.coil_axis)
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    np.save(a.out, maps)
+    meta = {k_: v for k_, v in info.items() if k_ not in ("support", "model", "problem", "temporal_modes", "config")}
+    if "k2" in meta:
+        meta["k2"] = [meta["k2"].real, meta["k2"].imag]
+    if "temporal_modes" in info:
+        np.save(a.out.replace(".npy", "") + "_modes.npy", info["temporal_modes"])
+    np.save(a.out.replace(".npy", "") + "_support.npy", info["support"])
+    with open(a.out.replace(".npy", "") + "_info.json", "w") as f:
+        json.dump(meta, f, indent=1, default=str)
+    if a.combined:
+        np.save(a.combined, coil_combine(k, maps, a.layout, a.coil_axis))
+    print(f"wrote {a.out} {maps.shape}")
 
 
 if __name__ == "__main__":

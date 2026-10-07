@@ -249,6 +249,59 @@ gives the usual Σ|C|² = 1 version for SENSE/BART.
 
 ## 4. Usage
 
+### 4.0 Quick start: a k-space array in, maps out
+
+```python
+import numpy as np
+from bspinn.api import estimate_maps, coil_combine
+
+ksp = np.load("ksp.npy")          # complex; unsampled entries exactly 0
+
+maps, info = estimate_maps(ksp, "2d", spacing=(1.0, 1.0), plane="axial")            # (coils, x, y)
+maps, info = estimate_maps(ksp, "3d", spacing=(1.0, 1.0, 1.0), axes="auto")         # (coils, x, y, z)
+maps, info = estimate_maps(ksp, "dynamic", spacing=(1.5, 1.5), rank=2)              # (coils, x, y, time)
+
+img = coil_combine(ksp, maps, "2d")    # fully sampled: SENSE-optimal combination
+```
+
+`maps` has the shape and axis order of `ksp`, phase-referenced (Inati virtual body coil) and
+RSS-normalised (`normalise="none"` keeps the raw, smoothly extrapolated model scale). Command line,
+same options (`.npy`, `.npz` with `ksp`/`mask`/`noise`, or BART `.cfl` with `--coil-axis -1`):
+
+```
+python -m bspinn.cli maps ksp.npy --layout 2d|3d|dynamic --out maps.npy [--spacing ...] [--plane ...]
+       [--axes auto|xyz] [--calib 24] [--noise noise.npy] [--quality fast] [--rank 2]
+       [--physics helmholtz --b0 3] [--combined img.npy] [--set iters_pinn=1000 lambda_phys=0.1]
+```
+
+What matters:
+
+* **Calibration**: the centre `calib` points per axis (default 24 in 2-D/dynamic, 12 in 3-D) should
+  be (densely) sampled; set `calib` to your ACS size. Undersampled entries inside it are handled
+  (k-space data term), but must be zero.
+* **Geometry**: `spacing` in mm (anisotropic voxels matter: the PDE is not scale-invariant).
+  2-D/dynamic `plane` tells the model where B0 points (axial = through the slice; coronal/sagittal =
+  along the first image axis). If unsure, run both and keep the lower `info["data_loss"]`. In 3-D
+  `axes="auto"` finds the B0 axis from the data.
+* **Noise**: pass noise-only samples `(n, coils)` for pre-whitening if you have them; maps come back
+  for the original channels.
+* **Dynamic**: Cartesian frames, each with a sampled centre. `rank` = number of temporal modes of the
+  coil motion (`rank=0`: one static map set; frames only add data). `info["temporal_modes"]` (T×rank)
+  is a respiratory-like surrogate.
+* **Helmholtz** (`physics="helmholtz"`, 3-D only): for body imaging at ≥ 3 T; give the real voxel
+  size (it sets the wavelength) and `b0_tesla`. `info["tissue"]` = fitted homogeneous (ε_r, σ).
+* **Run time** (measured, 2 CPU cores, `quality="fast"`): 2-D 48×48, 6 coils ≈ 1.5 min (300 PINN
+  iterations); dynamic 48×48×16 frames, 8 coils ≈ 10 min; 3-D 32³, 12 coils with `axes="auto"` ≈ 7 min;
+  3-D 48³ at evaluation settings ≈ 16 min (Laplace) or 42 min (Helmholtz) on one core. Cost scales with the calibration grid
+  (`calib`), not with the image matrix. Use `device="cuda"` if available.
+* **Sanity check on synthetic data with known maps** (same calls, `quality="fast"`): subspace error
+  3.9e-5 (2-D 96², 8 coils), 2.6e-4 (dynamic, moving anterior coils; the recovered temporal mode
+  correlates 0.997 with the true motion), 6.2e-4 (3-D 32³; `quality="default"` at 48³ gives 5.8e-5,
+  §8). `info["data_loss"]` is the relative calibration residual; compare it between runs (plane,
+  options), not across datasets.
+
+### 4.1 Full command line
+
 ```
 python -m bspinn.cli fit PATH --out DIR [options]
   data:     --plane axial|coronal|sagittal  --pixel-spacing ROW COL  --slice-spacing MM  --slices I J ...
@@ -679,6 +732,7 @@ effects relative to coils in air beside a body: relative Laplacian of the maps 4
 
 | file | content |
 |---|---|
+| `api.py` | `estimate_maps` / `coil_combine`: the one-call interface of §4.0 (CLI `maps`) |
 | `physics.py` | closed-form Biot–Savart for polylines, B→C mapping, autograd div/curl, Maxwell residual |
 | `models.py` | `WireLoopCoils` (hard), `HarmonicPINN` (soft / hybrid correction) |
 | `fit.py` | `FitConfig`, calibration `Problem` (VarPro / k-space / NUDFT), training stages, auto-handedness |
