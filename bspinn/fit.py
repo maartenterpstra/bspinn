@@ -63,6 +63,12 @@ class FitConfig:
     wire_radius: float = 0.05        # conductor radius (normalised; Rankine core): the field is bounded near
                                      #   the wires instead of ~1/d; exact beyond this distance, hence exact
                                      #   inside the object while wire_radius <= outside_margin. 0 = thin wires
+    fov_extend: float = 0.0          # objects cut by the FOV edge are assumed to continue this far beyond it
+                                     #   (normalised) for the conductor keep-out
+    lambda_fov: float = 0.0          # optional prior: push conductors out of the imaged region (FOV box,
+                                     #   2-D: +/- slab around the slice) where the data allow; the field in
+                                     #   the air of the image is unobserved, so this only changes the
+                                     #   extrapolation outside the object
     air_colloc: float = 0.25         # fraction of Laplace collocation points in the air around the object
                                      #   (>= 2 wire radii from any wire): keeps the network correction harmonic,
                                      #   hence smooth, outside the object too. 0 = object only
@@ -246,7 +252,8 @@ class Problem:
         self.N_model = self.mix.shape[1] if self.mix is not None else N
         self.coords = geom.grid((h, w)).reshape(-1, 3)              # (S*h*w,3)
         from .keepout import KeepOut
-        self.keep = KeepOut(self.support, self.coords.reshape(S, h, w, 3), volumetric=False, slab=cfg.slab)
+        self.keep = KeepOut(self.support, self.coords.reshape(S, h, w, 3), volumetric=False, slab=cfg.slab,
+                            extend=cfg.fov_extend)
         sup = self.support.flatten() > 0
         self.support_pts = self.coords[sup]
         self.weights = (self.I.abs() ** 2).permute(1, 0, 2, 3).reshape(N, -1)
@@ -300,8 +307,8 @@ class Problem:
         """Object mask: RSS above both a fraction of its 99th percentile and ~3x the expected noise RSS."""
         thr = self.cfg.support_thresh * float(torch.quantile(rss.flatten(), 0.99))
         thr = max(thr, 3.0 * self.noise_sigma * np.sqrt(self.I.shape[1]))
-        from .keepout import fill_holes
-        return torch.from_numpy(fill_holes((rss > thr).cpu().numpy(), per_slice=True)).float()
+        from .keepout import clean_support
+        return torch.from_numpy(clean_support((rss > thr).cpu().numpy(), per_slice=True)).float()
 
     # ---------------------------------------------------------------- device
     _tensors = ("ks_full", "yk", "mk", "I", "support", "coords", "support_pts", "weights", "coil_images",
@@ -497,6 +504,9 @@ def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=pr
         Cs = sens_sets(model, prob.slice_coords(sl), create_graph=False)
         d = prob.data_loss(Cs, m, sl)
         out, curv = wires.regularisers(prob.keep, cfg.outside_margin)
+        if cfg.lambda_fov:
+            from .keepout import fov_penalty
+            out = out + cfg.lambda_fov / cfg.lambda_outside * fov_penalty(prob.keep, wires.verts, cfg.outside_margin)
         loss = d + cfg.lambda_outside * out + cfg.lambda_curv * curv + cfg.lambda_norm * prob.norm_loss(Cs, sl)
         loss = loss + _extra_penalty(model, Cs, m, cfg)
         loss.backward()
@@ -563,6 +573,9 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
         for w in wires:                     # the wires keep training here: keep them outside the object too
             out, _ = w.regularisers(prob.keep, cfg.outside_margin)   # (no curvature term: it shrinks loops)
             loss = loss + cfg.lambda_outside * out
+            if cfg.lambda_fov:
+                from .keepout import fov_penalty
+                loss = loss + cfg.lambda_fov * fov_penalty(prob.keep, w.verts, cfg.outside_margin)
         loss.backward(); opt.step(); sched.step()
         if it % cfg.log_every == 0 or it == iters - 1:
             _log(hist, it, data=d.item(), phys=phys.item())

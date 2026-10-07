@@ -553,3 +553,26 @@ def test_wires_stay_outside_object_in_every_stage():
         dist = prob.keep.distance(segment_samples(w.verts.detach(), 8))
         assert float(dist.min()) > 0.5 * cfg.outside_margin
         assert w.core == cfg.wire_radius
+
+
+def test_support_cleaning_and_fov_truncation():
+    from bspinn.geometry import SliceGeometry
+    from bspinn.keepout import KeepOut, clean_support
+    m = np.zeros((1, 40, 40), bool); m[0, 25:, 10:30] = True; m[0, :2, 15:25] = True; m[0, 30:33, 18:20] = False
+    c = clean_support(m, True)[0]
+    assert not c[:2].any() and c[30:33, 18:20].all()           # wrap-around blob dropped, hole filled
+    g = SliceGeometry((40, 40), (1, 1), np.zeros(1), "axial"); co = g.grid()
+    k = KeepOut(torch.from_numpy(c[None]).float(), co, False)
+    below = torch.tensor([[0.0, 1.25, 0.0]])                    # beyond the FOV edge the object touches
+    assert 0.2 < float(k.distance(below)) < 0.35
+    k2 = KeepOut(torch.from_numpy(c[None]).float(), co, False, extend=0.1)
+    assert float(k2.distance(below)) < float(k.distance(below)) - 0.05
+
+
+def test_plane_auto_finds_inplane_b0():
+    from bspinn.api import _select_plane
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig
+    d, _, _ = make_synthetic(8, (48, 48), plane="coronal", noise=0.005)
+    best, sc = _select_plane(d.kspace, None, (1.0, 1.0), None, FitConfig(calib=16, iters_auto=60), lambda *a: None)
+    assert best in ("coronal", "coronal_t") and sc["axial"] > min(sc.values()), sc

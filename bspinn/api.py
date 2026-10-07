@@ -27,7 +27,7 @@ PRESETS = {      # iterations: (handedness/orientation probe, wire stage, PINN s
 }
 
 
-def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, plane="axial", axes="auto",
+def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, plane="auto", axes="auto",
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-3, mask_maps=False, support_threshold=0.1,
@@ -43,9 +43,13 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     spacing : pixel/voxel size in mm per spatial axis ((dx, dy) or (dx, dy, dz)). Default 1 mm
         isotropic. Only the aspect ratio matters for 'laplace'; for 'helmholtz' the absolute size sets
         the wavelength, so pass the real voxel size.
-    plane : 2-D / dynamic: 'axial' | 'coronal' | 'sagittal'. Tells the model where B0 points relative
-        to the image (axial: B0 through the slice; coronal/sagittal: B0 along the first image axis).
-        If unsure, run twice and keep the lower 'data_loss' in ``info``.
+    plane : 2-D / dynamic: where B0 points relative to the image. 'auto' (default): short wire fits
+        with B0 through the slice ('axial'), along the image rows ('coronal'; 'sagittal' is the same up
+        to a rotation about B0) and along the image columns ('coronal_t'); the lowest calibration loss
+        wins (``info['plane_scores']``). Or give it: 'axial' | 'coronal' | 'sagittal' | 'coronal_t'.
+        Through-plane vs in-plane B0 is well identified; rows vs columns for in-plane B0 often is not
+        (a warning is issued when the two are within 15 %): pass ``plane`` if you know it.
+        A wrong plane fits much worse and can give false zeros inside the object.
     axes : 3-D: physical axis of each array axis, e.g. 'xyz' (B0 = z along the last axis), or 'auto'
         (default) to pick the B0 axis from the data (adds ~3 short wire fits).
     calib : calibration (ACS) size per axis, int or tuple. Default: 24 (2-D/dynamic), 12 (3-D) clipped
@@ -177,11 +181,39 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
 
 
 # ---------------------------------------------------------------------------------- per layout
+def _select_plane(kst, mst, spacing, noise, cfg, log, meta=None):
+    """kst (S,N,X,Y), mst (S,1,X,Y) or None. Returns (plane, scores)."""
+    from .data import MultiCoilData
+    from .fit import Problem, fit_wires
+    from .geometry import SliceGeometry
+    S, N, X, Y = kst.shape
+    scores = {}
+    for pl in ("axial", "coronal", "coronal_t"):
+        d = MultiCoilData(kst.copy(), SliceGeometry((X, Y), spacing, np.zeros(S), pl), mask=mst, noise=noise,
+                          meta=dict(meta or {}))
+        d.prewhiten()
+        prob = Problem(d, cfg).to(cfg.device)
+        scores[pl] = min(fit_wires(prob, cfg, h, cfg.iters_auto, log=lambda *a: None)[3] for h in (1, -1))
+    best = min(scores, key=scores.get)
+    log("B0 orientation (plane) scores: " + ", ".join(f"{k} {v:.3e}" for k, v in scores.items()) + f" -> {best}")
+    if best != "axial" and min(scores["coronal"], scores["coronal_t"]) > 0.85 * max(scores["coronal"], scores["coronal_t"]):
+        import warnings
+        msg = ("B0 lies in the image plane, but whether it runs along the rows ('coronal'/'sagittal') or the "
+               f"columns ('coronal_t') is hardly identifiable from these data ({scores['coronal']:.3e} vs "
+               f"{scores['coronal_t']:.3e}); picked {best!r}. Pass plane= if you know the acquisition.")
+        warnings.warn(msg)
+        log("warning: " + msg)
+    return best, scores
+
+
 def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
     from .data import MultiCoilData
     from .fit import fit
     from .geometry import SliceGeometry
     N, X, Y = ksp.shape
+    scores = None
+    if plane == "auto":
+        plane, scores = _select_plane(ksp[None], None if mask is None else mask[None, None], spacing, noise, cfg, log)
     geom = SliceGeometry((X, Y), spacing, np.zeros(1), plane)
     data = MultiCoilData(ksp[None], geom, mask=None if mask is None else mask[None, None], noise=noise)
     model, prob, hist, extra = fit(data, cfg, log=log)
@@ -189,7 +221,7 @@ def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
     with torch.enable_grad():
         C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
     return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob,
-               "_m": extra["image_lowres"]}
+               "_m": extra["image_lowres"], "plane": plane, "plane_scores": scores}
 
 
 def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
@@ -219,6 +251,10 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     N, X, Y, T = ksp.shape
     kt = np.ascontiguousarray(np.moveaxis(ksp, -1, 0))                      # (T,N,X,Y)
     mt = None if mask is None else np.moveaxis(mask, -1, 0)[:, None]        # (T,1,X,Y)
+    scores = None
+    if plane == "auto":
+        mt_ = mt if mt is not None else (np.abs(kt).sum(1, keepdims=True) > 0)
+        plane, scores = _select_plane(kt, mt_, spacing, noise, cfg, log, meta={"dynamic": True})
     geom = SliceGeometry((X, Y), spacing, np.zeros(T), plane)               # frames = co-located slices
     data = MultiCoilData(kt, geom, mask=mt, noise=noise, meta={"dynamic": True})
     if mt is None:
@@ -231,7 +267,7 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
             C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
         return np.broadcast_to(C[None], (T, N, X, Y)).copy(), {
             "handedness": extra["handedness"], "data_loss": _last(hist), "rank": 0, "model": model, "problem": prob,
-            "_m": extra["image_lowres"]}
+            "_m": extra["image_lowres"], "plane": plane, "plane_scores": scores}
     from .dynamic import DynConfig, fit_dynamic
     dcfg = DynConfig(rank=rank, iters_dyn=iters_dynamic or max(300, cfg.iters_pinn // 2))
     dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log)
@@ -244,7 +280,7 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     C = np.concatenate(out).reshape(T, N, X, Y)
     return C, {"handedness": extra["handedness"], "rank": rank, "temporal_modes": dyn.alpha.detach().numpy(),
                "data_loss": float(hist["dynamic"][-1]["data"]) if hist.get("dynamic") else None,
-               "model": dyn, "problem": prob, "_m": extra["m"]}
+               "model": dyn, "problem": prob, "_m": extra["m"], "plane": plane, "plane_scores": scores}
 
 
 # ---------------------------------------------------------------------------------- helpers
@@ -290,7 +326,8 @@ def _support(ksp, mask, layout, calib, thresh=0.1, dilate=2):
     rss = np.sqrt((np.abs(img) ** 2).sum(0))
     rss = uniform_filter(rss, 5)
     s = rss > thresh * np.quantile(rss, 0.99)
-    s = binary_fill_holes(s)
+    from .keepout import clean_support
+    s = clean_support(s[None], True)[0] if s.ndim == 2 else clean_support(s, False)
     return binary_dilation(s, iterations=dilate) if dilate > 0 else s
 
 

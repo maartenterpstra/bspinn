@@ -11,6 +11,7 @@ PLANES = {
     "axial":    (1, 0, 2),   # rows -> y (AP), cols -> x (LR), normal -> z
     "coronal":  (2, 0, 1),   # rows -> z (SI), cols -> x (LR), normal -> y
     "sagittal": (2, 1, 0),   # rows -> z (SI), cols -> y (AP), normal -> x
+    "coronal_t": (0, 2, 1),  # transposed coronal: rows -> x, cols -> z (B0 along the image columns)
 }
 
 
@@ -76,7 +77,7 @@ class SliceGeometry:
             out[s, ..., ax[0]] = R
             out[s, ..., ax[1]] = Cc
             out[s, ..., ax[2]] = zs
-        return torch.from_numpy(out / self.half_fov)
+        return torch.from_numpy((out / float(self.half_fov)).astype(np.float32))
 
     def normal_axis(self) -> int:
         return PLANES[self.plane][2]

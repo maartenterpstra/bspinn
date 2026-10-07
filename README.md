@@ -265,6 +265,18 @@ gives the usual Σ|C|² = 1 version for SENSE/BART.
    the median sits next to coil elements at the object edge, where the measured coil images show
    the same (knee: one coil 16× the median coil at low resolution), or in air near a conductor,
    where the data carry no information: use `mask_maps=True` if those regions matter to you.
+8. **Objects cut by the FOV edge; wrap-around in the support.** The object support is estimated
+   from a low-resolution, periodic image: an object touching one edge also lit up the opposite
+   edge. Small disconnected components (< 20 % of the largest) are now dropped. Beyond the FOV the
+   keep-out measures the distance to the visible object (conductors may sit just outside an edge the
+   anatomy is cut by; `fov_extend` assumes it continues further). Close to such an edge the
+   sensitivity of the nearest coil rises steeply over fewer pixels than the calibration region
+   resolves; coil *shares* there agree with the data, but `|C|` (with `normalise="none"`) is an
+   extrapolation: a larger `calib` constrains it (24 → 48 halved the peak on a cut-off knee).
+9. **Conductors inside the FOV.** A wire crossing the image plane in the air (e.g. a tight head coil
+   in a large FOV) is physical, and its field (bounded, zero on the conductor axis) is visible in
+   the air there. `lambda_fov > 0` pushes conductors out of the imaged region where the data allow;
+   on a 12-channel brain it cost 28 % data fit, i.e. the conductors are really inside that FOV.
 
 ## 4. Usage
 
@@ -276,7 +288,7 @@ from bspinn.api import estimate_maps, coil_combine
 
 ksp = np.load("ksp.npy")          # complex; unsampled entries exactly 0
 
-maps, info = estimate_maps(ksp, "2d", spacing=(1.0, 1.0), plane="axial")            # (coils, x, y)
+maps, info = estimate_maps(ksp, "2d", spacing=(1.0, 1.0))                            # (coils, x, y)
 maps, info = estimate_maps(ksp, "3d", spacing=(1.0, 1.0, 1.0), axes="auto")         # (coils, x, y, z)
 maps, info = estimate_maps(ksp, "dynamic", spacing=(1.5, 1.5), rank=2)              # (coils, x, y, time)
 
@@ -310,9 +322,12 @@ What matters:
   be (densely) sampled; set `calib` to your ACS size. Undersampled entries inside it are handled
   (k-space data term), but must be zero.
 * **Geometry**: `spacing` in mm (anisotropic voxels matter: the PDE is not scale-invariant).
-  2-D/dynamic `plane` tells the model where B0 points (axial = through the slice; coronal/sagittal =
-  along the first image axis). If unsure, run both and keep the lower `info["data_loss"]`. In 3-D
-  `axes="auto"` finds the B0 axis from the data.
+  Where B0 points relative to the image matters a lot: `plane="auto"` (default) tries B0 through
+  the slice (`axial`), along the image rows (`coronal`) and along the columns (`coronal_t`) with
+  short wire fits and keeps the best (`info["plane"]`, `info["plane_scores"]`); it picked the stated
+  orientation on knee15 (coronal) and brain8 (axial). A wrong plane fitted a coronal knee 2.5× worse
+  and produced false zeros inside the object. Give `plane=` to skip the search (~6 short fits).
+  In 3-D `axes="auto"` does the same.
 * **Masked maps**: `mask_maps=True` zeros maps and images outside the estimated object support
   (`info["support"]`; tune with `support_threshold=0.1`, `support_dilate=2`), or pass your own bool
   mask (`mask_maps=sup`; CLI `--mask-maps [sup.npy]`). By default the maps cover the whole FOV, since
