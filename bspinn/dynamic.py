@@ -32,7 +32,7 @@ import torch
 from torch import nn
 
 from .data import MultiCoilData, _read_cfl
-from .fit import FitConfig, Problem, _extra_penalty, _image_param, _log, fit, sens_sets
+from .fit import _physics, FitConfig, Problem, _extra_penalty, _image_param, _log, fit, sens_sets
 from .geometry import SliceGeometry, fft2c_np
 from .models import HarmonicPINN
 from .physics import grad
@@ -92,8 +92,12 @@ class DynamicCoils(nn.Module):
         smooth = (a[1:] - a[:-1]).pow(2).mean() if a.shape[0] > 1 else a.sum() * 0
         unit = ((a.pow(2).mean(0) - 1) ** 2).sum()
         v = self.static.base.verts[None] + torch.einsum("bk,knlmd->bnlmd", a[frames], self.V)
-        d = torch.cdist(v.reshape(-1, 3), support).min(dim=1).values
-        outside = torch.relu(margin - d).pow(2).mean()
+        from .keepout import KeepOut, keepout_penalty
+        if isinstance(support, KeepOut):
+            outside = keepout_penalty(support, v, margin)
+        else:
+            d = torch.cdist(v.reshape(-1, 3), support).min(dim=1).values
+            outside = torch.relu(margin - d).pow(2).mean()
         if max_disp is not None:
             # physical bound on conductor motion (e.g. a flexible array on a breathing torso)
             dn = self.displacement(frames).norm(dim=-1)
@@ -162,8 +166,8 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print)
         C = dyn.sensitivity_frames(pts, fr)                        # (B,N,P)
         Cflat = C.permute(1, 0, 2).reshape(prob.N_model, -1)
         d = prob.data_loss(Cflat, m, fr)
-        phys = dyn.physics_loss(prob.collocation(cfg.n_colloc, gen))
-        smooth, unit, outside = dyn.regularisers(fr, sup, cfg.outside_margin, max_disp)
+        phys = _physics(dyn, prob, cfg, gen, [dyn.static.base] if dyn.static.base is not None else [])
+        smooth, unit, outside = dyn.regularisers(fr, prob.keep, cfg.outside_margin, max_disp)
         loss = (d + cfg.lambda_phys * phys + cfg.lambda_norm * prob.norm_loss(Cflat, fr)
                 + dcfg.lambda_smooth * smooth + dcfg.lambda_unit * unit + cfg.lambda_outside * outside
                 + _extra_penalty(dyn, C, m, cfg))

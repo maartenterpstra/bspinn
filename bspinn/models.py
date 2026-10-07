@@ -103,6 +103,7 @@ class WireLoopCoils(CoilModel):
         self.verts = nn.Parameter(torch.zeros(n_coils, loops_per_coil, verts_per_loop, 3))
         self.amp = nn.Parameter(torch.zeros(n_coils, loops_per_coil))   # real loop currents
         self.theta = nn.Parameter(torch.zeros(n_coils))                  # receive-chain phase
+        self.core = 0.0          # conductor radius (normalised); set from FitConfig.wire_radius
 
     def gain(self):
         return torch.exp(1j * self.theta)
@@ -112,9 +113,9 @@ class WireLoopCoils(CoilModel):
         (..., N, L, M, 3) with arbitrary leading batch dims -> field (..., N, P, 3, 1)."""
         V = self.verts if verts is None else verts
         if points.dim() == 2:      # shared points (P,3)
-            B = biot_savart_polyline(V, points)                               # (...,N,L,P,3)
+            B = biot_savart_polyline(V, points, core=self.core)               # (...,N,L,P,3)
         else:                      # per-coil points (N,P,3)
-            B = biot_savart_polyline(V, points[:, None, None])                # (...,N,L,P,3)
+            B = biot_savart_polyline(V, points[:, None, None], core=self.core)  # (...,N,L,P,3)
         B = (B * self.amp[..., None, None]).sum(-3)                           # (...,N,P,3)
         return B.unsqueeze(-1)
 
@@ -177,12 +178,18 @@ class WireLoopCoils(CoilModel):
         scale = (ww * rI * rC).sum(1) / (ww * rC * rC).sum(1).clamp_min(1e-12)
         self.amp.mul_(scale[:, None])
 
-    def regularisers(self, support: torch.Tensor, margin: float = 0.05):
-        """(i) keep conductors outside the imaged object (sources must be external for the
-        field to be source-free there); (ii) keep loop shapes smooth."""
-        v = self.verts.reshape(-1, 3)
-        d = torch.cdist(v, support).min(dim=1).values
-        outside = torch.relu(margin - d).pow(2).mean()
+    def regularisers(self, support, margin: float = 0.05):
+        """(i) keep conductors (every point along every segment, not just the vertices) at least
+        ``margin`` outside the imaged object: the field is only source-free where there are no
+        conductors; (ii) keep loop shapes smooth. ``support`` is a KeepOut (signed distance to the
+        hole-filled object) or, for backwards compatibility, a point set."""
+        from .keepout import KeepOut, keepout_penalty, segment_samples
+        if isinstance(support, KeepOut):
+            outside = keepout_penalty(support, self.verts, margin)
+        else:
+            v = segment_samples(self.verts).reshape(-1, 3)
+            d = torch.cdist(v, support).min(dim=1).values
+            outside = (torch.relu(margin - d) / margin).pow(2).sum() / self.n_coils
         v2 = self.verts
         curv = (torch.roll(v2, 1, -2) - 2 * v2 + torch.roll(v2, -1, -2)).pow(2).sum(-1).mean()
         return outside, curv

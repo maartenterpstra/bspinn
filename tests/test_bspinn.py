@@ -519,3 +519,37 @@ def test_api_mask_maps():
     kd = np.stack([k] * 3, -1)
     Cd, infod = estimate_maps(kd, "dynamic", mask_maps=True, rank=0, **few)
     assert Cd.shape == kd.shape and np.all(Cd[:, ~infod["support"]] == 0)
+
+
+def test_keepout_distance_and_wire_core():
+    from bspinn.geometry import SliceGeometry
+    from bspinn.keepout import KeepOut
+    from bspinn.physics import biot_savart_polyline
+    g = SliceGeometry((40, 40), (1, 1), np.zeros(1), "axial")
+    co = g.grid()
+    sup = (co[..., :2].norm(dim=-1) < 0.5).float()
+    k = KeepOut(sup, co, False, slab=0.15)
+    d = k.distance(torch.tensor([[0.8, 0, 0], [0.2, 0, 0], [0, 0, 0.5], [0.0, 0.0, 0.1]]))
+    assert abs(d[0] - 0.3) < 0.03 and d[1] < 0 and abs(d[2] - 0.35) < 0.03 and d[3] < 0     # prism +/- slab
+    # Rankine core: exact beyond the core radius, bounded inside it
+    V = torch.tensor([[[0.0, 0, -1], [0.0, 0, 1], [1.0, 0, 1], [1.0, 0, -1]]])
+    far = torch.tensor([[0.3, 0.2, 0.0], [0.5, 0.5, 0.1]])
+    assert torch.allclose(biot_savart_polyline(V, far), biot_savart_polyline(V, far, core=0.05))
+    near = torch.tensor([[0.001, 0.0, 0.0]])
+    assert biot_savart_polyline(V, near, core=0.05).norm() < 0.05 * biot_savart_polyline(V, near).norm()
+
+
+def test_wires_stay_outside_object_in_every_stage():
+    """Regression: the PINN stage trained the wires without the keep-out penalty, so conductors could
+    drift into the object (singular, outlier-valued maps)."""
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig, fit, wire_modules
+    from bspinn.keepout import segment_samples
+    d, _, _ = make_synthetic(4, (32, 32), noise=0.01)
+    cfg = FitConfig(calib=12, iters_auto=5, iters_wires=40, iters_pinn=40, lr_pinn=3e-2, lr_wires=5e-2,
+                    log_every=1000)
+    model, prob, hist, extra = fit(d, cfg, log=lambda *a: None)
+    for w in wire_modules(model):
+        dist = prob.keep.distance(segment_samples(w.verts.detach(), 8))
+        assert float(dist.min()) > 0.5 * cfg.outside_margin
+        assert w.core == cfg.wire_radius

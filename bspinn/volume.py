@@ -180,6 +180,8 @@ class Problem3D:
                     if (mix is not None and cfg.model_channels == "physical") else None)
         self.N_model = self.mix.shape[1] if self.mix is not None else self.N
         self.coords = geom.grid(g).reshape(-1, 3)
+        from .keepout import KeepOut
+        self.keep = KeepOut(self.support, self.coords.reshape(*g, 3), volumetric=True)
         self.support_pts = self.coords[self.support.flatten() > 0]
         self.coil_images = self.I[0].reshape(self.N, -1)
         self.weights = self.coil_images.abs() ** 2
@@ -224,7 +226,9 @@ class Problem3D:
     def object_support(self, rss):
         thr = self.cfg.support_thresh * float(torch.quantile(rss.flatten()[torch.randperm(rss.numel())[:200000]], 0.99))
         thr = max(thr, 3.0 * self.noise_sigma * math.sqrt(self.N))
-        return (rss > thr).float()
+        from .keepout import fill_holes
+        m = (rss > thr).cpu().numpy()
+        return torch.from_numpy(fill_holes(m.reshape(m.shape[-3:]), per_slice=False).reshape(m.shape)).float()
 
     _tensors = ("yk", "mk", "I", "support", "coords", "support_pts", "weights", "coil_images", "mix",
                 "coil_images_model", "weights_model", "Inorm_slice", "ynorm_slice", "fold_vec", "coarse_coords")
@@ -235,6 +239,7 @@ class Problem3D:
             v = getattr(self, name, None)
             if torch.is_tensor(v):
                 setattr(self, name, v.to(device))
+        self.keep.to(device)
         self.device = device
         return self
 

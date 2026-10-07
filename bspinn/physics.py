@@ -21,7 +21,7 @@ import torch
 # --------------------------------------------------------------------------------------
 # Biot–Savart for closed polygonal wire loops (exact, closed form per straight segment)
 # --------------------------------------------------------------------------------------
-def biot_savart_polyline(verts: torch.Tensor, points: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+def biot_savart_polyline(verts: torch.Tensor, points: torch.Tensor, eps: float = 1e-9, core: float = 0.0) -> torch.Tensor:
     """Magnetic field of closed polygonal loops carrying unit current.
 
     Uses the exact closed-form expression for a finite straight segment
@@ -32,6 +32,9 @@ def biot_savart_polyline(verts: torch.Tensor, points: torch.Tensor, eps: float =
     Args:
         verts:  (..., M, 3) vertices of closed loops (segment k joins vertex k and k+1 mod M).
         points: (P, 3) observation points.
+        core:   conductor radius (Rankine core). 0: ideal thin wire (field ~ 1/d near the wire).
+                > 0: within distance d < core of a segment the field is scaled by d^2/core^2 (a
+                conductor of finite cross-section: bounded, linear in d inside), exact outside.
     Returns:
         (..., P, 3) magnetic field at each point, summed over the loop's segments.
     """
@@ -44,6 +47,10 @@ def biot_savart_polyline(verts: torch.Tensor, points: torch.Tensor, eps: float =
     axb = torch.cross(a, b, dim=-1)
     denom = na * nb * (na * nb + (a * b).sum(-1))
     factor = (na + nb) / (denom + eps)
+    if core > 0:
+        ab = Bv - A                                                       # segment vector
+        d2 = (axb * axb).sum(-1) / (ab * ab).sum(-1).clamp_min(1e-12)     # squared distance to the line
+        factor = factor * (d2 / core ** 2).clamp(max=1.0)
     return (axb * factor.unsqueeze(-1)).sum(dim=-3)          # sum over segments
 
 

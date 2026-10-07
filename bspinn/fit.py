@@ -58,7 +58,14 @@ class FitConfig:
     correction_grid: int = 12        # 3-D only: the PINN correction is evaluated on this many points per
                                      #   axis and upsampled (trilinear) to the calibration grid in training
     init_z_offset: float = 0.15      # +/- out-of-plane offset of initial loops (breaks z-mirror symmetry; 0 = off)
-    outside_margin: float = 0.1      # min. conductor distance from object (normalised; 0.1 ~ 5% of FOV)
+    outside_margin: float = 0.1      # min. conductor distance from object (normalised; 0.1 ~ 5% of FOV),
+                                     #   enforced along every wire segment in every stage
+    wire_radius: float = 0.05        # conductor radius (normalised; Rankine core): the field is bounded near
+                                     #   the wires instead of ~1/d; exact beyond this distance, hence exact
+                                     #   inside the object while wire_radius <= outside_margin. 0 = thin wires
+    air_colloc: float = 0.25         # fraction of Laplace collocation points in the air around the object
+                                     #   (>= 2 wire radii from any wire): keeps the network correction harmonic,
+                                     #   hence smooth, outside the object too. 0 = object only
     # pinn
     width: int = 64
     depth: int = 4
@@ -238,6 +245,8 @@ class Problem:
                     if (mix is not None and cfg.model_channels == "physical") else None)
         self.N_model = self.mix.shape[1] if self.mix is not None else N
         self.coords = geom.grid((h, w)).reshape(-1, 3)              # (S*h*w,3)
+        from .keepout import KeepOut
+        self.keep = KeepOut(self.support, self.coords.reshape(S, h, w, 3), volumetric=False, slab=cfg.slab)
         sup = self.support.flatten() > 0
         self.support_pts = self.coords[sup]
         self.weights = (self.I.abs() ** 2).permute(1, 0, 2, 3).reshape(N, -1)
@@ -291,7 +300,8 @@ class Problem:
         """Object mask: RSS above both a fraction of its 99th percentile and ~3x the expected noise RSS."""
         thr = self.cfg.support_thresh * float(torch.quantile(rss.flatten(), 0.99))
         thr = max(thr, 3.0 * self.noise_sigma * np.sqrt(self.I.shape[1]))
-        return (rss > thr).float()
+        from .keepout import fill_holes
+        return torch.from_numpy(fill_holes((rss > thr).cpu().numpy(), per_slice=True)).float()
 
     # ---------------------------------------------------------------- device
     _tensors = ("ks_full", "yk", "mk", "I", "support", "coords", "support_pts", "weights", "coil_images",
@@ -305,6 +315,7 @@ class Problem:
             if torch.is_tensor(v):
                 setattr(self, name, v.to(device))
         self.op = self.op.to(device)
+        self.keep.to(device)
         self.device = device
         return self
 
@@ -459,6 +470,7 @@ def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=pr
             wires.coarse = (prob.coords, prob.coarse_coords, prob.calib, prob.coarse_shape)
     else:
         wires = WireLoopCoils(prob.N_model, cfg.loops_per_coil, cfg.verts_per_loop, handedness)
+    wires.core = float(cfg.wire_radius)
     wires.init_from_data(prob.coords, prob.weights_model, prob.support_pts,
                          standoff=max(0.15, cfg.outside_margin + 0.05), seed=cfg.seed,
                          normal_axis=prob.normal_axis, z_offset=cfg.init_z_offset)
@@ -479,13 +491,12 @@ def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=pr
     opt = torch.optim.Adam(params)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters, eta_min=0.05 * cfg.lr_wires)
     hist = []
-    sup_sub = prob.support_pts[torch.randperm(prob.support_pts.shape[0], generator=gen)[:2048].to(prob.device)]
     for it in range(iters):
         sl = _batch(prob, cfg, gen)
         opt.zero_grad()
         Cs = sens_sets(model, prob.slice_coords(sl), create_graph=False)
         d = prob.data_loss(Cs, m, sl)
-        out, curv = wires.regularisers(sup_sub, cfg.outside_margin)
+        out, curv = wires.regularisers(prob.keep, cfg.outside_margin)
         loss = d + cfg.lambda_outside * out + cfg.lambda_curv * curv + cfg.lambda_norm * prob.norm_loss(Cs, sl)
         loss = loss + _extra_penalty(model, Cs, m, cfg)
         loss.backward()
@@ -534,6 +545,7 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
     if k2p:                                    # helmholtz: k^2 is O(1-10) in normalised units -> its own step size
         params.append({"params": k2p, "lr": 2e-2})
     K = getattr(model, "n_sets", 1)
+    wires = wire_modules(model)
     if prob.data_term == "kspace":
         C0 = model.sensitivity(prob.coords, create_graph=False).detach() if m is None else None
         m = _image_param(prob, C0, K, m)
@@ -546,13 +558,58 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
         opt.zero_grad()
         Cs = sens_sets(model, prob.slice_coords(sl))
         d = prob.data_loss(Cs, m, sl)
-        phys = model.physics_loss(prob.collocation(cfg.n_colloc, gen))
+        phys = _physics(model, prob, cfg, gen, wires)
         loss = d + cfg.lambda_phys * phys + cfg.lambda_norm * prob.norm_loss(Cs, sl) + _extra_penalty(model, Cs, m, cfg)
+        for w in wires:                     # the wires keep training here: keep them outside the object too
+            out, _ = w.regularisers(prob.keep, cfg.outside_margin)   # (no curvature term: it shrinks loops)
+            loss = loss + cfg.lambda_outside * out
         loss.backward(); opt.step(); sched.step()
         if it % cfg.log_every == 0 or it == iters - 1:
             _log(hist, it, data=d.item(), phys=phys.item())
             log(f"[pinn] it {it:5d}  data {d.item():.4e}  laplace {phys.item():.3e}")
     return m, hist
+
+
+def wire_modules(model):
+    """All trainable wire-loop modules inside a (wrapped) model."""
+    out, seen = [], set()
+    for mod in model.modules():
+        if isinstance(mod, WireLoopCoils) and id(mod) not in seen and mod.verts.requires_grad:
+            seen.add(id(mod)); out.append(mod)
+    return out
+
+
+def air_points(prob, n, gen, wires, min_dist):
+    """Collocation points in the air around the object: uniform over the calibration grid (2-D:
+    jittered through the slab), outside the object, and at least ``min_dist`` from every wire."""
+    if n <= 0:
+        return None
+    idx = torch.randint(0, prob.coords.shape[0], (4 * n,), generator=gen).to(prob.coords.device)
+    p = prob.coords[idx].clone()
+    step = float((prob.coords[1] - prob.coords[0]).abs().max())
+    p = p + (0.5 * step * torch.randn(p.shape, generator=gen)).to(p.device)
+    na = getattr(prob, "normal_axis", None)
+    if na is not None and prob.__class__.__name__ == "Problem":
+        p[:, na] = ((2 * torch.rand(p.shape[0], generator=gen) - 1) * prob.cfg.slab).to(p.device)
+    with torch.no_grad():
+        keep = prob.keep.distance(p) > 0
+        if wires:
+            from .keepout import segment_samples
+            ws = torch.cat([segment_samples(w.verts.detach(), 4).reshape(-1, 3) for w in wires])
+            keep &= torch.cdist(p, ws).min(1).values > min_dist
+    p = p[keep][:n]
+    return p if p.shape[0] >= 8 else None
+
+
+def _physics(model, prob, cfg, gen, wires):
+    """Laplace (or Helmholtz) residual of the network correction: inside the object and, with
+    weight air_colloc, in the surrounding air (source-free too, as long as we stay off the wires)."""
+    n_air = int(round(cfg.air_colloc * cfg.n_colloc))
+    phys = model.physics_loss(prob.collocation(cfg.n_colloc - n_air, gen))
+    pa = air_points(prob, n_air, gen, wires, 2 * max(cfg.wire_radius, 0.02))
+    if pa is not None:
+        phys = phys + cfg.air_colloc * model.physics_loss(pa)
+    return phys
 
 
 # ===================================================================================== driver

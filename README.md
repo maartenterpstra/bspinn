@@ -246,6 +246,25 @@ gives the usual Σ|C|² = 1 version for SENSE/BART.
 6. **Non-Cartesian trajectories must be exact**, including gradient-delay correction. On a
    rotationally symmetric phantom a wrong spoke ordering still grids to a plausible-looking disk;
    only the coil data reveal it. Pass the scanner/BART trajectory with `--traj`.
+7. **Conductors and the air around the object (fixed in v8).** Earlier versions could produce maps
+   with wire-shaped holes (after RSS normalisation) and outliers up to ~300× the median inside the
+   object and ~2600× outside it (knee15). Causes: (a) the wires kept training in the PINN stage
+   *without* the keep-out penalty and drifted onto the object edge (min. distance 0.003 vs margin
+   0.1); (b) the keep-out only tested vertices, not the segments between them, against a random
+   2048-point subsample, with a mean-over-vertices weight too small to matter; (c) a thin wire's field
+   is ~1/d, and in 2-D a loop facing the object crosses the image plane in the air next to it;
+   (d) the network correction had no Laplace penalty outside the object. Now: a signed distance to
+   the hole-filled object (2-D: the outline extruded by ± `slab`, as the anatomy continues
+   through the plane) is enforced along every segment in every stage, normalised so a violation
+   outweighs the data term (`outside_margin`); conductors have a finite radius (`wire_radius`,
+   Rankine core: exact beyond it, so exact inside the object); and a quarter of the Laplace
+   collocation points lie in the air (`air_colloc`). Knee15 / brain8 (`quality="fast"`): max |C|
+   / median inside the object 302 → 14.5 / 3.5 → 3.0, outside 2611 → 60 / 219 → 18; network
+   correction in air 172 → 2.3 / 44 → 3.2 × median; ACS combine→expand residual 0.0961 → 0.0929 /
+   0.0524 → 0.0541; synthetic 2-D map error unchanged (3.9e-5 → 3.75e-5). What remains above ~10×
+   the median sits next to coil elements at the object edge, where the measured coil images show
+   the same (knee: one coil 16× the median coil at low resolution), or in air near a conductor,
+   where the data carry no information: use `mask_maps=True` if those regions matter to you.
 
 ## 4. Usage
 
@@ -314,8 +333,8 @@ What matters:
   3-D 48³ at evaluation settings ≈ 16 min (Laplace) or 42 min (Helmholtz) on one core. Cost scales with the calibration grid
   (`calib`), not with the image matrix. Use `device="cuda"` if available.
 * **Sanity check on synthetic data with known maps** (same calls, `quality="fast"`): subspace error
-  3.9e-5 (2-D 96², 8 coils), 2.6e-4 (dynamic, moving anterior coils; the recovered temporal mode
-  correlates 0.997 with the true motion), 6.2e-4 (3-D 32³; `quality="default"` at 48³ gives 5.8e-5,
+  3.75e-5 (2-D 96², 8 coils), 2.4e-4 (dynamic, moving anterior coils; the recovered temporal mode
+  correlates 0.997 with the true motion), 3.9e-4 (3-D 32³; `quality="default"` at 48³ gives 5.8e-5,
   §8). `info["data_loss"]` is the relative calibration residual; compare it between runs (plane,
   options), not across datasets.
 
