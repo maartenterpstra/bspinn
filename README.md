@@ -261,8 +261,19 @@ maps, info = estimate_maps(ksp, "2d", spacing=(1.0, 1.0), plane="axial")        
 maps, info = estimate_maps(ksp, "3d", spacing=(1.0, 1.0, 1.0), axes="auto")         # (coils, x, y, z)
 maps, info = estimate_maps(ksp, "dynamic", spacing=(1.5, 1.5), rank=2)              # (coils, x, y, time)
 
-img = coil_combine(ksp, maps, "2d")    # fully sampled: SENSE-optimal combination
+# maps and image together: the image is the full-resolution SENSE reconstruction with these maps
+# (closed form if fully sampled, CG-SENSE otherwise; per frame for dynamic), ksp ~ F(maps * image)
+maps, image, info = estimate_maps(ksp, "2d", return_image=True)
+image_joint = info["image_joint"]      # the image of the joint fit itself: calibration resolution only
 ```
+
+The fit is joint (maps and image, NLINV-style), but its image lives on the calibration grid: it
+carries only the information of the calibration region (24² centre by default), so it is a
+low-resolution image, returned interpolated to the full matrix in the same phase/scale convention as
+the maps. The full-resolution `image` uses all acquired samples with the final maps. Both satisfy
+`ksp ≈ F(maps · image)` (the joint one only inside the calibration region). Measured on a 64² synthetic
+(8 coils, σ = 0.01, `quality="fast"`): `image` is within 3.3 % of the truth (noise level; scale 0.998)
+fully sampled and 12 % at R ≈ 3; `image_joint` reproduces the calibration data to the noise floor.
 
 `maps` has the shape and axis order of `ksp`, phase-referenced (Inati virtual body coil) and
 RSS-normalised (`normalise="none"` keeps the raw, smoothly extrapolated model scale). Command line,
@@ -271,7 +282,7 @@ same options (`.npy`, `.npz` with `ksp`/`mask`/`noise`, or BART `.cfl` with `--c
 ```
 python -m bspinn.cli maps ksp.npy --layout 2d|3d|dynamic --out maps.npy [--spacing ...] [--plane ...]
        [--axes auto|xyz] [--calib 24] [--noise noise.npy] [--quality fast] [--rank 2]
-       [--physics helmholtz --b0 3] [--combined img.npy] [--set iters_pinn=1000 lambda_phys=0.1]
+       [--physics helmholtz --b0 3] [--image img.npy] [--set iters_pinn=1000 lambda_phys=0.1]
 ```
 
 What matters:
@@ -284,7 +295,8 @@ What matters:
   along the first image axis). If unsure, run both and keep the lower `info["data_loss"]`. In 3-D
   `axes="auto"` finds the B0 axis from the data.
 * **Noise**: pass noise-only samples `(n, coils)` for pre-whitening if you have them; maps come back
-  for the original channels.
+  for the original channels (the SENSE image whitens data and maps alike). With strongly correlated
+  channels use `quality="default"`: the fit converges more slowly after whitening.
 * **Dynamic**: Cartesian frames, each with a sampled centre. `rank` = number of temporal modes of the
   coil motion (`rank=0`: one static map set; frames only add data). `info["temporal_modes"]` (T×rank)
   is a respiratory-like surrogate.
@@ -732,7 +744,7 @@ effects relative to coils in air beside a body: relative Laplacian of the maps 4
 
 | file | content |
 |---|---|
-| `api.py` | `estimate_maps` / `coil_combine`: the one-call interface of §4.0 (CLI `maps`) |
+| `api.py` | `estimate_maps`, `sense_image`, `coil_combine`: the one-call interface of §4.0 (CLI `maps`) |
 | `physics.py` | closed-form Biot–Savart for polylines, B→C mapping, autograd div/curl, Maxwell residual |
 | `models.py` | `WireLoopCoils` (hard), `HarmonicPINN` (soft / hybrid correction) |
 | `fit.py` | `FitConfig`, calibration `Problem` (VarPro / k-space / NUDFT), training stages, auto-handedness |

@@ -30,7 +30,7 @@ PRESETS = {      # iterations: (handedness/orientation probe, wire stage, PINN s
 def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, plane="axial", axes="auto",
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
-                  threads=0, seed=0, verbose=True, **cfg_overrides):
+                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-3, **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
     Parameters
@@ -61,12 +61,19 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     normalise : 'rss' (sum_j |C_j|^2 = 1 everywhere, the ESPIRiT/SENSE convention) | 'none' (raw model
         scale; the maps then still extrapolate smoothly to the whole FOV).
     phase_ref : common-phase convention: 'inati' (virtual body coil, default) | 'model' | 'coil'.
+    return_image : also return the full-resolution image reconstructed with the estimated maps
+        (SENSE: closed form for fully sampled data, CG-SENSE with Tikhonov ``sense_lambda`` otherwise;
+        per frame for dynamic data). Returns (maps, image, info).
     cfg_overrides : any other FitConfig field (e.g. lambda_phys=0.1, field_mode='complex').
 
     Returns
     -------
     maps : complex64 array with the shape and axis order of ``ksp``.
-    info : dict with 'support' (object mask used for the phase reference), 'data_loss',
+    image : (only with return_image=True) complex64, the spatial(-temporal) shape of ``ksp`` without
+        the coil axis, in the same phase/scale convention as ``maps`` (ksp ~ F(maps * image)).
+    info : dict with 'image_joint' (the image of the joint fit: it only lives on the calibration grid,
+        i.e. it has the resolution of the calibration region; returned interpolated to the full matrix,
+        in the convention of ``maps``), 'support' (object mask used for the phase reference), 'data_loss',
         'handedness', 'orientation' (3-D), 'k2'/'tissue' (helmholtz), 'temporal_modes' (dynamic),
         'seconds', 'config'.
     """
@@ -108,6 +115,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         if not hasattr(cfg, k):
             raise TypeError(f"unknown option {k!r} (not a FitConfig field)")
         setattr(cfg, k, v)
+    if cfg.compress:
+        raise ValueError("compress is not supported by estimate_maps (maps are returned for the input channels)")
     log = print if verbose else (lambda *a, **k: None)
     t0 = time.time()
     if threads:
@@ -120,14 +129,31 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     else:
         C, info = _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log)
 
-    # common phase + normalisation; C is (N, *spatial) or (T, N, H, W) for dynamic
+    # C: data-channel maps, (N, *spatial) or (T, N, X, Y) for dynamic. Pre-whitening made the data
+    # channels M @ (original channels): map back to the original channels.
+    prob = info["problem"]
+    M = prob.data.meta.get("mix")
+    if M is not None:
+        Minv = np.linalg.inv(np.asarray(M))
+        C = (np.einsum("ij,tj...->ti...", Minv, C) if layout == "dynamic"
+             else np.einsum("ij,j...->i...", Minv, C))
+    C_raw = C
+    # common phase + normalisation (per-pixel complex scalars, identical for all coils)
     sup = _support(ksp, mask, layout, cfg.calib)
     C = _finish(C, sup, layout, phase_ref, normalise)
+    # joint-fit image, interpolated to the full matrix, in the convention of the returned maps
+    info["image_joint"] = _joint_image(info.pop("_m", None), prob, C_raw, C, layout)
     if layout == "dynamic":
         C = np.moveaxis(C, 0, -1)                       # (T,N,X,Y) -> (N,X,Y,T)
+        if info["image_joint"] is not None:
+            info["image_joint"] = np.moveaxis(info["image_joint"], 0, -1)
     info.update(support=sup, seconds=time.time() - t0, config=_cfg_dict(cfg))
     log(f"maps {C.shape} in {info['seconds']:.0f}s")
-    return C.astype(np.complex64), info
+    C = C.astype(np.complex64)
+    if not return_image:
+        return C, info
+    img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda)
+    return C, img, info
 
 
 # ---------------------------------------------------------------------------------- per layout
@@ -142,7 +168,8 @@ def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
     pts = geom.grid().reshape(-1, 3)
     with torch.enable_grad():
         C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
-    return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob}
+    return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob,
+               "_m": extra["image_lowres"]}
 
 
 def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
@@ -154,7 +181,7 @@ def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
     C = volume_maps(model, prob).numpy()
     info = {"handedness": extra["handedness"], "orientation": prob.data.geom.axes,
             "orientation_note": "physical axis (x,y,z; B0 = z) of array axes 1..3", "data_loss": _last(hist),
-            "model": model, "problem": prob}
+            "model": model, "problem": prob, "_m": extra["image_lowres"]}
     if hasattr(model, "k2_re"):
         from .models import k2_to_tissue
         k2 = complex(float(model.k2_re), float(model.k2_im))
@@ -183,7 +210,8 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
         with torch.enable_grad():
             C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
         return np.broadcast_to(C[None], (T, N, X, Y)).copy(), {
-            "handedness": extra["handedness"], "data_loss": _last(hist), "rank": 0, "model": model, "problem": prob}
+            "handedness": extra["handedness"], "data_loss": _last(hist), "rank": 0, "model": model, "problem": prob,
+            "_m": extra["image_lowres"]}
     from .dynamic import DynConfig, fit_dynamic
     dcfg = DynConfig(rank=rank, iters_dyn=iters_dynamic or max(300, cfg.iters_pinn // 2))
     dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log)
@@ -196,7 +224,7 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     C = np.concatenate(out).reshape(T, N, X, Y)
     return C, {"handedness": extra["handedness"], "rank": rank, "temporal_modes": dyn.alpha.detach().numpy(),
                "data_loss": float(hist["dynamic"][-1]["data"]) if hist.get("dynamic") else None,
-               "model": dyn, "problem": prob}
+               "model": dyn, "problem": prob, "_m": extra["m"]}
 
 
 # ---------------------------------------------------------------------------------- helpers
@@ -279,3 +307,75 @@ def coil_combine(ksp, maps, layout="2d", coil_axis=0):
     ax = (1, 2) if layout in ("2d", "dynamic") else (1, 2, 3)
     x = np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(ksp, axes=ax), axes=ax, norm="ortho"), axes=ax)
     return (maps.conj() * x).sum(0) / np.maximum((np.abs(maps) ** 2).sum(0), 1e-12)
+
+
+def _cfft(x, axes, inverse=False):
+    f = np.fft.ifftn if inverse else np.fft.fftn
+    return np.fft.fftshift(f(np.fft.ifftshift(x, axes=axes), axes=axes, norm="ortho"), axes=axes)
+
+
+def _joint_image(m, prob, C_raw, C_out, layout):
+    """The image of the joint fit lives on the calibration grid (prob.calib points spanning the FOV)
+    and is paired with the raw model maps on that grid. Interpolate it to the full matrix by k-space
+    zero-padding (it is band-limited to the calibration region), restore the data scale, and move it
+    to the convention of the returned maps: C_out = C_raw * g per pixel  =>  image_out = image / g."""
+    if m is None:
+        return None
+    m = m.detach().cpu().numpy() if hasattr(m, "detach") else np.asarray(m)
+    if layout == "3d":
+        m = m.reshape(m.shape[-3:])[None]                       # (1, gd, gh, gw)
+        full = C_out.shape[1:]
+    else:
+        m = m[:, 0] if m.ndim == 4 else m                       # (S|T, h, w): primary set
+        full = C_out.shape[-2:]
+    ax = tuple(range(1, m.ndim))
+    k = _cfft(m, ax)
+    # centre index n//2 of the small grid must land on F//2 of the large one
+    pad = [(0, 0)] + [(F // 2 - g // 2, F - g - (F // 2 - g // 2)) for g, F in zip(m.shape[1:], full)]
+    f = _cfft(np.pad(k, pad), ax, inverse=True) * prob.scale
+    if layout == "2d":
+        f, Cr, Co = f[0], C_raw, C_out
+        g = (Cr.conj() * Co).sum(0) / np.maximum((np.abs(Cr) ** 2).sum(0), 1e-30)
+    elif layout == "3d":
+        f = f[0]
+        g = (C_raw.conj() * C_out).sum(0) / np.maximum((np.abs(C_raw) ** 2).sum(0), 1e-30)
+    else:
+        g = (C_raw.conj() * C_out).sum(1) / np.maximum((np.abs(C_raw) ** 2).sum(1), 1e-30)
+    return (f / np.where(np.abs(g) > 0, g, 1)).astype(np.complex64)
+
+
+def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=60, coil_axis=0):
+    """Full-resolution image from k-space and maps: argmin ||M F (C x) - y||^2 + lam' ||x||^2 with
+    noise pre-whitening (if ``noise`` is given) applied to data and maps alike. Closed form when fully
+    sampled; CG otherwise (``lam`` relative to the mean of sum_j |C_j|^2). Dynamic: frame by frame."""
+    ksp = np.moveaxis(np.asarray(ksp), coil_axis, 0).astype(np.complex64)
+    C = np.moveaxis(np.asarray(maps), coil_axis, 0).astype(np.complex64)
+    if noise is not None:
+        n = np.asarray(noise).reshape(-1, ksp.shape[0])
+        L = np.linalg.inv(np.linalg.cholesky((n.conj().T @ n) / n.shape[0]))
+        ksp = np.einsum("ij,j...->i...", L, ksp)
+        C = np.einsum("ij,j...->i...", L, C)
+    if layout == "dynamic":
+        ms = [None if mask is None else mask[..., t] for t in range(ksp.shape[-1])]
+        return np.stack([sense_image(ksp[..., t], C[..., t], "2d", ms[t], None, lam, iters)
+                         for t in range(ksp.shape[-1])], -1)
+    m = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
+    ax = tuple(range(1, ksp.ndim))
+    den = (np.abs(C) ** 2).sum(0)
+    if m.all():
+        return ((C.conj() * _cfft(ksp, ax, True)).sum(0) / np.maximum(den, 1e-12)).astype(np.complex64)
+    lam = lam * float(den.mean())
+
+    def AhA(x):
+        return (C.conj() * _cfft(m[None] * _cfft(C * x[None], ax), ax, True)).sum(0) + lam * x
+    b = (C.conj() * _cfft(m[None] * ksp, ax, True)).sum(0)
+    x = np.zeros_like(b); r = b.copy(); p = r.copy(); rs = np.vdot(r, r).real; b0 = rs
+    for _ in range(iters):
+        Ap = AhA(p)
+        al = rs / np.vdot(p, Ap).real
+        x += al * p; r -= al * Ap
+        rn = np.vdot(r, r).real
+        if rn < 1e-10 * b0:
+            break
+        p = r + (rn / rs) * p; rs = rn
+    return x.astype(np.complex64)

@@ -123,7 +123,9 @@ def main(argv=None):
     pm.add_argument("--device", default="cpu")
     pm.add_argument("--threads", type=int, default=0)
     pm.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="any FitConfig field, e.g. iters_pinn=1000")
-    pm.add_argument("--combined", default=None, help="also write the coil-combined image (fully sampled data) here")
+    pm.add_argument("--image", "--combined", dest="image", default=None,
+                    help="also write the full-resolution image (SENSE with the estimated maps; CG if undersampled) "
+                         "here, and the joint-fit (calibration-resolution) image next to it as *_joint.npy")
 
     a = ap.parse_args(argv)
     if a.cmd == "maps":
@@ -195,7 +197,7 @@ def main(argv=None):
 
 def _run_maps(a):
     import os
-    from .api import coil_combine, estimate_maps
+    from .api import estimate_maps
     mask = noise = None
     if a.path.endswith(".npy"):
         k = np.load(a.path)
@@ -220,14 +222,16 @@ def _run_maps(a):
         t = type(defaults[key])
         over[key] = (val.lower() in ("1", "true", "yes")) if t is bool else t(val)
     calib = None if a.calib is None else (a.calib[0] if len(a.calib) == 1 else tuple(a.calib))
-    maps, info = estimate_maps(k, a.layout, coil_axis=a.coil_axis, mask=mask, spacing=a.spacing, plane=a.plane,
+    res = estimate_maps(k, a.layout, return_image=bool(a.image), coil_axis=a.coil_axis, mask=mask, spacing=a.spacing, plane=a.plane,
                                axes=a.axes, calib=calib, noise=noise, physics=a.physics, b0_tesla=a.b0,
                                model=a.model, rank=a.rank, quality=a.quality, normalise=a.normalise,
                                phase_ref=a.phase_ref, device=a.device, threads=a.threads, **over)
+    maps, info = (res[0], res[2]) if a.image else res
     maps = np.moveaxis(maps, 0, a.coil_axis)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     np.save(a.out, maps)
-    meta = {k_: v for k_, v in info.items() if k_ not in ("support", "model", "problem", "temporal_modes", "config")}
+    meta = {k_: v for k_, v in info.items()
+            if k_ not in ("support", "model", "problem", "temporal_modes", "config", "image_joint")}
     if "k2" in meta:
         meta["k2"] = [meta["k2"].real, meta["k2"].imag]
     if "temporal_modes" in info:
@@ -235,8 +239,10 @@ def _run_maps(a):
     np.save(a.out.replace(".npy", "") + "_support.npy", info["support"])
     with open(a.out.replace(".npy", "") + "_info.json", "w") as f:
         json.dump(meta, f, indent=1, default=str)
-    if a.combined:
-        np.save(a.combined, coil_combine(k, maps, a.layout, a.coil_axis))
+    if a.image:
+        np.save(a.image, res[1])
+        if info.get("image_joint") is not None:
+            np.save(a.image.replace(".npy", "") + "_joint.npy", info["image_joint"])
     print(f"wrote {a.out} {maps.shape}")
 
 

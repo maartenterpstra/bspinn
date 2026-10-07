@@ -466,10 +466,35 @@ def test_api_shapes_and_coil_axis(layout, shape):
     few = dict(iters_auto=2, iters_wires=3, iters_pinn=3, iters_dynamic=2, rank=1) if layout == "dynamic" else \
         dict(iters_auto=2, iters_wires=3, iters_pinn=3)
     kw = dict(calib=8, verbose=False, axes="xyz") if layout == "3d" else dict(calib=8, verbose=False)
-    C, info = estimate_maps(np.moveaxis(k, 0, -1), layout, coil_axis=-1, **kw, **few)
+    C, img, info = estimate_maps(np.moveaxis(k, 0, -1), layout, coil_axis=-1, return_image=True, **kw, **few)
     assert C.shape == k.shape and C.dtype == np.complex64 and np.isfinite(C).all()
+    assert img.shape == k.shape[1:] and info["image_joint"].shape == k.shape[1:]
     assert np.allclose((np.abs(C) ** 2).sum(0), 1, atol=1e-4)                     # rss normalisation
     assert info["support"].shape == k.shape[1:] if layout != "dynamic" else info["support"].shape == k.shape[1:3]
     assert coil_combine(k, C, layout).shape == k.shape[1:]
     with pytest.raises(ValueError):
         estimate_maps(k[0], layout, verbose=False)
+
+
+def test_api_image_conventions():
+    """Returned image(s) pair with the returned maps: fully sampled SENSE image reproduces the data,
+    the joint image reproduces the calibration data up to the (short) fit's residual, and noise
+    pre-whitening returns maps for the original channels."""
+    from bspinn.api import _cfft, estimate_maps, sense_image
+    from bspinn.data import make_synthetic
+    d, G, obj = make_synthetic(4, (32, 32), noise=0.002, noise_corr=0.3)
+    k = d.kspace[0]
+    C, img, info = estimate_maps(k, "2d", noise=d.noise, calib=12, return_image=True, verbose=False,
+                                 iters_auto=20, iters_wires=60, iters_pinn=60)
+    x = _cfft(k, (1, 2), True)
+    assert img.shape == (32, 32) and np.isfinite(img).all()
+    assert np.abs(sense_image(k, C, "2d") - (C.conj() * x).sum(0) / (np.abs(C) ** 2).sum(0)).max() < 1e-3 * np.abs(img).max()
+    acs = np.zeros((32, 32), bool); acs[10:22, 10:22] = True
+    n = d.noise.reshape(-1, 4)
+    L = np.linalg.inv(np.linalg.cholesky(n.conj().T @ n / n.shape[0]))
+    pred = np.einsum("ij,j...->i...", L, _cfft(C * info["image_joint"][None], (1, 2)))
+    kw = np.einsum("ij,j...->i...", L, k)
+    r = np.linalg.norm((pred - kw)[:, acs]) / np.linalg.norm(kw[:, acs])
+    assert abs(r / np.sqrt(info["data_loss"]) - 1) < 0.1, (r, info["data_loss"])     # same residual as the fit
+    with pytest.raises(ValueError):
+        estimate_maps(k, "2d", compress=2, verbose=False)
