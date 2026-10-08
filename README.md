@@ -338,7 +338,11 @@ What matters:
   mask) undersamples fully sampled data retrospectively. The calibration block defaults to the fit's
   `calib`, so the fit always sees a fully sampled calibration region and uses every other acquired
   sample inside its calibration grid; `return_image=True` unfolds the rest (CG-SENSE).
-  `info["mask"]`, `info["R_effective"]`. CLI: `maps ... --undersample 4 --pattern vd` or
+  `info["mask"]`, `info["R_effective"]`. Your own mask works the same way:
+  `m = cartesian_mask(...)` (or any bool array), then `estimate_maps(ksp, ..., undersample=m)` for fully
+  sampled data, or `estimate_maps(ksp * m, ..., mask=m)` for data that are already undersampled. A
+  warning is issued if the mask does not fully sample the central `calib` block the fit uses.
+  CLI: `maps ... --undersample 4 --pattern vd`, `maps ... --undersample-mask m.npy` or
   `python -m bspinn.cli mask --shape 320 368 --R 4 --acs 24 --out mask.npy`.
   On a 15-channel knee (Biot–Savart maps fitted from the undersampled data, `quality="fast"`;
   complex NRMSE of the CG-SENSE image against the same maps' fully sampled combination):

@@ -635,3 +635,20 @@ def test_estimate_maps_undersample_uses_calibration_block():
     m = info["mask"]
     assert m[:, 15:25].all() and info["undersample"]["acs"] == 10 and 1.8 < info["R_effective"] < 2.6
     assert img.shape == (32, 40) and np.isfinite(img).all()
+
+
+def test_estimate_maps_with_own_mask_and_calibration_warning():
+    import warnings
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    d, _, _ = make_synthetic(4, (32, 40), noise=0.01)
+    k = d.kspace[0]
+    few = dict(plane="axial", iters_auto=2, iters_wires=3, iters_pinn=3, verbose=False)
+    m = cartesian_mask(k.shape[1:], R=3, acs=10, pattern="random", seed=4)
+    _, info = estimate_maps(k, "2d", undersample=m, calib=10, **few)
+    assert np.array_equal(info["mask"], m)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        estimate_maps(k, "2d", undersample=cartesian_mask(k.shape[1:], R=3, acs=4), calib=12, **few)
+    assert any("calibration block" in str(x.message) for x in w)

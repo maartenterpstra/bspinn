@@ -313,8 +313,26 @@ def _apply_undersampling(ksp, mask, undersample, layout, calib):
             opts["acs"] = c[0] if layout != "3d" else (c[1], c[2]) if len(c) == 3 else c[0]
         m = cartesian_mask(ksp.shape[1:], layout=layout, extent=acquired, **opts)
     m = m & acquired
+    _check_calibration(m, acquired, calib, layout)
     info = {"mask": m, "R_effective": effective_acceleration(m, acquired), "undersample": {k: v for k, v in opts.items()}}
     return ksp * m[None], m, info
+
+
+def _check_calibration(m, acquired, calib, layout):
+    """Warn if the centre ``calib`` block of k-space (what the fit calibrates on) is not fully sampled
+    wherever data were acquired. The fit still runs (k-space data term), but with fewer samples."""
+    import warnings
+    sp = m.shape if layout != "dynamic" else m.shape[:-1]
+    c = calib if isinstance(calib, (tuple, list)) else (calib,) * len(sp)
+    sl = tuple(slice(max(0, n // 2 - min(int(a), n) // 2), max(0, n // 2 - min(int(a), n) // 2) + min(int(a), n))
+               for n, a in zip(sp, c))
+    if layout == "dynamic":
+        sl = sl + (slice(None),)
+    frac = float(m[sl].sum() / max(1, acquired[sl].sum()))
+    if frac < 0.999:
+        warnings.warn(f"the mask samples {100 * frac:.0f}% of the central calibration block "
+                      f"{tuple(int(min(a, n)) for a, n in zip(c, sp))} the fit uses (calib={calib}); "
+                      "add an ACS of that size to the mask (cartesian_mask(..., acs=...)) or lower calib")
 
 
 def _calib(calib, default, n):
