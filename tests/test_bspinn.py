@@ -576,3 +576,21 @@ def test_plane_auto_finds_inplane_b0():
     d, _, _ = make_synthetic(8, (48, 48), plane="coronal", noise=0.005)
     best, sc = _select_plane(d.kspace, None, (1.0, 1.0), None, FitConfig(calib=16, iters_auto=60), lambda *a: None)
     assert best in ("coronal", "coronal_t") and sc["axial"] > min(sc.values()), sc
+
+
+def test_sense_image_does_not_extrapolate_beyond_acquired_kspace():
+    """Regression: zero-padded / partial-Fourier k-space edges were treated as undersampling, and
+    CG-SENSE filled them with amplified noise (high-frequency stripes)."""
+    from bspinn.api import _cfft, acquired_extent, coil_combine, sense_image
+    from bspinn.data import make_synthetic
+    d, G, obj = make_synthetic(6, (48, 48), noise=0.01)
+    k = d.kspace[0].copy(); k[:, :, :4] = 0; k[:, :, -3:] = 0          # zero-padded PE edges
+    C = G.reshape(k.shape)
+    assert np.allclose(sense_image(k, C), coil_combine(k, C), atol=1e-5)  # fully sampled inside the extent
+    ku = k.copy(); ku[:, :, 5:43:2] = 0; ku[:, :, 20:28] = k[:, :, 20:28]  # R=2 inside the extent (+ ACS)
+    x = sense_image(ku, C)
+    box = acquired_extent(np.abs(ku).sum(0) > 0)
+    K = np.abs(_cfft(x, (0, 1))) ** 2
+    assert K[~box].sum() < 1e-10 * K.sum()
+    Ko = np.abs(_cfft(sense_image(ku, C, extrapolate=True), (0, 1))) ** 2
+    assert Ko[~box].sum() > 1e-4 * Ko.sum()                                  # the old behaviour did fill them

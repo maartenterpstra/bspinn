@@ -67,8 +67,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         scale; the maps then still extrapolate smoothly to the whole FOV).
     phase_ref : common-phase convention: 'inati' (virtual body coil, default) | 'model' | 'coil'.
     return_image : also return the full-resolution image reconstructed with the estimated maps
-        (SENSE: closed form for fully sampled data, CG-SENSE with Tikhonov ``sense_lambda`` otherwise;
-        per frame for dynamic data). Returns (maps, image, info).
+        (SENSE: closed form when everything inside the acquired k-space extent is sampled, CG-SENSE with
+        Tikhonov ``sense_lambda`` otherwise; zero-padded or partial-Fourier k-space edges are not
+        extrapolated; per frame for dynamic data). Returns (maps, image, info).
     mask_maps : False (default; maps cover the whole FOV) | True (zero the maps, and the images, outside
         the estimated object support ``info['support']``, as ESPIRiT's cropped maps; CG-SENSE is then
         support-constrained) | a bool array of the spatial shape (your own support; also used for the
@@ -401,10 +402,31 @@ def _joint_image(m, prob, C_raw, C_out, layout):
     return (f / np.where(np.abs(g) > 0, g, 1)).astype(np.complex64)
 
 
-def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=60, coil_axis=0):
+def acquired_extent(m):
+    """Box spanned by the acquired k-space along each axis (first..last index with any sample): the
+    region a reconstruction can estimate. Zero padding, partial Fourier and a cropped readout lie outside."""
+    box = np.ones(m.shape, bool)
+    for a in range(m.ndim):
+        prof = m.any(axis=tuple(i for i in range(m.ndim) if i != a))
+        idx = np.nonzero(prof)[0]
+        keep = np.zeros(m.shape[a], bool)
+        if idx.size:
+            keep[idx[0]:idx[-1] + 1] = True
+        box &= keep.reshape([-1 if i == a else 1 for i in range(m.ndim)])
+    return box
+
+
+def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=60, coil_axis=0, extrapolate=False):
     """Full-resolution image from k-space and maps: argmin ||M F (C x) - y||^2 + lam' ||x||^2 with
-    noise pre-whitening (if ``noise`` is given) applied to data and maps alike. Closed form when fully
-    sampled; CG otherwise (``lam`` relative to the mean of sum_j |C_j|^2). Dynamic: frame by frame."""
+    noise pre-whitening (if ``noise`` is given) applied to data and maps alike (``lam`` relative to the
+    mean of sum_j |C_j|^2). Dynamic: frame by frame.
+
+    Only k-space inside the acquired extent (``acquired_extent``) is estimated: missing samples inside
+    it (undersampling) are unfolded by CG-SENSE; zero-padded edges, partial-Fourier gaps and cropped
+    readout are left empty, as in a zero-filled reconstruction. Recovering those from coil
+    sensitivities alone is ill-conditioned and only amplifies noise into high spatial frequencies.
+    If everything inside the extent is acquired, this is the closed-form SENSE-1 combination of the
+    zero-filled data. ``extrapolate=True`` restores CG over the whole k-space grid."""
     ksp = np.moveaxis(np.asarray(ksp), coil_axis, 0).astype(np.complex64)
     C = np.moveaxis(np.asarray(maps), coil_axis, 0).astype(np.complex64)
     if noise is not None:
@@ -414,18 +436,20 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         C = np.einsum("ij,j...->i...", L, C)
     if layout == "dynamic":
         ms = [None if mask is None else mask[..., t] for t in range(ksp.shape[-1])]
-        return np.stack([sense_image(ksp[..., t], C[..., t], "2d", ms[t], None, lam, iters)
+        return np.stack([sense_image(ksp[..., t], C[..., t], "2d", ms[t], None, lam, iters, extrapolate=extrapolate)
                          for t in range(ksp.shape[-1])], -1)
     m = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
     ax = tuple(range(1, ksp.ndim))
     den = (np.abs(C) ** 2).sum(0)
-    if m.all():
-        return ((C.conj() * _cfft(ksp, ax, True)).sum(0) / np.maximum(den, 1e-12)).astype(np.complex64)
+    box = np.ones(m.shape, bool) if extrapolate else acquired_extent(m)
+    if (m | ~box).all():
+        return ((C.conj() * _cfft(ksp * m[None], ax, True)).sum(0) / np.maximum(den, 1e-12)).astype(np.complex64)
     lam = lam * float(den.mean())
+    band = (lambda x: x) if box.all() else (lambda x: _cfft(_cfft(x, tuple(range(x.ndim))) * box, tuple(range(x.ndim)), True))
 
     def AhA(x):
-        return (C.conj() * _cfft(m[None] * _cfft(C * x[None], ax), ax, True)).sum(0) + lam * x
-    b = (C.conj() * _cfft(m[None] * ksp, ax, True)).sum(0)
+        return band((C.conj() * _cfft(m[None] * _cfft(C * band(x)[None], ax), ax, True)).sum(0)) + lam * x
+    b = band((C.conj() * _cfft(m[None] * ksp, ax, True)).sum(0))
     x = np.zeros_like(b); r = b.copy(); p = r.copy(); rs = np.vdot(r, r).real; b0 = rs
     for _ in range(iters):
         Ap = AhA(p)
@@ -435,4 +459,4 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         if rn < 1e-10 * b0:
             break
         p = r + (rn / rs) * p; rs = rn
-    return x.astype(np.complex64)
+    return band(x).astype(np.complex64)

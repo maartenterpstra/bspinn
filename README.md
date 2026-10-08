@@ -328,6 +328,12 @@ What matters:
   orientation on knee15 (coronal) and brain8 (axial). A wrong plane fitted a coronal knee 2.5× worse
   and produced false zeros inside the object. Give `plane=` to skip the search (~6 short fits).
   In 3-D `axes="auto"` does the same.
+* **Image reconstruction**: `return_image=True` / `sense_image` only estimates k-space inside the
+  acquired extent (first..last sampled line per axis). Zero-padded edges, partial-Fourier gaps and a
+  cropped readout stay empty, as in a zero-filled reconstruction; undersampling inside the extent is
+  unfolded by CG-SENSE. Earlier versions treated those edges as undersampling and filled them with
+  amplified noise (high-frequency stripes; on a zero-padded knee 20 % of the image energy outside the
+  acquired extent, and 3× the error at R = 2). `extrapolate=True` restores that behaviour.
 * **Masked maps**: `mask_maps=True` zeros maps and images outside the estimated object support
   (`info["support"]`; tune with `support_threshold=0.1`, `support_dilate=2`), or pass your own bool
   mask (`mask_maps=sup`; CLI `--mask-maps [sup.npy]`). By default the maps cover the whole FOV, since
