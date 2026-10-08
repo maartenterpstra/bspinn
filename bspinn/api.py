@@ -30,8 +30,8 @@ PRESETS = {      # iterations: (handedness/orientation probe, wire stage, PINN s
 def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, plane="auto", axes="auto",
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
-                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-3, mask_maps=False, support_threshold=0.1,
-                  support_dilate=2, **cfg_overrides):
+                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-2, mask_maps=False, support_threshold=0.1,
+                  support_dilate=2, undersample=None, **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
     Parameters
@@ -68,7 +68,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     phase_ref : common-phase convention: 'inati' (virtual body coil, default) | 'model' | 'coil'.
     return_image : also return the full-resolution image reconstructed with the estimated maps
         (SENSE: closed form when everything inside the acquired k-space extent is sampled, CG-SENSE with
-        Tikhonov ``sense_lambda`` otherwise; zero-padded or partial-Fourier k-space edges are not
+        Tikhonov ``sense_lambda`` (relative to the mean of sum |C|^2; default 1e-2) otherwise; zero-padded or partial-Fourier k-space edges are not
         extrapolated; per frame for dynamic data). Returns (maps, image, info).
     mask_maps : False (default; maps cover the whole FOV) | True (zero the maps, and the images, outside
         the estimated object support ``info['support']``, as ESPIRiT's cropped maps; CG-SENSE is then
@@ -78,6 +78,13 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         image (calibration region, Hann window, 5-pixel smoothing) above ``support_threshold`` x its
         99th percentile, holes filled, dilated by ``support_dilate`` pixels. Lower the threshold or
         dilate more if the mask clips the object edge (masked maps make SENSE zero there).
+    undersample : retrospective Cartesian undersampling of (fully sampled) ``ksp`` before the fit: an
+        acceleration R (float, or (R1, R2) in 3-D), a dict of ``bspinn.masks.cartesian_mask`` options
+        (e.g. ``dict(R=4, pattern='vd', partial_fourier=0.75, seed=1)``) or a ready bool mask. The
+        mask always contains a fully sampled calibration block, by default of the fit's ``calib`` size
+        (``acs=`` to change it), and never samples outside the acquired data. The fit then uses every
+        acquired sample in its calibration grid; ``return_image`` unfolds the rest by CG-SENSE.
+        ``info['mask']``, ``info['R_effective']`` report what was used.
     cfg_overrides : any other FitConfig field (e.g. lambda_phys=0.1, field_mode='complex').
 
     Returns
@@ -131,6 +138,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         setattr(cfg, k, v)
     if cfg.compress:
         raise ValueError("compress is not supported by estimate_maps (maps are returned for the input channels)")
+    under_info = {}
+    if undersample is not None:
+        ksp, mask, under_info = _apply_undersampling(ksp, mask, undersample, layout, cfg.calib)
     log = print if verbose else (lambda *a, **k: None)
     t0 = time.time()
     if threads:
@@ -171,6 +181,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         C = C * sx[None]
         if info["image_joint"] is not None:
             info["image_joint"] = info["image_joint"] * sx
+    info.update(under_info)
     info.update(support=sup, maps_masked=mask_maps is not False and mask_maps is not None,
                 seconds=time.time() - t0, config=_cfg_dict(cfg))
     log(f"maps {C.shape} in {info['seconds']:.0f}s")
@@ -285,6 +296,27 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
 
 
 # ---------------------------------------------------------------------------------- helpers
+def _apply_undersampling(ksp, mask, undersample, layout, calib):
+    """Retrospective undersampling: build (or take) a Cartesian mask with the calibration block of
+    the fit, restricted to the acquired samples; zero the rest of ``ksp``."""
+    from .masks import cartesian_mask, effective_acceleration
+    acquired = (np.abs(ksp).sum(0) > 0) if mask is None else mask
+    if isinstance(undersample, np.ndarray):
+        m = np.asarray(undersample, bool)
+        if m.shape != ksp.shape[1:]:
+            raise ValueError(f"undersample mask must have shape {ksp.shape[1:]}, got {m.shape}")
+        opts = {}
+    else:
+        opts = dict(undersample) if isinstance(undersample, dict) else {"R": undersample}
+        if "acs" not in opts:                                  # the calibration region of the fit
+            c = calib if isinstance(calib, (tuple, list)) else (calib,)
+            opts["acs"] = c[0] if layout != "3d" else (c[1], c[2]) if len(c) == 3 else c[0]
+        m = cartesian_mask(ksp.shape[1:], layout=layout, extent=acquired, **opts)
+    m = m & acquired
+    info = {"mask": m, "R_effective": effective_acceleration(m, acquired), "undersample": {k: v for k, v in opts.items()}}
+    return ksp * m[None], m, info
+
+
 def _calib(calib, default, n):
     if calib is None:
         calib = default

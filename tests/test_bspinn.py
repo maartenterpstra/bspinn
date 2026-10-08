@@ -594,3 +594,44 @@ def test_sense_image_does_not_extrapolate_beyond_acquired_kspace():
     assert K[~box].sum() < 1e-10 * K.sum()
     Ko = np.abs(_cfft(sense_image(ku, C, extrapolate=True), (0, 1))) ** 2
     assert Ko[~box].sum() > 1e-4 * Ko.sum()                                  # the old behaviour did fill them
+
+
+@pytest.mark.parametrize("pattern", ["uniform", "random", "vd"])
+def test_cartesian_masks_2d_and_dynamic(pattern):
+    from bspinn.masks import cartesian_mask, effective_acceleration
+    m = cartesian_mask((64, 80), R=4, acs=12, pattern=pattern, seed=3)
+    assert m.shape == (64, 80) and m.dtype == bool
+    assert m[:, 34:46].all()                                      # centred ACS block (80//2 - 6 .. +6)
+    assert (m == m[:1]).all()                                     # readout (axis 0) fully sampled: lines
+    if pattern != "uniform":
+        assert abs(effective_acceleration(m) - 4) < 0.3          # net acceleration incl. ACS
+    pf = cartesian_mask((64, 80), R=4, acs=12, pattern=pattern, partial_fourier=0.75)
+    assert not pf[:, 60:].any()
+    ext = np.zeros((64, 80), bool); ext[:, 5:75] = True           # zero-padded edges: never sampled
+    assert not cartesian_mask((64, 80), 4, 12, pattern, extent=ext)[:, :5].any()
+    d = cartesian_mask((32, 40, 6), R=4, acs=8, pattern=pattern, layout="dynamic")
+    assert d.shape == (32, 40, 6) and d[:, 16:24].all()
+    assert not all((d[..., t] == d[..., 0]).all() for t in range(1, 6))   # varies over time
+
+
+@pytest.mark.parametrize("pattern", ["uniform", "caipi", "vd", "poisson"])
+def test_cartesian_masks_3d(pattern):
+    from bspinn.masks import cartesian_mask, effective_acceleration
+    R = (2, 2) if pattern in ("uniform", "caipi") else 6
+    m = cartesian_mask((8, 40, 48), R=R, acs=(8, 10), pattern=pattern, seed=1)
+    assert (m == m[:1]).all()                                     # readout axis 0 fully sampled
+    assert m[0, 16:24, 19:29].all()                               # ACS block in the PE plane
+    if pattern in ("vd", "poisson"):
+        assert abs(effective_acceleration(m) - 6) < 0.4
+
+
+def test_estimate_maps_undersample_uses_calibration_block():
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    d, _, _ = make_synthetic(4, (32, 40), noise=0.01)
+    k = d.kspace[0]
+    C, img, info = estimate_maps(k, "2d", plane="axial", calib=10, return_image=True, verbose=False,
+                                 undersample=dict(R=3, pattern="uniform"), iters_auto=2, iters_wires=3, iters_pinn=3)
+    m = info["mask"]
+    assert m[:, 15:25].all() and info["undersample"]["acs"] == 10 and 1.8 < info["R_effective"] < 2.6
+    assert img.shape == (32, 40) and np.isfinite(img).all()

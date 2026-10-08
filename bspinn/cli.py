@@ -123,6 +123,10 @@ def main(argv=None):
     pm.add_argument("--device", default="cpu")
     pm.add_argument("--threads", type=int, default=0)
     pm.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="any FitConfig field, e.g. iters_pinn=1000")
+    pm.add_argument("--undersample", type=float, nargs="+", default=None, metavar="R",
+                    help="retrospective Cartesian undersampling: R (or R1 R2 in 3-D); calibration block = --calib")
+    pm.add_argument("--undersample-mask", default=None, help="use this bool .npy mask instead of generating one")
+    _add_mask_args(pm, with_R=False)
     pm.add_argument("--mask-maps", nargs="?", const=True, default=False, metavar="SUPPORT.npy",
                     help="zero the maps (and images) outside the object support: estimated, or your own bool .npy")
     pm.add_argument("--support-threshold", type=float, default=0.1, help="estimated support: fraction of the 99th pct")
@@ -131,7 +135,19 @@ def main(argv=None):
                     help="also write the full-resolution image (SENSE with the estimated maps; CG if undersampled) "
                          "here, and the joint-fit (calibration-resolution) image next to it as *_joint.npy")
 
+    pk = sub.add_parser("mask", help="write a Cartesian undersampling mask (.npy) with a calibration block")
+    pk.add_argument("--shape", type=int, nargs="+", required=True, help="spatial shape (2-D/3-D), or (x, y, t) for dynamic")
+    pk.add_argument("--out", required=True)
+    pk.add_argument("--layout", default=None, choices=["2d", "3d", "dynamic"])
+    _add_mask_args(pk)
+
     a = ap.parse_args(argv)
+    if a.cmd == "mask":
+        from .masks import cartesian_mask, effective_acceleration
+        m = cartesian_mask(tuple(a.shape), layout=a.layout, **_mask_opts(a))
+        np.save(a.out, m)
+        print(f"wrote {a.out} {m.shape}, R_effective {effective_acceleration(m):.2f}")
+        return
     if a.cmd == "maps":
         _run_maps(a)
         return
@@ -199,6 +215,27 @@ def main(argv=None):
              recon_size=getattr(a, "recon_size", 128), seed=cfg.seed, ref_maps=refs)
 
 
+def _add_mask_args(p, with_R=True):
+    if with_R:
+        p.add_argument("--R", type=float, nargs="+", default=[4.0], help="acceleration (R1 R2 for 3-D lattices)")
+    p.add_argument("--pattern", default="uniform", choices=["uniform", "random", "vd", "caipi", "poisson"])
+    p.add_argument("--acs", type=int, nargs="+", default=None, help="calibration block per PE axis (maps: default --calib)")
+    p.add_argument("--partial-fourier", type=float, default=1.0)
+    p.add_argument("--mask-seed", type=int, default=0)
+
+
+def _mask_opts(a, R=None):
+    o = {"pattern": a.pattern, "partial_fourier": a.partial_fourier, "seed": a.mask_seed}
+    R = R if R is not None else getattr(a, "R", None)
+    if R is not None:
+        o["R"] = R[0] if len(R) == 1 else tuple(R)
+    if a.acs is not None:
+        o["acs"] = a.acs[0] if len(a.acs) == 1 else tuple(a.acs)
+    if getattr(a, "acs", None) is None and getattr(a, "R", None) is not None and "acs" not in o:
+        o["acs"] = 24
+    return o
+
+
 def _run_maps(a):
     import os
     from .api import estimate_maps
@@ -226,7 +263,12 @@ def _run_maps(a):
         t = type(defaults[key])
         over[key] = (val.lower() in ("1", "true", "yes")) if t is bool else t(val)
     calib = None if a.calib is None else (a.calib[0] if len(a.calib) == 1 else tuple(a.calib))
-    res = estimate_maps(k, a.layout, return_image=bool(a.image), coil_axis=a.coil_axis, mask=mask, spacing=a.spacing, plane=a.plane,
+    under = None
+    if a.undersample_mask:
+        under = np.load(a.undersample_mask).astype(bool)
+    elif a.undersample:
+        under = _mask_opts(a, R=a.undersample)
+    res = estimate_maps(k, a.layout, return_image=bool(a.image), undersample=under, coil_axis=a.coil_axis, mask=mask, spacing=a.spacing, plane=a.plane,
                                axes=a.axes, calib=calib, noise=noise, physics=a.physics, b0_tesla=a.b0,
                                model=a.model, rank=a.rank, quality=a.quality, normalise=a.normalise,
                                phase_ref=a.phase_ref, device=a.device, threads=a.threads,
@@ -237,12 +279,14 @@ def _run_maps(a):
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     np.save(a.out, maps)
     meta = {k_: v for k_, v in info.items()
-            if k_ not in ("support", "model", "problem", "temporal_modes", "config", "image_joint")}
+            if k_ not in ("support", "model", "problem", "temporal_modes", "config", "image_joint", "mask")}
     if "k2" in meta:
         meta["k2"] = [meta["k2"].real, meta["k2"].imag]
     if "temporal_modes" in info:
         np.save(a.out.replace(".npy", "") + "_modes.npy", info["temporal_modes"])
     np.save(a.out.replace(".npy", "") + "_support.npy", info["support"])
+    if "mask" in info:
+        np.save(a.out.replace(".npy", "") + "_mask.npy", info["mask"])
     with open(a.out.replace(".npy", "") + "_info.json", "w") as f:
         json.dump(meta, f, indent=1, default=str)
     if a.image:

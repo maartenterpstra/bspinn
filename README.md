@@ -328,6 +328,31 @@ What matters:
   orientation on knee15 (coronal) and brain8 (axial). A wrong plane fitted a coronal knee 2.5× worse
   and produced false zeros inside the object. Give `plane=` to skip the search (~6 short fits).
   In 3-D `axes="auto"` does the same.
+* **Undersampling masks** (`bspinn/masks.py`): `cartesian_mask(shape, R, acs, pattern)` builds
+  Cartesian masks with a fully sampled calibration block: 2-D / dynamic lines (`uniform`, `random`,
+  `vd` variable density; dynamic: a shifted lattice or a new draw per frame) and 3-D phase-encoding
+  planes (`uniform` R1×R2, `caipi`, `vd`, `poisson` variable-density Poisson disc), with optional
+  `partial_fourier` and an `extent` (never sample outside the acquired data). For uniform/CAIPI `R` is the
+  lattice spacing; for the random patterns it is the net acceleration including the ACS.
+  `estimate_maps(..., undersample=4)` or `undersample=dict(R=4, pattern="vd", seed=1)` (or a bool
+  mask) undersamples fully sampled data retrospectively. The calibration block defaults to the fit's
+  `calib`, so the fit always sees a fully sampled calibration region and uses every other acquired
+  sample inside its calibration grid; `return_image=True` unfolds the rest (CG-SENSE).
+  `info["mask"]`, `info["R_effective"]`. CLI: `maps ... --undersample 4 --pattern vd` or
+  `python -m bspinn.cli mask --shape 320 368 --R 4 --acs 24 --out mask.npy`.
+  On a 15-channel knee (Biot–Savart maps fitted from the undersampled data, `quality="fast"`;
+  complex NRMSE of the CG-SENSE image against the same maps' fully sampled combination):
+
+  | pattern, net R | λ | ours, as delivered | ours, `mask_maps` | ours on ESPIRiT's support | ESPIRiT |
+  |---|---|---|---|---|---|
+  | uniform, 3.3 | 1e-3 | 1.17 | 0.60 | 0.80 | 0.93 |
+  | uniform, 3.3 | 1e-2 | 0.53 | **0.47** | 0.58 | 0.65 |
+  | vd, 4.0 | 1e-3 | 0.99 | 1.35 | 1.40 | 1.55 |
+  | vd, 4.0 | 1e-2 | **0.37** | 0.54 | 0.56 | 0.59 |
+
+  With a regular lattice a support constraint (`mask_maps=True`) helps, with random-like patterns the
+  full-FOV maps do; λ = 1e-2 beats 1e-3 everywhere (also at R = 2), so it is now the default
+  `sense_lambda` of `return_image`. This knee is noise-limited beyond R ≈ 3 for plain SENSE.
 * **Image reconstruction**: `return_image=True` / `sense_image` only estimates k-space inside the
   acquired extent (first..last sampled line per axis). Zero-padded edges, partial-Fourier gaps and a
   cropped readout stay empty, as in a zero-filled reconstruction; undersampling inside the extent is
@@ -811,6 +836,7 @@ effects relative to coils in air beside a body: relative Laplacian of the maps 4
 
 | file | content |
 |---|---|
+| `masks.py` | `cartesian_mask`: Cartesian undersampling patterns with a calibration block (2-D, 3-D, dynamic) |
 | `api.py` | `estimate_maps`, `sense_image`, `coil_combine`: the one-call interface of §4.0 (CLI `maps`) |
 | `physics.py` | closed-form Biot–Savart for polylines, B→C mapping, autograd div/curl, Maxwell residual |
 | `models.py` | `WireLoopCoils` (hard), `HarmonicPINN` (soft / hybrid correction) |
