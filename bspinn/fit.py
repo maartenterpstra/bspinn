@@ -643,7 +643,8 @@ def _fit_free(prob, cfg, history, t0, log):
         loss = ((C - target).abs() ** 2 * w).sum() / (w.sum() * prob.N)
         loss.backward(); opt.step()
     log(f"[free] distilled to low-res division maps: {loss.item():.3e}")
-    c2 = FitConfig(**{**cfg.__dict__, "lambda_phys": cfg.lambda_sobolev})
+    # the ablation's smoothness term acts on the object only (as defined), not on the air collocation
+    c2 = FitConfig(**{**cfg.__dict__, "lambda_phys": cfg.lambda_sobolev, "air_colloc": 0.0})
     m, history["pinn"] = fit_pinn(prob, c2, model, None, log=log)
     log(f"fit done in {time.time() - t0:.1f}s")
     model.cpu(); prob.to("cpu")

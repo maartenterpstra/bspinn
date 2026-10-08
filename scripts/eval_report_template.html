@@ -211,6 +211,7 @@ ul.plain { margin: 0; padding-left: 18px; display: grid; gap: 6px; color: var(--
       <li>The knee FOV cuts through the leg along the readout, so the object touches the top and bottom edge. FFT-based estimators wrap structure across that edge; this affects every method and is visible in the last rows of the error maps.</li>
       <li>Synthetic truth is a Biot–Savart field, which favours the physics model; the mismatch case removes that advantage. The knee is the decisive real test because its fully sampled data give a reference for every metric.</li>
       <li>Runtimes are single-threaded CPU and include BART process start-up for ESPIRiT and NLINV.</li>
+      <li>This is the v8 run: every Biot–Savart variant and the no-physics ablation refitted after the conductor fixes (keep-out along every segment in every stage, finite conductor radius, Laplace penalty also in the air, hole-filled object support); classical baselines reused unchanged. The v7 numbers are kept in <code>runs/prev_v7</code>, the per-case comparison in <code>runs/compare_v8.json</code>.</li>
     </ul>
     <pre>python scripts/prepare_eval_data.py --knee &lt;kspace_fs&gt; --brain &lt;pics-brain/ksp&gt;
 BART=/path/to/bart ./run_eval.sh

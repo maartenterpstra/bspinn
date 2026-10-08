@@ -591,19 +591,20 @@ method's natural input.
 | prospective | held-out k-space NRMSE (2 folds × 20 %), noise floor | brain, where no reference exists |
 | maps | subspace, relative-phase, magnitude and absolute error vs truth; vortices; projector roughness; coverage; runtime | |
 
-**Results** (single slice, one run per method; full tables and figures in the report):
+**Results** (v8, single slice, one run per method; full tables and figures in the report; v7 → v8
+changes in `runs/compare_v8.json`):
 
 | | PINN | wires | NLINV | ESPIRiT | Walsh | low-res |
 |---|---|---|---|---|---|---|
-| synth σ=0.01, subspace err | **1.7e-5** | 3.8e-5 | 1.2e-4 | 2.0e-4 | 8.4e-4 | 7.4e-4 |
+| synth σ=0.01, subspace err | **1.7e-5** | 3.9e-5 | 1.2e-4 | 2.0e-4 | 8.4e-4 | 7.4e-4 |
 | synth σ=0.003, subspace err | **1.9e-6** | 3.6e-5 | 3.3e-5 | 1.1e-4 | 6.4e-4 | 5.1e-4 |
-| synth σ=0.03, subspace err | 1.9e-4 | **6.6e-5** | 8.6e-4 | 9.2e-4 | 2.6e-3 | 2.7e-3 |
-| synth, non-Biot–Savart maps, subspace err | 1.3e-3 | 5.0e-3 | **3.3e-4** | 4.9e-4 | 1.6e-3 | 1.5e-3 |
-| knee, residual/floor outside ACS 24 | 1.030 | 1.036 | **1.029** | 1.113 | 1.061 | 1.082 |
-| knee, SNR efficiency | 99.8 % | 99.1 % | **99.9 %** | 93.5 % | 98.4 % | 98.1 % |
-| knee, SENSE R4 NRMSE, maps as delivered | 0.245 | **0.242** | 0.288 | 0.300 | 0.309 | 0.304 |
-| knee, SENSE R4 NRMSE, common support | 0.176 | 0.175 | **0.173** | 0.278 | 0.184 | 0.185 |
-| brain (prospective), held-out NRMSE | **0.409** | 0.448 | 0.451 | 0.415 | 0.483 | 0.455 |
+| synth σ=0.03, subspace err | 1.8e-4 | **6.6e-5** | 8.6e-4 | 9.2e-4 | 2.6e-3 | 2.7e-3 |
+| synth, non-Biot–Savart maps, subspace err | 1.3e-3 | 5.2e-3 | **3.3e-4** | 4.9e-4 | 1.6e-3 | 1.5e-3 |
+| knee, residual/floor outside ACS 24 | **1.029** | 1.035 | **1.029** | 1.113 | 1.061 | 1.082 |
+| knee, SNR efficiency | 99.8 % | 99.2 % | **99.9 %** | 93.5 % | 98.4 % | 98.1 % |
+| knee, SENSE R4 NRMSE, maps as delivered | 0.257 | **0.231** | 0.288 | 0.300 | 0.309 | 0.304 |
+| knee, SENSE R4 NRMSE, common support | 0.175 | **0.172** | 0.173 | 0.278 | 0.184 | 0.185 |
+| brain (prospective), held-out NRMSE | 0.416 | 0.446 | 0.451 | **0.415** | 0.482 | 0.455 |
 
 Conclusions:
 
@@ -613,15 +614,29 @@ Conclusions:
 * When they do not (per-coil non-harmonic factors), the PINN falls back to low-res-division
   accuracy and NLINV/ESPIRiT win. The wire-only model is worst there.
 * On the real knee, NLINV and the PINN tie on every data-consistency metric. The Biot–Savart maps give
-  15–20 % lower SENSE error when used as delivered, because they extrapolate physically outside
+  11–20 % lower SENSE error when used as delivered, because they extrapolate physically outside
   the object. With a common support mask that advantage disappears.
 * ESPIRiT (default crop) fails where the knee is cut by the readout FOV (5th-percentile SNR efficiency 32 %).
-* Brain: the PINN has the lowest held-out error, but it used more samples (48×48 vs a 20×20 ACS).
+* Brain: the PINN ties ESPIRiT on held-out error (0.416 vs 0.415; v7 led with 0.409), using more
+  samples (48×48 vs a 20×20 ACS). See "v7 → v8" below.
 * Metric validity (Spearman vs ground truth, synthetic): the out-of-ACS residual tracks map
   error (0.66–0.97). The in-ACS residual does not, because methods fit noise there. SENSE error with maps as
-  delivered is misleading: the true maps give 0.123 at R = 4, ESPIRiT 0.082. Use the
+  delivered is misleading: the true maps give 0.122 at R = 4, ESPIRiT 0.082. Use the
   common-support variant.
-* Cost: PINN 9–52 min per slice on one CPU core, wires 1–11 min, the classical methods < 30 s.
+* Cost: PINN 12–53 min per slice on one CPU core, wires 1–10 min, the classical methods < 30 s.
+
+**v7 → v8 (conductor fixes, §3 items 7–9).** Same benchmark, baseline maps reused, every fitted
+method refitted. Unchanged within run-to-run noise: all synthetic 2-D cases, the knee at every ACS
+size (residual 1.030 → 1.029), the model-size sweep. Better: 3-D synthetic (PINN 5.8e-5 → 4.0e-5,
+wires 2.2e-4 → 7.4e-5), BART 3-D phantom (4.3e-3 → 3.9e-3), Helmholtz at 1.5 T (4.4e-5 → 2.8e-5)
+and 3 T (3.1e-4 → 2.5e-4), knee SENSE R4 with the wire model (0.242 → 0.231). Worse: knee SENSE R4
+as delivered with the PINN (0.245 → 0.257; on the common support 0.176 → 0.175, i.e. only the air
+extrapolation changed), prospective brain held-out (0.409 → 0.416), and the pure-PINN ablation
+(which now also gets the air Laplace penalty). Brain ablation (`scripts/brain_ablation.py`, deterministic; v8 default reproduces 0.4157 exactly):
+no air collocation 0.4156, 10× weaker keep-out 0.4176, thin wires (`wire_radius=0`) 0.4129. The finite
+conductor radius explains about 40 % of the 0.409 → 0.416 change; the rest comes from the
+segment/prism keep-out and the hole-filled support together. `wire_radius` stays at 0.05: it bounds
+the fields near conductors in the air, which is what removed the outliers reported on real data.
 
 **What the benchmark changed.** The calibration used to be modelled pixel-wise on the ACS grid
 (C·m on h×w), which ignores the truncation of the calibration data. The new default,
@@ -635,24 +650,26 @@ from 1.054 to 1.031. The old model is kept as `calib_oversample=1` (ablation `bs
 
 | model | setting | params (8 ch) | synth: subspace err | mismatch: subspace err | knee: residual/floor |
 |---|---|---|---|---|---|
-| wires | 1 loop × 6 vertices | 160 | 2.5e-3 | 1.1e-2 | 1.047 |
-| wires | 1 × 12 (default) | 304 | 3.8e-5 | 5.0e-3 | 1.036 |
-| wires | 1 × 24 | 592 | **9.5e-6** | 2.9e-3 | 1.032 |
-| wires | 3 × 12 | 896 | 1.4e-5 | 3.6e-3 | 1.032 |
-| wires | 3 × 24 | 1760 | 9.9e-6 | 2.0e-3 | – |
-| PINN | width 16 | 1.6k | 1.8e-5 | 1.2e-3 | 1.030 |
-| PINN | width 64, depth 4 (default) | 14k | 1.7e-5 | 1.25e-3 | 1.030 |
-| PINN | width 128 | 53k | 1.4e-5 | 1.3e-3 | 1.030 |
-| PINN | λ_phys 0.001 … 1 | 14k | – | 1.22–1.27e-3 | – |
-| PINN | `--field-mode complex` | 14k | – | **4.3e-4** | – |
+| wires | 1 loop × 6 vertices | 160 | 2.8e-3 | 1.1e-2 | 1.045 |
+| wires | 1 × 12 (default) | 304 | 3.9e-5 | 5.2e-3 | 1.035 |
+| wires | 1 × 24 | 592 | **8.4e-6** | 3.0e-3 | 1.032 |
+| wires | 3 × 12 | 896 | 1.3e-5 | 3.8e-3 | 1.031 |
+| wires | 3 × 24 | 1760 | 9.1e-6 | 2.1e-3 | – |
+| PINN | width 16 | 1.6k | 1.8e-5 | 1.3e-3 | 1.029 |
+| PINN | width 64, depth 4 (default) | 14k | 1.7e-5 | 1.27e-3 | 1.029 |
+| PINN | width 128 | 53k | 1.4e-5 | 1.3e-3 | 1.029 |
+| PINN | λ_phys 0.001 … 1 | 14k | – | 1.21–1.31e-3 | – |
+| PINN | `--field-mode complex` | 14k | – | **4.9e-4** | – |
+
+(v8 numbers; the v7 run gave the same picture within run-to-run noise, `runs/prev_v7/size`.)
 
 * Wires: resolution of each loop matters more than the number of loops. With 6 vertices a loop is
   too coarse near its conductor. Error saturates at about 24 vertices, matching the 48-vertex circles of
-  the synthetic truth. On the knee more geometry helps slowly (1.047 → 1.032) and approaches the PINN.
+  the synthetic truth. On the knee more geometry helps slowly (1.045 → 1.031) and approaches the PINN.
 * PINN: a 33× range of network size (and 3 decades of λ_phys) changes nothing beyond run-to-run
   noise, while runtime grows about 4×. The network is not capacity-limited. On the mismatch case the limit is
   the `real` field model: per-coil spatially varying phase cannot be written as e^{iθ}(B_x+iB_y)
-  of a real field. The complex mode removes that limit (1.25e-3 → 4.3e-4, close to NLINV 3.3e-4).
+  of a real field. The complex mode removes that limit (1.27e-3 → 4.9e-4, close to NLINV 3.3e-4).
 * Practical: width 16–32 and 24 vertices per loop are as good as the defaults or better, and 2–3× faster.
 
 **Are the wires needed?** `--init none` fits a single harmonic network for the whole field, with no wire model,
@@ -660,13 +677,16 @@ and the same total iterations (2500):
 
 | | hybrid (default) | pure PINN, width 64 | pure PINN, width 128 |
 |---|---|---|---|
-| synth8, subspace err | **1.7e-5** | 1.7e-3 | 2.7e-3 |
-| synth8 mismatch, subspace err | **1.25e-3** | 7.8e-3 | – |
-| knee, residual/floor outside ACS | 1.030 | 1.030 | – |
-| knee, SENSE R4 NRMSE as delivered / common support | **0.245 / 0.176** | 0.378 / 0.194 | – |
-| runtime synth8 / knee | 518 s / 991 s | 935 s / 1755 s | 2209 s / – |
+| synth8, subspace err | **1.7e-5** | 2.2e-3 | 3.3e-3 |
+| synth8 mismatch, subspace err | **1.27e-3** | 1.2e-2 | – |
+| knee, residual/floor outside ACS | 1.029 | 1.032 | – |
+| knee, SENSE R4 NRMSE as delivered / common support | **0.257 / 0.175** | 0.376 / 0.218 | – |
+| runtime synth8 / knee | 737 s / 1382 s | 1103 s / 1862 s | 2563 s / – |
 
-The pure network fits the measured data inside the object as well as the hybrid (knee residual 1.030). But
+(v8. In v7 the pure network reached 1.7e-3 / 7.8e-3; in v8 its Laplace penalty also covers the air,
+which it fits less well without conductors to put the sources somewhere.)
+
+The pure network fits the measured data inside the object almost as well as the hybrid (knee residual 1.032 vs 1.029). But
 its maps are 100× less accurate on synthetic truth and extrapolate badly outside the object. A larger
 network makes it worse, not better. Harmonic inside the object does not say where the sources are. The
 explicit conductors outside the object provide that, plus the steep near-field and a physical starting point.
