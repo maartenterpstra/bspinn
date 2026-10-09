@@ -369,20 +369,25 @@ def fit3d(data: VolumeData, cfg: FitConfig, log=print, orientation: str = "given
     t0 = time.time()
     data.prewhiten()
     orient_scores = None
+    from . import accel
     if orientation == "auto":
-        axes, orient_scores = select_orientation(data, cfg, log)
+        with accel.phase("orientation_search", cfg.device):
+            axes, orient_scores = select_orientation(data, cfg, log)
         data.geom = VolumeGeometry(data.geom.shape, data.geom.voxel, axes)
-    prob = Problem3D(data, cfg).to(cfg.device)
+    with accel.phase("problem_setup", cfg.device):
+        prob = Problem3D(data, cfg).to(cfg.device)
     log(f"3-D data: {prob.N} coils, volume {data.geom.shape}, calib block {prob.kcalib} on a {prob.calib} grid, "
         f"data term '{prob.data_term}', {prob.support_pts.shape[0]} support points, correction grid {prob.coarse_shape}")
     hist = {"orientation": data.geom.axes, "orientation_scores": orient_scores}
     h = cfg.handedness
     if h == 0:
-        sc = {hh: fit_wires(prob, cfg, hh, cfg.iters_auto, log=lambda *a: None)[3] for hh in (1, -1)}
+        with accel.phase("handedness_search", cfg.device):
+            sc = {hh: fit_wires(prob, cfg, hh, cfg.iters_auto, log=lambda *a: None)[3] for hh in (1, -1)}
         h = min(sc, key=sc.get)
         hist["handedness_scores"] = {str(k): v for k, v in sc.items()}
         log(f"handedness {h:+d}  (data loss +1: {sc[1]:.3e}, -1: {sc[-1]:.3e})")
-    wires, m, hist["wires"], _ = fit_wires(prob, cfg, h, cfg.iters_wires, log=log)
+    with accel.phase("wires", cfg.device):
+        wires, m, hist["wires"], _ = fit_wires(prob, cfg, h, cfg.iters_wires, log=log)
     t_wires = time.time() - t0
     model = wires
     snapshot = None
@@ -391,7 +396,8 @@ def fit3d(data: VolumeData, cfg: FitConfig, log=print, orientation: str = "given
         snapshot = copy.deepcopy(wires).cpu()          # the wire stage alone (the PINN co-adapts its wires)
         pinn = make_pinn(prob, cfg, wires, h)
         wrapped = CoarseCorrection(pinn, prob)
-        m, hist["pinn"] = fit_pinn(prob, cfg, wrapped, m, log=log)
+        with accel.phase("pinn", cfg.device):
+            m, hist["pinn"] = fit_pinn(prob, cfg, wrapped, m, log=log)
         model = pinn
     log(f"3-D fit done in {time.time() - t0:.0f}s")
     model.cpu(); prob.to("cpu")

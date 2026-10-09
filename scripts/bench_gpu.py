@@ -93,18 +93,38 @@ def check_end_to_end(dev, quick):
     k = d.kspace[0]
     sup = torch.from_numpy((np.abs(obj[:1]) > 0).astype(np.float32))           # object support
     res = {}
-    runs = [("cpu", "cpu", {}), (dev, dev, {})]
+    runs = [("cpu", "cpu", {}), (dev, dev, {"cuda_graph": False})]
     if torch.device(dev).type == "cuda":
         runs.append((dev + " cuda_graph", dev, {"cuda_graph": True}))
     for name, device, extra in runs:
+        import cProfile
+        import pstats
+        pr = cProfile.Profile() if "cuda_graph" in name else None   # where the wall time goes (host view)
         t = time.time()
+        if pr:
+            pr.enable()
         C, info = estimate_maps(k, "2d", calib=24, quality="fast", device=device, verbose=False,
                                 **({"iters_pinn": 150, "iters_wires": 100} if quick else {}), **extra)
+        if pr:
+            pr.disable()
         e = subspace_error(torch.from_numpy(C)[None], torch.from_numpy(gt[:1]), sup)
         from bspinn import accel
-        res[name] = {"subspace_err": e, "seconds": time.time() - t, "cuda_graph_stats": dict(accel.STATS)}
+        res[name] = {"subspace_err": e, "seconds": time.time() - t, "phase_seconds": info.get("timings"),
+                     "cuda_graph_stats": dict(accel.STATS)}
         accel.STATS.update(captured=0, fallback=0, last_error=None)
-        print(f"  estimate_maps 128^2 on {name:18s}: subspace error {e:.2e}, {time.time() - t:.1f} s", flush=True)
+        if pr:
+            st = pstats.Stats(pr)
+            top = sorted(st.stats.items(), key=lambda kv: -kv[1][3])[:40]
+            res[name]["cprofile_top_cumulative"] = [
+                {"function": f"{os.path.basename(f)}:{ln}({fn})", "calls": v[1], "cum_s": round(v[3], 3),
+                 "self_s": round(v[2], 3)} for (f, ln, fn), v in top]
+            top = sorted(st.stats.items(), key=lambda kv: -kv[1][2])[:25]
+            res[name]["cprofile_top_self"] = [
+                {"function": f"{os.path.basename(f)}:{ln}({fn})", "calls": v[1], "self_s": round(v[2], 3)}
+                for (f, ln, fn), v in top]
+        ph = info.get("timings") or {}
+        print(f"  estimate_maps 128^2 on {name:18s}: subspace error {e:.2e}, {time.time() - t:.1f} s  "
+              + " ".join(f"{a} {b:.1f}" for a, b in ph.items()), flush=True)
     return res
 
 
@@ -302,7 +322,8 @@ def main():
     a = ap.parse_args()
     if a._child:
         return child(a)
-    report = {"device": a.device, "torch": torch.__version__,
+    report = {"device": a.device, "torch": torch.__version__, "cpu_count": os.cpu_count(),
+              "torch_threads": torch.get_num_threads(),
               "gpu": torch.cuda.get_device_name(a.device) if torch.device(a.device).type == "cuda" else None}
     print(f"bspinn GPU benchmark on {a.device} ({report['gpu'] or 'no GPU'}), torch {torch.__version__}", flush=True)
     if a.only in ("all", "correctness"):

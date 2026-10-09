@@ -145,18 +145,21 @@ def virtual_body_coil(C0, sup=None, robust=True, iters=300, restarts=8, seed=0):
     strength = lambda d: (d.conj() @ Xn).abs().min()
     best, best_s = d_eig, float(strength(d_eig))
     starts = [d_eig] + [torch.randn(N, dtype=torch.complex64, generator=g) for _ in range(restarts)]
+    # all starts optimised together (Adam is element-wise, the summed losses are independent: identical
+    # to one loop per start, ~(restarts + 1)x fewer operations)
+    D0 = torch.stack([d0 / d0.norm() for d0 in starts])                         # (R,N)
     with torch.enable_grad():
-        for d0 in starts:
-            p = torch.nn.Parameter(torch.view_as_real((d0 / d0.norm()).clone()))
-            opt = torch.optim.Adam([p], lr=2e-2)
-            for _ in range(iters):
-                dc = torch.view_as_complex(p); dc = dc / dc.norm()
-                loss = -torch.log((dc.conj() @ Xn).abs() ** 2 + 1e-6).mean()
-                opt.zero_grad(); loss.backward(); opt.step()
-            dc = torch.view_as_complex(p.detach()); dc = dc / dc.norm()
-            s = float(strength(dc))
-            if s > best_s:
-                best, best_s = dc, s
+        p = torch.nn.Parameter(torch.view_as_real(D0.clone()))
+        opt = torch.optim.Adam([p], lr=2e-2)
+        for _ in range(iters):
+            dc = torch.view_as_complex(p); dc = dc / dc.norm(dim=1, keepdim=True)
+            loss = -torch.log((dc.conj() @ Xn).abs() ** 2 + 1e-6).mean(1).sum()
+            opt.zero_grad(); loss.backward(); opt.step()
+    D = torch.view_as_complex(p.detach()); D = D / D.norm(dim=1, keepdim=True)
+    st = (D.conj() @ Xn).abs().min(1).values
+    for r in range(D.shape[0]):
+        if float(st[r]) > best_s:
+            best, best_s = D[r], float(st[r])
     return best
 
 

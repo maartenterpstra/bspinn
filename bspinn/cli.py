@@ -123,8 +123,8 @@ def main(argv=None):
     pm.add_argument("--device", default="cpu", help="cpu | cuda | cuda:1 ...")
     pm.add_argument("--compile", nargs="?", const=True, default=False, metavar="MODE",
                     help="torch.compile each stage's iteration; MODE: default | reduce-overhead (CUDA graphs) | max-autotune")
-    pm.add_argument("--cuda-graph", action="store_true",
-                    help="replay each training iteration from one captured CUDA graph (GPU; see README 8.2)")
+    pm.add_argument("--no-cuda-graph", dest="cuda_graph", action="store_false",
+                    help="GPU: run the training iterations eagerly instead of replaying a captured CUDA graph")
     pm.add_argument("--tf32", action="store_true", help="TF32 matmuls on Ampere+ GPUs")
     pm.add_argument("--threads", type=int, default=0)
     pm.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="any FitConfig field, e.g. iters_pinn=1000")

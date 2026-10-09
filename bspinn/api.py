@@ -18,6 +18,7 @@ import time
 import numpy as np
 import torch
 
+from . import accel
 from .fit import FitConfig
 
 PRESETS = {      # iterations: (handedness/orientation probe, wire stage, PINN stage)
@@ -158,6 +159,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         ksp, mask, under_info = _apply_undersampling(ksp, mask, undersample, layout, cfg.calib)
     log = print if verbose else (lambda *a, **k: None)
     t0 = time.time()
+    accel.TIMES.clear()
     if threads:
         torch.set_num_threads(threads)
 
@@ -184,7 +186,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         sup = np.asarray(mask_maps, bool)
         if sup.shape != ksp.shape[1:3 if layout == "dynamic" else None]:
             raise ValueError(f"mask_maps array must have the spatial shape {ksp.shape[1:3 if layout == 'dynamic' else None]}")
-    C = _finish(C, sup, layout, phase_ref, normalise)
+    with accel.phase("finish"):
+        C = _finish(C, sup, layout, phase_ref, normalise)
     x_solved = None
     xf = info.pop("_xfull", None)
     if xf is not None:                         # joint full-resolution image, in the convention of the maps
@@ -213,7 +216,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
             info["image_joint"] = info["image_joint"] * sx
     info.update(under_info)
     info.update(support=sup, maps_masked=mask_maps is not False and mask_maps is not None,
-                seconds=time.time() - t0, config=_cfg_dict(cfg))
+                seconds=time.time() - t0, config=_cfg_dict(cfg), timings=dict(accel.TIMES))
     log(f"maps {C.shape} in {info['seconds']:.0f}s")
     C = C.astype(np.complex64)
     if not return_image:
@@ -221,7 +224,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     if x_solved is not None:
         info["image_solved_jointly"] = True
         return C, x_solved, info
-    img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda, device=device)
+    with accel.phase("sense_image", device):
+        img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda, device=device)
+    info["timings"] = dict(accel.TIMES)
+    info["seconds"] = time.time() - t0
     return C, img, info
 
 
@@ -258,14 +264,16 @@ def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
     N, X, Y = ksp.shape
     scores = None
     if plane == "auto":
-        plane, scores = _select_plane(ksp[None], None if mask is None else mask[None, None], spacing, noise, cfg, log)
+        with accel.phase("plane_search", cfg.device):
+            plane, scores = _select_plane(ksp[None], None if mask is None else mask[None, None], spacing, noise, cfg, log)
     geom = SliceGeometry((X, Y), spacing, np.zeros(1), plane)
     data = MultiCoilData(ksp[None], geom, mask=None if mask is None else mask[None, None], noise=noise)
     model, prob, hist, extra = fit(data, cfg, log=log)
-    pts = geom.grid().reshape(-1, 3)
-    model.to(cfg.device)                                   # evaluate the full-resolution maps on the device
-    C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
-    model.cpu()
+    with accel.phase("maps_eval", cfg.device):
+        pts = geom.grid().reshape(-1, 3)
+        model.to(cfg.device)                                   # evaluate the full-resolution maps on the device
+        C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
+        model.cpu()
     return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob,
                "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores}
 
@@ -277,10 +285,11 @@ def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
     data = VolumeData(ksp, geom, mask=mask, noise=noise)
     model, prob, hist, extra = fit3d(data, cfg, log=log, orientation=orient)
     from .models import HelmholtzPINN, WaveWireLoopCoils
-    if not isinstance(model, (HelmholtzPINN, WaveWireLoopCoils)):
-        model.to(cfg.device)                               # wave models: evaluated as trained (CPU grids)
-    C = volume_maps(model, prob).numpy()
-    model.cpu()
+    with accel.phase("maps_eval", cfg.device):
+        if not isinstance(model, (HelmholtzPINN, WaveWireLoopCoils)):
+            model.to(cfg.device)                               # wave models: evaluated as trained (CPU grids)
+        C = volume_maps(model, prob).numpy()
+        model.cpu()
     info = {"handedness": extra["handedness"], "orientation": prob.data.geom.axes,
             "orientation_note": "physical axis (x,y,z; B0 = z) of array axes 1..3", "data_loss": _last(hist),
             "model": model, "problem": prob, "_m": extra["image_lowres"]}

@@ -87,8 +87,9 @@ class FitConfig:
     compile: bool | str = False      # torch.compile each stage's whole iteration (see accel.py): False | True |
                                      #   'reduce-overhead' (+ CUDA graphs) | 'max-autotune'; ~10-60 s per stage
     compile_min_iters: int = 200     # stages with fewer iterations run eagerly (not worth compiling)
-    cuda_graph: bool = False         # CUDA: replay each stage's iteration (forward, backward, Adam) from one
-                                     #   captured CUDA graph after 3 warm-up iterations (accel.train_graphed)
+    cuda_graph: bool = True          # CUDA only: replay each stage's iteration (forward, backward, Adam) from one
+                                     #   captured CUDA graph after 3 warm-up iterations (accel.train_graphed);
+                                     #   4-7x faster per iteration on an RTX PRO 6000. No effect on CPU
     tf32: bool = False               # allow TF32 matmuls on Ampere+ GPUs (faster, ~1e-3 relative precision)
     air_colloc: float = 0.25         # fraction of Laplace collocation points in the air around the object
                                      #   (>= 2 wire radii from any wire): keeps the network correction harmonic,
@@ -972,10 +973,11 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
         torch.set_num_threads(cfg.threads)
     torch.manual_seed(cfg.seed)
     t0 = time.time()
-    data.prewhiten()
-    if cfg.compress:
-        data.compress(cfg.compress, cfg.calib)
-    prob = Problem(data, cfg).to(cfg.device)
+    with accel.phase("problem_setup", cfg.device):
+        data.prewhiten()
+        if cfg.compress:
+            data.compress(cfg.compress, cfg.calib)
+        prob = Problem(data, cfg).to(cfg.device)
     if prob.mix is not None or cfg.compress:
         log(f"channels: {prob.N} data (virtual) channels, modelling {prob.N_model} "
             f"{'physical coils + known mixing' if prob.mix is not None else 'virtual channels directly'}")
@@ -989,26 +991,30 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
     h = cfg.handedness
     if h == 0:
         scores = {}
-        for hh in (+1, -1):
-            _, _, _, scores[hh] = fit_wires(prob, cfg, hh, cfg.iters_auto, log=lambda *a: None)
+        with accel.phase("handedness_search", cfg.device):
+            for hh in (+1, -1):
+                _, _, _, scores[hh] = fit_wires(prob, cfg, hh, cfg.iters_auto, log=lambda *a: None)
         h = min(scores, key=scores.get)
         log(f"handedness auto-selected: {h:+d}  (data loss +1: {scores[1]:.3e}, -1: {scores[-1]:.3e})")
         history["handedness_scores"] = {str(k): v for k, v in scores.items()}
 
     wires_model = m = None
     if cfg.model == "wires" or cfg.init == "wires":
-        wires_model, m, history["wires"], _ = fit_wires(prob, cfg, h, cfg.iters_wires, log=log)
+        with accel.phase("wires", cfg.device):
+            wires_model, m, history["wires"], _ = fit_wires(prob, cfg, h, cfg.iters_wires, log=log)
     model = wires_model
     if cfg.model == "wires" and cfg.free_sets:
         log("note: free sets need the PINN (--model pinn); ignored for --model wires")
     if cfg.model == "pinn":
         wires = wires_model.primary if isinstance(wires_model, MultiSetCoils) else wires_model
-        pinn = make_pinn(prob, cfg, wires, h)
-        model = _wrap(pinn, prob, cfg, prev=wires_model, free=cfg.free_sets)
-        m, history["pinn"] = fit_pinn(prob, cfg, model, m, log=log)
+        with accel.phase("pinn", cfg.device):
+            pinn = make_pinn(prob, cfg, wires, h)
+            model = _wrap(pinn, prob, cfg, prev=wires_model, free=cfg.free_sets)
+            m, history["pinn"] = fit_pinn(prob, cfg, model, m, log=log)
     image_full = None
     if cfg.joint_full:
-        image_full, history["joint"] = fit_joint_full(prob, cfg, model, log=log)
+        with accel.phase("joint_image", cfg.device):
+            image_full, history["joint"] = fit_joint_full(prob, cfg, model, log=log)
     log(f"fit done in {time.time() - t0:.1f}s")
     wires = wires_model.primary if isinstance(wires_model, MultiSetCoils) else wires_model
     # evaluation runs on CPU

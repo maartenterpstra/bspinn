@@ -21,6 +21,28 @@ than eager because of recompilation and per-call overhead, and it was removed.)
 import torch
 
 STATS = {"captured": 0, "fallback": 0, "last_error": None}     # CUDA-graph stages (for diagnostics)
+TIMES = {}                                                     # wall time per phase of the last estimate_maps
+
+
+class phase:
+    """Context manager adding the wall time of a block to TIMES[name] (synchronising the GPU at the block
+    boundaries only, so the time is attributed to the right phase)."""
+
+    def __init__(self, name, device=None):
+        self.name, self.cuda = name, device is not None and torch.device(device).type == "cuda"
+
+    def __enter__(self):
+        import time
+        if self.cuda:
+            torch.cuda.synchronize()
+        self.t = time.perf_counter()
+
+    def __exit__(self, *exc):
+        import time
+        if self.cuda:
+            torch.cuda.synchronize()
+        TIMES[self.name] = TIMES.get(self.name, 0.0) + time.perf_counter() - self.t
+        return False
 
 
 def configure(cfg):
