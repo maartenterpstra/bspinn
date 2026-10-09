@@ -219,8 +219,10 @@ def trunk_taylor(net: nn.Sequential, x: torch.Tensor, z: torch.Tensor, laplacian
     x: (..., 3); z: latent codes broadcastable to (..., L), e.g. (N, 1, L) for per-coil codes (their
     first-layer contribution is computed once per code, not per point).
     Returns phi (..., K), dphi/dx (..., 3, K), lap phi (..., K) (None if laplacian=False).
-    On CUDA the stacked variant (trunk_taylor_stacked: one matmul per layer) is used."""
-    if x.is_cuda:
+    Under torch.compile on CUDA the stacked variant (trunk_taylor_stacked: one matmul per layer) is used:
+    inductor fuses its row slicing and concatenation away. Uncompiled, the separate tensors are faster (the
+    strided row slices and copies cost more than the saved matmuls; measured on an RTX PRO 6000)."""
+    if x.is_cuda and torch.compiler.is_compiling():
         return trunk_taylor_stacked(net, x, z, laplacian)
     layers = list(net)
     W0, b0 = layers[0].weight, layers[0].bias

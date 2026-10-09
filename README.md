@@ -900,7 +900,7 @@ End to end (`estimate_maps`, 128², 8 coils, synthetic, v16), seconds:
 |---|---|---|---|---|---|---|
 | 2-D `fast`, CPU (1 process, 64 threads) | 96 | 24 | 16 | 56 | | 0.6 |
 | 2-D `fast`, GPU eager | 21 | 5.0 | 3.9 | 11.3 | | 0.5 |
-| 2-D `fast`, GPU CUDA graphs (default) | **3.4** | 0.57 | 0.35 | 1.76 | | 0.67 |
+| 2-D `fast`, GPU CUDA graphs (default) | **3.4** (v17: phase reference 0.05) | 0.52 | 0.35 | 1.76 | | 0.67 |
 | 2-D `default`, CUDA graphs | 7.5 | 0.74 | 0.94 | 5.3 | | 0.5 |
 | 2-D `fast` + `solve_image`, CUDA graphs | 4.4 | 0.47 | 0.35 | 1.74 | 1.31 | 0.5 |
 | 3-D 48³ `fast`, orientation search, CUDA graphs | 2.9 | 1.07 | 0.35 | 0.78 | | 0.56 |
@@ -926,8 +926,8 @@ What was changed for GPU throughput (all exact, covered by tests):
 | **no repeated handedness search**: the plane / orientation search already fits both handednesses on exactly the problem of the main fit; its scores are reused (2 of 8 probe stages saved) | identical maps (checked) |
 | **`solve_image` stage in a CUDA graph** too (map step, physics, regularisers, Adam and the warm-started CG image update, all replayed) | same trajectory as eager (CPU test of the code path) |
 | capturable Adam: real parameters in one **fused** kernel, the complex image parameter separately | fewer optimizer kernels per replay |
-| GPU: **stacked Taylor-mode trunk** (value, 3 tangents and Laplacian as rows of one tensor: one GEMM per layer instead of three) and **one trunk pass for data grid + collocation** in the PINN stage (`sensitivity_and_physics`) | the per-iteration profile showed ~25–45 % of the device time in ~45 latency-bound small GEMMs; now ~6× fewer. Same values (tests); CPU keeps the separate passes |
-| probes never compiled, phase-reference search replayed from a CUDA graph | `compile=True` no longer compiles 6 probe geometries (27 s); the virtual-body-coil Adam loop costs one launch per step |
+| with `compile=True` on a GPU: **stacked Taylor-mode trunk** (value, 3 tangents and Laplacian as rows of one tensor: one GEMM per layer instead of three) and **one trunk pass for data grid + collocation** in the PINN stage (`sensitivity_and_physics`) | ~6× fewer GEMMs; PINN iteration 1.32 → 1.19 ms. Without compile both were slower (strided slices, Laplacian on the data grid: 2.5 → 3.1 ms with CUDA graphs) and are not used. Same values (tests) |
+| probes never compiled, phase-reference search replayed from a CUDA graph | `compile=True` no longer compiles 6 probe geometries (27 → 1.3 s); phase reference 0.5–0.7 → 0.05 s |
 | `tf32=True` | TF32 matmuls (Ampere+); ~1e-3 relative precision in the MLP, off by default |
 
 `scripts/bench_gpu.py` measures eager / graph / compile [+tf32] in fresh processes, reports first-call

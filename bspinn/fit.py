@@ -615,9 +615,11 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
         C0 = model.sensitivity(prob.coords, create_graph=False).detach() if m is None else None
         m = _image_param(prob, C0, K, m)
         params.append({"params": [m], "lr": 1e-2})
-    # GPU: data grid + collocation in one trunk pass (fewer, larger kernels; the extra Laplacian rows on
-    # the data grid are free there). CPU: separate passes (compute-bound; no wasted Laplacian).
-    joint_pass = getattr(model, "sensitivity_and_physics", None) if prob.device.type == "cuda" else None
+    # compiled on a GPU: data grid + collocation in one trunk pass (fewer GEMMs; inductor fuses the rest).
+    # Otherwise separate passes: uncompiled, the Laplacian on the data grid costs more than it saves
+    # (CUDA graphs: 2.5 -> 3.1 ms per iteration), and on CPU everything is compute-bound.
+    joint_pass = getattr(model, "sensitivity_and_physics", None) \
+        if (prob.device.type == "cuda" and accel.compile_mode(cfg)) else None
 
     def step_loss(sl, pin, pair):
         r = joint_pass(prob.slice_coords(sl), pin, pair, cfg.air_colloc) if joint_pass else None
