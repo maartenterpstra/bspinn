@@ -875,12 +875,12 @@ image), the full-resolution map evaluation and the CG-SENSE image (`sense_image`
 the inputs and outputs cross the PCIe bus.
 
 **Where the time goes on a GPU.** The calibration problems are small (2-D: 48² grid points × 8 coils,
-768 collocation points), so an iteration costs ~1000 tiny kernels and ~1400 dispatcher calls, and the
-GPU waits on the host. Measured on an RTX PRO 6000 Blackwell (eager, v10): 2-D 256², 8 coils: wires
-24 ms/it, PINN 83 ms/it, full-resolution maps 11 ms; 3-D 48³: 26 / 50 ms/it; Helmholtz 32³: 36 /
-84 ms/it; `solve_image` 256²: 0.35 s/it (hybrid) vs 3.0 s/it (exact). End to end (128², quick
-preset) 56 s on the GPU vs 136 s on that machine's CPU, with the same accuracy (subspace error 1.37e-5
-vs 1.38e-5); kernels agree with the CPU to ≤ 1e-5; no host syncs inside the training loops.
+768 collocation points), so an iteration is ~1000 tiny kernels and ~1400 dispatcher calls: on a GPU
+the host-side launch overhead, not the arithmetic, is expected to dominate. Measured end to end on an
+RTX PRO 6000 Blackwell (128², quick preset): 141 s on that machine's CPU, 55 s on the GPU, 45 s on the
+GPU with `cuda_graph=True`, all with the same accuracy (subspace error 1.37–1.38e-5); kernels agree
+with the CPU to ≤ 1e-5. (Per-stage GPU timings from `bench_gpu.py` before v12 were in fact CPU timings:
+the script built the problems without moving them to the device.)
 
 What was changed for GPU throughput (all exact, covered by tests):
 
@@ -894,12 +894,11 @@ What was changed for GPU throughput (all exact, covered by tests):
 | **fused Adam** on CUDA when all parameters are real | one optimizer kernel |
 | **joint image stage**: `joint_maps="hybrid"` = exact wire field at full resolution + the smooth network correction from the calibration grid, upsampled by k-space zero padding; one graph and one wire-field pass when it fits in memory (`joint_chunk=0` sizes it from free GPU memory) | same accuracy as exact maps, 6× faster per iteration |
 | **`cuda_graph=True`**: after 3 eager warm-up iterations, each stage's whole iteration (collocation draws, forward, backward, Adam step) is captured once as a CUDA graph and replayed: one launch per iteration instead of ~1000. Learning rates are device tensors (closed-form cosine schedule), slice batches are copied into static index tensors, the device random generators are registered with the graph (new numbers every replay). Falls back to eager if capture fails | removes the launch overhead above; trajectory identical to eager (test of the code path on CPU; the capture itself is checked by `bench_gpu.py`) |
-| `compile=` (experimental): `torch.compile` of each stage's whole iteration (static shapes, randomness drawn outside, one graph per stage) | **slower** on the GPU above (0.8–3.5 s/it against 24–84 ms/it eager), not yet understood; `bench_gpu.py` now profiles it |
+| `compile=` (experimental): `torch.compile` of each stage's whole iteration (static shapes, randomness drawn outside, one graph per stage) | on the benchmark machine's CPU 15–200× slower than eager (0.8–3.6 s/it); on CPU here about equal; GPU not yet measured |
 | `tf32=True` | TF32 matmuls (Ampere+); ~1e-3 relative precision in the MLP, off by default |
 
-`compile`: the first version compiled individual kernels with dynamic shapes (10–40× slower than eager
-on the GPU); the whole-iteration compile that replaced it is also slower there, although on CPU it matches
-eager and gives the same trajectories. Use `cuda_graph=True` instead. `scripts/bench_gpu.py` measures
+`compile` is experimental: on the benchmark machine's (many-core) CPU, the profiler shows almost all the
+time inside the compiled forward graph; its GPU behaviour is not measured yet. Prefer `cuda_graph=True`. `scripts/bench_gpu.py` measures
 eager / graph / compile [+tf32] in fresh processes, reports first-call costs, recompiles, skipped CUDA
 graphs, host syncs, and a profiler summary (top operators, kernel launches) of 12 PINN iterations per mode.
 
