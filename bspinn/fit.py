@@ -87,6 +87,8 @@ class FitConfig:
     compile: bool | str = False      # torch.compile each stage's whole iteration (see accel.py): False | True |
                                      #   'reduce-overhead' (+ CUDA graphs) | 'max-autotune'; ~10-60 s per stage
     compile_min_iters: int = 200     # stages with fewer iterations run eagerly (not worth compiling)
+    cuda_graph: bool = False         # CUDA: replay each stage's iteration (forward, backward, Adam) from one
+                                     #   captured CUDA graph after 3 warm-up iterations (accel.train_graphed)
     tf32: bool = False               # allow TF32 matmuls on Ampere+ GPUs (faster, ~1e-3 relative precision)
     air_colloc: float = 0.25         # fraction of Laplace collocation points in the air around the object
                                      #   (>= 2 wire radii from any wire): keeps the network correction harmonic,
@@ -412,7 +414,7 @@ class Problem:
             r0 = 1e-6 * diag[..., 0].mean().detach()
             regs = [r0.expand_as(diag[..., 0])] + [self.cfg.set_ridge * diag[..., k] + r0 for k in range(1, K)]
             Gr = G + torch.diag_embed(torch.stack(regs, -1).to(G.dtype))
-            mm = torch.linalg.solve(Gr, b.unsqueeze(-1)).squeeze(-1)   # (S,h,w,K)
+            mm = torch.linalg.solve_ex(Gr, b.unsqueeze(-1), check_errors=False)[0].squeeze(-1)   # (S,h,w,K); no sync
             res = (I.abs() ** 2).sum(1) - (b.conj() * mm).real.sum(-1)
             loss = res.sum() / self.Inorm_slice[idx].sum()
             return (loss, mm.permute(0, 3, 1, 2)) if return_images else loss
@@ -523,9 +525,6 @@ def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=pr
             K = getattr(model, "n_sets", 1)
             m = _image_param(prob, wires.sensitivity(prob.coords, create_graph=False), K)
         params.append({"params": [m], "lr": 2e-2})
-    opt = accel.adam(params, prob.device)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters, eta_min=0.05 * cfg.lr_wires)
-
     def step_loss(sl):
         Cs = sens_sets(model, prob.slice_coords(sl), create_graph=False)
         d = prob.data_loss(Cs, m, sl)
@@ -537,18 +536,17 @@ def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=pr
         loss = loss + _extra_penalty(model, Cs, m, cfg)
         return loss, d, out, curv
 
-    step = accel.compile_step(step_loss, cfg, iters)
-    compiled = step is not step_loss
     hist = []
-    for it in range(iters):
-        sl = _batch(prob, cfg, gen)
-        opt.zero_grad()
-        loss, d, out, curv = step(_sl_arg(prob, sl, compiled))
-        loss.backward()
-        opt.step(); sched.step()
+
+    def after(it, o):
         if it % cfg.log_every == 0 or it == iters - 1:
+            _, d, out, curv = o
             _log(hist, it, data=d.item(), outside=out.item(), curv=curv.item())
             log(f"[{tag} h={handedness:+d}] it {it:5d}  data {d.item():.4e}  outside {out.item():.2e}")
+
+    o = _run_stage(prob, cfg, iters, params, 0.05 * cfg.lr_wires, step_loss, lambda: (),
+                   [_batch(prob, cfg, gen) for _ in range(iters)], [gen], after)
+    d = o[1]
     return model, m, hist, float(d.detach())
 
 
@@ -595,9 +593,6 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
         C0 = model.sensitivity(prob.coords, create_graph=False).detach() if m is None else None
         m = _image_param(prob, C0, K, m)
         params.append({"params": [m], "lr": 1e-2})
-    opt = accel.adam(params, prob.device)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters, eta_min=0.1 * cfg.lr_pinn)
-
     def step_loss(sl, pin, pair):
         Cs = sens_sets(model, prob.slice_coords(sl))
         d = prob.data_loss(Cs, m, sl)
@@ -611,17 +606,16 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
                 loss = loss + cfg.lambda_fov * fov_penalty(prob.keep, w.verts, cfg.outside_margin)
         return loss, d, phys
 
-    step = accel.compile_step(step_loss, cfg, iters)
-    compiled = step is not step_loss
     hist = []
-    for it in range(iters):
-        sl = _batch(prob, cfg, gen)
-        opt.zero_grad()
-        loss, d, phys = step(_sl_arg(prob, sl, compiled), *_colloc(prob, cfg, gen, wires))
-        loss.backward(); opt.step(); sched.step()
+
+    def after(it, o):
         if it % cfg.log_every == 0 or it == iters - 1:
+            _, d, phys = o
             _log(hist, it, data=d.item(), phys=phys.item())
             log(f"[pinn] it {it:5d}  data {d.item():.4e}  laplace {phys.item():.3e}")
+
+    _run_stage(prob, cfg, iters, params, 0.1 * cfg.lr_pinn, step_loss, lambda: _colloc(prob, cfg, gen, wires),
+               [_batch(prob, cfg, gen) for _ in range(iters)], [gen], after)
     return m, hist
 
 
@@ -904,6 +898,36 @@ def _physics(model, prob, cfg, gen, wires):
     """Laplace (or Helmholtz) residual of the network correction: inside the object and, with
     weight air_colloc, in the surrounding air (source-free too, as long as we stay off the wires)."""
     return _physics_at(model, cfg, *_colloc(prob, cfg, gen, wires))
+
+
+def _run_stage(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, after):
+    """One training stage: for each iteration,  out = step_loss(sl, *draw()); out[0].backward(); Adam step;
+    cosine learning-rate decay to ``eta_min``; after(it, out).  ``sls``: the host-chosen slice batch per
+    iteration (lists or None), ``draw``: the iteration's random inputs (device generators ``gens``).
+    Runs eagerly, with the step compiled (cfg.compile), or replayed from a CUDA graph (cfg.cuda_graph).
+    Returns the outputs of the last iteration."""
+    dev = prob.device
+    if accel.graph_mode(cfg, dev, iters) and not (sls[0] is not None and getattr(prob, "per_slice_traj", False)):
+        opt, base = accel.capturable_adam(groups, dev)
+        tab = None if sls[0] is None else torch.tensor(np.asarray(sls), device=dev)
+        static_sl = None if tab is None else tab[0].clone()
+
+        def before(it):
+            if tab is not None:
+                static_sl.copy_(tab[it])
+        return accel.train_graphed(lambda: step_loss(static_sl, *draw()), opt, base, eta_min, iters, gens,
+                                   before, after, log=getattr(cfg, "_log", print))
+    opt = accel.adam(groups, dev)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters, eta_min=eta_min)
+    step = accel.compile_step(step_loss, cfg, iters)
+    compiled = step is not step_loss
+    out = None
+    for it in range(iters):
+        opt.zero_grad()
+        out = step(_sl_arg(prob, sls[it], compiled), *draw())
+        out[0].backward(); opt.step(); sched.step()
+        after(it, out)
+    return out
 
 
 def _sl_arg(prob, sl, compiled):

@@ -15,7 +15,7 @@ python -m pytest tests                                                 # 62 test
 
 Requirements: Python ≥ 3.10, PyTorch ≥ 2.0, NumPy, matplotlib (figures), h5py (fastMRI only).
 Runs on CPU (a 2-CPU laptop fits a slice in 5–20 min) or on a GPU (`device="cuda"`, optionally
-`compile=True`): see §8.2.
+`cuda_graph=True`): see §8.2.
 
 ---
 
@@ -863,10 +863,10 @@ effects relative to coils in air beside a body: relative Laplacian of the maps 4
 
 ```python
 C, img, info = estimate_maps(ksp, "2d", device="cuda", return_image=True)
-C, img, info = estimate_maps(ksp, "2d", device="cuda", compile="reduce-overhead", return_image=True)  # see below
+C, img, info = estimate_maps(ksp, "2d", device="cuda", cuda_graph=True, return_image=True)   # see below
 ```
 ```
-python -m bspinn.cli maps ksp.npy --out maps.npy --device cuda [--compile [reduce-overhead]] [--tf32]
+python -m bspinn.cli maps ksp.npy --out maps.npy --device cuda [--cuda-graph] [--tf32]
 python scripts/bench_gpu.py [--device cuda:0] [--quick]      # correctness (device vs CPU) + per-stage timings
 ```
 
@@ -876,11 +876,11 @@ the inputs and outputs cross the PCIe bus.
 
 **Where the time goes on a GPU.** The calibration problems are small (2-D: 48² grid points × 8 coils,
 768 collocation points), so an iteration costs ~1000 tiny kernels and ~1400 dispatcher calls, and the
-GPU waits on the host. Measured on an RTX PRO 6000 Blackwell (eager): 2-D 256², 8 coils: wires
-23 ms/it, PINN 94 ms/it, full-resolution maps 11 ms; 3-D 48³: 41 / 145 ms/it; Helmholtz 32³: 81 /
-109 ms/it; `solve_image` 256²: 0.46 s/it (hybrid) vs 2.8 s/it (exact). End to end (128², quick
-preset) 65 s on the GPU vs 175 s on that machine's CPU, with the same accuracy (subspace error 1.37e-5
-vs 1.38e-5); kernels agree with the CPU to ≤ 1e-5.
+GPU waits on the host. Measured on an RTX PRO 6000 Blackwell (eager, v10): 2-D 256², 8 coils: wires
+24 ms/it, PINN 83 ms/it, full-resolution maps 11 ms; 3-D 48³: 26 / 50 ms/it; Helmholtz 32³: 36 /
+84 ms/it; `solve_image` 256²: 0.35 s/it (hybrid) vs 3.0 s/it (exact). End to end (128², quick
+preset) 56 s on the GPU vs 136 s on that machine's CPU, with the same accuracy (subspace error 1.37e-5
+vs 1.38e-5); kernels agree with the CPU to ≤ 1e-5; no host syncs inside the training loops.
 
 What was changed for GPU throughput (all exact, covered by tests):
 
@@ -893,16 +893,15 @@ What was changed for GPU throughput (all exact, covered by tests):
 | **no host syncs in the loops**: device-side random generators, fixed-size `topk` sampling instead of boolean compaction / `multinomial`, no `.item()` per iteration, CG residual checked every 10 iterations | the GPU queue never drains during training (the benchmark checks this with `torch.cuda.set_sync_debug_mode`) |
 | **fused Adam** on CUDA when all parameters are real | one optimizer kernel |
 | **joint image stage**: `joint_maps="hybrid"` = exact wire field at full resolution + the smooth network correction from the calibration grid, upsampled by k-space zero padding; one graph and one wire-field pass when it fits in memory (`joint_chunk=0` sizes it from free GPU memory) | same accuracy as exact maps, 6× faster per iteration |
-| **`compile=`**: `torch.compile` of each stage's *whole* iteration (loss forward + backward, static shapes, randomness drawn outside), compiled once and reused by later stages with the same shapes; `"reduce-overhead"` adds CUDA graphs (the whole forward/backward replayed as one launch) | targets the launch overhead above; stages under `compile_min_iters` (200, e.g. the plane/handedness search) stay eager |
+| **`cuda_graph=True`**: after 3 eager warm-up iterations, each stage's whole iteration (collocation draws, forward, backward, Adam step) is captured once as a CUDA graph and replayed: one launch per iteration instead of ~1000. Learning rates are device tensors (closed-form cosine schedule), slice batches are copied into static index tensors, the device random generators are registered with the graph (new numbers every replay). Falls back to eager if capture fails | removes the launch overhead above; trajectory identical to eager (test of the code path on CPU; the capture itself is checked by `bench_gpu.py`) |
+| `compile=` (experimental): `torch.compile` of each stage's whole iteration (static shapes, randomness drawn outside, one graph per stage) | **slower** on the GPU above (0.8–3.5 s/it against 24–84 ms/it eager), not yet understood; `bench_gpu.py` now profiles it |
 | `tf32=True` | TF32 matmuls (Ampere+); ~1e-3 relative precision in the MLP, off by default |
 
-`compile`: an earlier version compiled the individual kernels with dynamic shapes; on the GPU above that
-was 10–40× *slower* than eager (recompilation, per-call overhead) and it was replaced by the
-whole-iteration compile. That one gives identical trajectories (test) and, on CPU, where the work is
-arithmetic rather than launches, about the same speed as eager; its GPU gain has not been measured yet.
-Compilation costs ~10–60 s per distinct graph (two per run: wires and PINN). `scripts/bench_gpu.py`
-measures eager / compile / reduce-overhead [+tf32] in fresh processes, reports the first-call (compile)
-cost separately, the recompiles and any skipped CUDA graphs, and where host syncs happen.
+`compile`: the first version compiled individual kernels with dynamic shapes (10–40× slower than eager
+on the GPU); the whole-iteration compile that replaced it is also slower there, although on CPU it matches
+eager and gives the same trajectories. Use `cuda_graph=True` instead. `scripts/bench_gpu.py` measures
+eager / graph / compile [+tf32] in fresh processes, reports first-call costs, recompiles, skipped CUDA
+graphs, host syncs, and a profiler summary (top operators, kernel launches) of 12 PINN iterations per mode.
 
 Tips: the cost scales with the calibration grid and the number of coils, not with the image matrix
 (except `solve_image`). Being launch-bound, a GPU iteration costs about the same for many more
@@ -915,7 +914,7 @@ reference for the hybrid maps; `"interp"` is the cheapest and slightly biased.
 |---|---|
 | `masks.py` | `cartesian_mask`: Cartesian undersampling patterns with a calibration block (2-D, 3-D, dynamic) |
 | `api.py` | `estimate_maps`, `sense_image`, `coil_combine`: the one-call interface of §4.0 (CLI `maps`) |
-| `accel.py` | whole-iteration `torch.compile` (`compile=`), fused Adam, TF32 |
+| `accel.py` | CUDA-graph training loop (`cuda_graph=True`), whole-iteration `torch.compile`, fused Adam, TF32 |
 | `physics.py` | closed-form Biot–Savart for polylines, B→C mapping, autograd div/curl, Maxwell residual |
 | `models.py` | `WireLoopCoils` (hard), `HarmonicPINN` (soft / hybrid correction) |
 | `fit.py` | `FitConfig`, calibration `Problem` (VarPro / k-space / NUDFT), training stages, auto-handedness |

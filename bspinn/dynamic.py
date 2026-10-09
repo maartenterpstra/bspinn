@@ -151,10 +151,7 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print)
               {"params": [dyn.alpha], "lr": dcfg.lr_alpha}]
     if m is not None:
         params.append({"params": [m], "lr": 1e-2})
-    from . import accel
-    from .fit import _colloc, _physics_at, _sl_arg
-    opt = accel.adam(params, prob.device)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, dcfg.iters_dyn, eta_min=0.1 * cfg.lr_pinn)
+    from .fit import _colloc, _physics_at, _run_stage
     gen = torch.Generator(device=prob.device).manual_seed(cfg.seed + 11)
     frame_rng = np.random.default_rng(cfg.seed + 12)
     h, w = prob.calib
@@ -176,17 +173,16 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print)
                 + _extra_penalty(dyn, C, m, cfg))
         return loss, d, phys, smooth
 
-    step = accel.compile_step(step_loss, cfg, dcfg.iters_dyn)
-    compiled = step is not step_loss
-    for it in range(dcfg.iters_dyn):
-        fr = sorted(frame_rng.permutation(prob.S)[:B].tolist())
-        opt.zero_grad()
-        loss, d, phys, smooth = step(_sl_arg(prob, fr, compiled), *_colloc(prob, cfg, gen, wires))
-        loss.backward(); opt.step(); sched.step()
+    def after(it, o):
         if it % cfg.log_every == 0 or it == dcfg.iters_dyn - 1:
+            _, d, phys, smooth = o
             _log(dhist, it, data=d.item(), phys=phys.item(), smooth=smooth.item())
             log(f"[dynamic K={dcfg.rank}] it {it:5d}  data {d.item():.4e}  laplace {phys.item():.3e}  "
                 f"|V| {dyn.V.abs().max().item():.3f}")
+
+    frames = [sorted(frame_rng.permutation(prob.S)[:B].tolist()) for _ in range(dcfg.iters_dyn)]
+    _run_stage(prob, cfg, dcfg.iters_dyn, params, 0.1 * cfg.lr_pinn, step_loss,
+               lambda: _colloc(prob, cfg, gen, wires), frames, [gen], after)
     log(f"dynamic fit done in {time.time() - t0:.1f}s")
     hist["dynamic"] = dhist
     dyn.cpu(); prob.to("cpu")

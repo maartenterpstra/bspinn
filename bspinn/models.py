@@ -507,7 +507,8 @@ class WaveWireLoopCoils(WireLoopCoils):
         for i in range(0, P, self.chunk):
             pts = points[:, i:i + self.chunk][:, None, None, None] if per_coil else points[i:i + self.chunk]
             if grad_on and not create_graph:
-                out.append(torch.utils.checkpoint.checkpoint(part, pts, pos, dl, k, self.amp, use_reentrant=False))
+                out.append(torch.utils.checkpoint.checkpoint(part, pts, pos, dl, k, self.amp, use_reentrant=False,
+                                                             preserve_rng_state=False))   # no RNG inside; graph-capturable
             else:   # recompute-in-backward keeps memory flat; double backward (physics) needs the plain graph
                 out.append(part(pts, pos, dl, k, self.amp))
         return torch.cat(out, -2)

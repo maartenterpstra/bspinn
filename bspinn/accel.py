@@ -26,8 +26,8 @@ def configure(cfg):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     if getattr(cfg, "compile", False):
-        import torch._dynamo
-        cfgd = torch._dynamo.config
+        from torch import _dynamo                              # (not `import torch._dynamo`: rebinds `torch`)
+        cfgd = _dynamo.config
         for name in ("recompile_limit", "cache_size_limit"):        # one graph per stage, several stages
             if hasattr(cfgd, name):
                 setattr(cfgd, name, max(getattr(cfgd, name), 64))
@@ -63,3 +63,98 @@ def adam(params, device=None, **kw):
         except (RuntimeError, TypeError, ValueError):
             pass
     return torch.optim.Adam(groups, **kw)
+
+
+# ------------------------------------------------------------------------------------ CUDA graphs
+def graph_mode(cfg, device, iters, warmup=3):
+    """cfg.cuda_graph on a CUDA device, and enough iterations to warm up, capture and replay."""
+    on_dev = torch.device(device).type == "cuda" or getattr(cfg, "_graph_emulate", False)   # (test hook: CPU)
+    return bool(getattr(cfg, "cuda_graph", False)) and on_dev and iters >= warmup + 2 and not compile_mode(cfg)
+
+
+def capturable_adam(groups, device, default_lr=1e-3):
+    """Adam whose step can be captured in a CUDA graph: device tensors for the step counts and the
+    learning rates (changed between replays with fill_, no host sync). Returns (optimizer, base lrs)."""
+    groups = list(groups)
+    if not groups or not isinstance(groups[0], dict):
+        groups = [{"params": groups}]
+    base, out = [], []
+    for g in groups:
+        lr = float(g.get("lr", default_lr))
+        base.append(lr)
+        out.append({**g, "params": list(g["params"]), "lr": torch.tensor(lr, device=device)})
+    if torch.device(device).type != "cuda":           # CPU emulation (tests): same algorithm, no capture
+        return torch.optim.Adam(out, foreach=False), base
+    return torch.optim.Adam(out, capturable=True, foreach=True), base
+
+
+def cosine_lr(base, eta_min, it, T):
+    """CosineAnnealingLR's learning rate before step ``it`` (closed form; T = number of iterations)."""
+    import math
+    return eta_min + (base - eta_min) * (1 + math.cos(math.pi * it / T)) / 2
+
+
+def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, after=None, warmup=3, log=print):
+    """Run ``iters`` iterations of  out = step(); out[0].backward(); opt.step()  with the iterations after
+    ``warmup`` replayed from one CUDA graph (forward, backward and optimizer: one launch per iteration).
+
+    step():  computes the loss tuple; draws its random numbers with the generators ``gens`` (registered
+             with the graph, so every replay draws new numbers) and reads per-iteration inputs from static
+             tensors that ``before(it)`` fills (device-to-device copies) before each iteration.
+    after(it, out): called after every iteration with the (static) outputs, e.g. for logging.
+    If capture fails (an operation that is not capturable), the remaining iterations run eagerly.
+    Returns the outputs of the last iteration."""
+    def set_lr(it):
+        for g, b in zip(opt.param_groups, base_lrs):
+            g["lr"].fill_(cosine_lr(b, eta_min, it, iters))
+
+    def eager(it):
+        set_lr(it)
+        if before:
+            before(it)
+        opt.zero_grad(set_to_none=True)
+        out = step()
+        out[0].backward()
+        opt.step()
+        if after:
+            after(it, out)
+        return out
+
+    if not opt.param_groups[0]["lr"].is_cuda:           # CPU emulation (tests): everything eager
+        out = None
+        for it in range(iters):
+            out = eager(it)
+        return out
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):                       # warm-up (real iterations) on a side stream
+        for it in range(warmup):
+            out = eager(it)
+    torch.cuda.current_stream().wait_stream(s)
+    try:
+        g = torch.cuda.CUDAGraph()
+        for gen in gens:
+            g.register_generator_state(gen)
+        set_lr(warmup)
+        if before:
+            before(warmup)
+        opt.zero_grad(set_to_none=True)
+        with torch.cuda.graph(g):
+            static = step()
+            static[0].backward()
+            opt.step()
+    except Exception as e:                           # not capturable: carry on eagerly
+        log(f"CUDA graph capture failed ({type(e).__name__}: {str(e)[:200]}); continuing eagerly")
+        torch.cuda.synchronize()
+        for it in range(warmup, iters):
+            out = eager(it)
+        return out
+    for it in range(warmup, iters):
+        if it > warmup:
+            set_lr(it)
+            if before:
+                before(it)
+        g.replay()
+        if after:
+            after(it, static)
+    return static

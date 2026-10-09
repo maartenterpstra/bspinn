@@ -12,8 +12,9 @@
      CPU and CUDA generators, so the maps are not bitwise equal, only equally accurate).
 2. Timings per optimisation iteration (ms/it, from the difference of a short and a long run, so that
    per-stage setup cancels; the one-off cost of the first call, i.e. compilation, is *_first_call_s), for
-   eager | compile | reduce-overhead (compile + CUDA graphs) [+tf32], each mode in a fresh subprocess
-   (torch.compile and the TF32 switches are process-global):
+   eager | graph (cfg.cuda_graph: each iteration replayed from one captured CUDA graph) | compile
+   [+tf32], each mode in a fresh subprocess (torch.compile and the TF32 switches are process-global),
+   plus a torch.profiler summary of 12 PINN iterations per mode (top operators, kernel launches):
      2d     8 coils, 256x256, calib 24: wire stage, PINN stage, full-res maps evaluation
      joint  the solve_image stage on 256x256: hybrid vs exact maps
      3d     8 coils, 48^3, calib 12^3: wire stage, PINN stage (Laplace)
@@ -92,13 +93,16 @@ def check_end_to_end(dev, quick):
     k = d.kspace[0]
     sup = torch.from_numpy((np.abs(obj[:1]) > 0).astype(np.float32))           # object support
     res = {}
-    for device in ("cpu", dev):
+    runs = [("cpu", "cpu", {}), (dev, dev, {})]
+    if torch.device(dev).type == "cuda":
+        runs.append((dev + " cuda_graph", dev, {"cuda_graph": True}))
+    for name, device, extra in runs:
         t = time.time()
         C, info = estimate_maps(k, "2d", calib=24, quality="fast", device=device, verbose=False,
-                                **({"iters_pinn": 150, "iters_wires": 100} if quick else {}))
+                                **({"iters_pinn": 150, "iters_wires": 100} if quick else {}), **extra)
         e = subspace_error(torch.from_numpy(C)[None], torch.from_numpy(gt[:1]), sup)
-        res[device] = {"subspace_err": e, "seconds": time.time() - t}
-        print(f"  estimate_maps 128^2 on {device:7s}: subspace error {e:.2e}, {time.time() - t:.1f} s", flush=True)
+        res[name] = {"subspace_err": e, "seconds": time.time() - t}
+        print(f"  estimate_maps 128^2 on {name:18s}: subspace error {e:.2e}, {time.time() - t:.1f} s", flush=True)
     return res
 
 
@@ -116,7 +120,8 @@ def per_iter(dev, run, n, k0=2):
 
 def _cfg(**kw):
     from bspinn.fit import FitConfig
-    return FitConfig(log_every=10 ** 6, compile=MODE["compile"], tf32=MODE["tf32"], compile_min_iters=0, **kw)
+    return FitConfig(log_every=10 ** 6, compile=MODE["compile"], tf32=MODE["tf32"], compile_min_iters=0,
+                     cuda_graph=MODE["graph"], **kw)
 
 
 def bench_2d(dev, n):
@@ -129,12 +134,34 @@ def bench_2d(dev, n):
     (w, m, _, _), tw, cw = per_iter(dev, lambda k: fit_wires(prob, cfg, 1, k, **QUIET), n)
     pinn = make_pinn(prob, cfg, w, 1); wr = _wrap(pinn, prob, cfg, prev=w)
     _, tp, cp = per_iter(dev, lambda k: fit_pinn(prob, cfg, wr, m, iters=k, **QUIET), n)
+    prof = profile_stage(dev, lambda: fit_pinn(prob, cfg, wr, m, iters=12, **QUIET))
     pts = torch.from_numpy(np.asarray(d.geom.grid(), np.float32).reshape(-1, 3))      # full-res 256^2 grid
     pinn.to(dev)
     pinn.sensitivity_batched(pts.to(dev))
     _, te = timed(dev, lambda: pinn.sensitivity_batched(pts.to(dev)), 1)
     return {"wire_ms_per_it": tw, "pinn_ms_per_it": tp, "maps_eval_ms": te,
-            "wire_first_call_s": cw, "pinn_first_call_s": cp}
+            "wire_first_call_s": cw, "pinn_first_call_s": cp, "pinn_profile_12_it": prof}
+
+
+def profile_stage(dev, run):
+    """torch.profiler over one short stage: the top operators by host time and by device time, and the
+    number of kernel launches (tells launch-bound from compute-bound, and what a compiled graph runs)."""
+    from torch.profiler import ProfilerActivity, profile
+    acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if torch.device(dev).type == "cuda" else [])
+    try:
+        with profile(activities=acts) as pr:
+            run()
+            sync(dev)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    ev = pr.key_averages()
+    dk = "self_device_time_total" if hasattr(ev[0], "self_device_time_total") else "self_cuda_time_total"
+    rows = lambda key: [{"op": e.key[:80], "calls": e.count, "self_host_ms": e.self_cpu_time_total / 1e3,
+                         "self_device_ms": getattr(e, dk, 0) / 1e3} for e in sorted(ev, key=lambda e: -getattr(e, key, 0))[:15]]
+    launches = sum(e.count for e in ev if e.key.startswith(("cudaLaunchKernel", "cuLaunchKernel", "cudaGraphLaunch")))
+    return {"by_host_time": rows("self_cpu_time_total"), "by_device_time": rows(dk),
+            "total_host_ms": sum(e.self_cpu_time_total for e in ev) / 1e3,
+            "total_device_ms": sum(getattr(e, dk, 0) for e in ev) / 1e3, "kernel_launch_calls": launches}
 
 
 def bench_joint(dev, n):
@@ -178,7 +205,7 @@ def bench_3d(dev, n, helmholtz):
     return {"wire_ms_per_it": tw, "pinn_ms_per_it": tp, "wire_first_call_s": cw, "pinn_first_call_s": cp}
 
 
-MODE = {"compile": False, "tf32": False}
+MODE = {"compile": False, "tf32": False, "graph": False}
 
 
 def check_syncs(dev, iters=6):
@@ -198,8 +225,8 @@ def check_syncs(dev, iters=6):
     def show(message, category, filename, lineno, file=None, line=None):
         if "synchroniz" in str(message):
             st = [f"{os.path.basename(f.filename)}:{f.lineno}" for f in traceback.extract_stack()
-                  if "bspinn" in f.filename and "bench_gpu" not in f.filename]
-            key = " < ".join(st[::-1][:3])
+                  if "warnings" not in f.filename and "bench_gpu" not in f.filename]
+            key = " < ".join(st[::-1][:5])
             sites[key] = sites.get(key, 0) + 1
     old = warnings.showwarning
     warnings.showwarning = show
@@ -219,7 +246,8 @@ def check_syncs(dev, iters=6):
 
 def child(a):
     base = a.mode.split("+")[0]
-    MODE.update(compile={"eager": False, "compile": True}.get(base, base), tf32="tf32" in a.mode)
+    MODE.update(compile={"eager": False, "graph": False, "compile": True}.get(base, base), tf32="tf32" in a.mode,
+                graph=base == "graph")
     n = 20 if a.quick else 100
     res = {}
     cases = a.cases.split(",")
@@ -251,8 +279,9 @@ def main():
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--only", default="all", choices=["all", "correctness", "timings"])
     ap.add_argument("--cases", default="2d,joint,3d,helm")
-    ap.add_argument("--modes", default="eager,compile,reduce-overhead,reduce-overhead+tf32",
-                    help="comma list of eager | compile | reduce-overhead | max-autotune, each optionally +tf32")
+    ap.add_argument("--modes", default="eager,graph,graph+tf32,compile",
+                    help="comma list of eager | graph (CUDA-graph replay) | compile | reduce-overhead | max-autotune, "
+                         "each optionally +tf32")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--out", default="bench_gpu.json")
     ap.add_argument("--_child", action="store_true", help=argparse.SUPPRESS)
@@ -294,7 +323,7 @@ def main():
                     print(f"  compile diagnostics: {v['count']} lines (see {a.out})", flush=True)
                     continue
                 print(f"  {case:6s} " + ", ".join(f"{k} {x:.1f}" if isinstance(x, float) else f"{k} {x}"
-                                                for k, x in v.items()), flush=True)
+                                                for k, x in v.items() if not isinstance(x, dict)), flush=True)
     json.dump(report, open(a.out, "w"), indent=1)
     print(f"wrote {a.out}")
 

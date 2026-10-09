@@ -773,3 +773,27 @@ def test_physics_loss_pair_matches_two_calls():
         g1 = torch.autograd.grad(l1, ps, allow_unused=True); g2 = torch.autograd.grad(l2, ps, allow_unused=True)
         assert torch.allclose(l1, l2, rtol=1e-5)
         assert all((x is None and y is None) or torch.allclose(x, y, rtol=1e-4, atol=1e-6) for x, y in zip(g1, g2))
+
+
+def test_cuda_graph_stage_plumbing_matches_eager():
+    """cfg.cuda_graph: capturable Adam with tensor learning rates, closed-form cosine schedule, slice batches
+    through static index tensors and random draws inside the step give the eager trajectory. Runs the
+    graph code path without capture on CPU (the capture itself needs CUDA: scripts/bench_gpu.py checks it)."""
+    import copy
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig, Problem, fit_pinn, fit_wires, make_pinn
+    d, _, _ = make_synthetic(4, (24, 24), n_slices=3, noise=0.01)
+    d.prewhiten()
+    out = {}
+    for graph in (False, True):
+        cfg = FitConfig(calib=12, log_every=1, cuda_graph=graph, slice_batch=2, n_colloc=64)
+        cfg._graph_emulate = True
+        prob = Problem(copy.deepcopy(d), cfg)
+        w, m, hw, _ = fit_wires(prob, cfg, 1, 8, log=lambda *a: None)
+        p = make_pinn(prob, cfg, w, 1)
+        torch.nn.init.normal_(p.net[-1].weight, std=0.05)
+        m, hp = fit_pinn(prob, cfg, p, m, log=lambda *a: None, iters=8)
+        out[graph] = ([h["data"] for h in hw], [h["data"] for h in hp], p.base.verts.detach().clone())
+    for a, b in zip(out[False][:2], out[True][:2]):
+        assert np.allclose(a, b, rtol=1e-4), (a, b)
+    assert torch.allclose(out[False][2], out[True][2], atol=1e-5)

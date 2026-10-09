@@ -261,7 +261,9 @@ class Problem3D:
         dev = gen.device
         idx = torch.randint(0, self.support_pts.shape[0], (n,), generator=gen, device=dev)
         p = self.support_pts[idx].clone()
-        step = self.__dict__.setdefault("_grid_step", float((self.coords[1] - self.coords[0]).abs().max()))
+        if "_grid_step" not in self.__dict__:                    # (setdefault would evaluate -> sync every call)
+            self._grid_step = float((self.coords[1] - self.coords[0]).abs().max())
+        step = self._grid_step
         return p + 0.5 * step * torch.randn(p.shape, generator=gen, device=dev)
 
     def data_loss(self, Cs, m=None, sl=None, return_images=False):
