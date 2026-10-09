@@ -936,6 +936,11 @@ What was changed for GPU throughput (all exact, covered by tests):
 costs, recompiles, CUDA-graph captures and fallbacks, host syncs, a profiler summary of 12 PINN
 iterations per mode, and per-phase wall times plus a host profile of one end-to-end run.
 
+**How many iterations?** `scripts/accuracy_sweep.py` measures, on your own (preferably fully sampled)
+data and without ground truth, the k-space residual over the noise floor, the CG-SENSE error at R = 4,
+the map change relative to the longest budget and the seed-to-seed spread, for iteration budgets from
+half of `fast` to twice `default`.
+
 Tips: the cost scales with the calibration grid and the number of coils, not with the image matrix
 (except `solve_image`). Being launch-bound, a GPU iteration costs about the same for many more
 collocation points (`n_colloc`) or a larger calibration grid: use them. `joint_maps="exact"` is the
