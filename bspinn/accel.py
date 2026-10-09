@@ -93,7 +93,7 @@ def adam(params, device=None, **kw):
 def graph_mode(cfg, device, iters, warmup=3):
     """cfg.cuda_graph on a CUDA device, and enough iterations to warm up, capture and replay."""
     on_dev = torch.device(device).type == "cuda" or getattr(cfg, "_graph_emulate", False)   # (test hook: CPU)
-    return bool(getattr(cfg, "cuda_graph", False)) and on_dev and iters >= warmup + 2 and not compile_mode(cfg)
+    return bool(getattr(cfg, "cuda_graph", False)) and on_dev and iters >= warmup + 2
 
 
 def capturable_adam(groups, device, default_lr=1e-3):

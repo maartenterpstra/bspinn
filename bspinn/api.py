@@ -187,7 +187,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         if sup.shape != ksp.shape[1:3 if layout == "dynamic" else None]:
             raise ValueError(f"mask_maps array must have the spatial shape {ksp.shape[1:3 if layout == 'dynamic' else None]}")
     with accel.phase("finish"):
-        C = _finish(C, sup, layout, phase_ref, normalise)
+        C = _finish(C, sup, layout, phase_ref, normalise, device)
     x_solved = None
     xf = info.pop("_xfull", None)
     if xf is not None:                         # joint full-resolution image, in the convention of the maps
@@ -432,7 +432,7 @@ def _support(ksp, mask, layout, calib, thresh=0.1, dilate=2):
     return binary_dilation(s, iterations=dilate) if dilate > 0 else s
 
 
-def _finish(C, sup, layout, phase_ref, normalise):
+def _finish(C, sup, layout, phase_ref, normalise, device=None):
     from .recon import phase_reference, virtual_body_coil
     Ct = torch.from_numpy(np.ascontiguousarray(C)).to(torch.complex64)
     if layout == "2d":
@@ -444,7 +444,7 @@ def _finish(C, sup, layout, phase_ref, normalise):
     if phase_ref not in ("model", "none"):
         d = None
         if phase_ref in ("inati", "inati-eig"):
-            d = virtual_body_coil(Cs, S.float(), robust=(phase_ref == "inati"))
+            d = virtual_body_coil(Cs, S.float(), robust=(phase_ref == "inati"), device=device)
         Cs, _, _, _ = phase_reference(Cs, phase_ref, S, None, d)
     if normalise == "rss":
         Cs = Cs / (Cs.abs() ** 2).sum(1, keepdim=True).sqrt().clamp_min(1e-12)

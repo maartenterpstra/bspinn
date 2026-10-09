@@ -275,9 +275,10 @@ def check_syncs(dev, iters=6):
 
 
 def child(a):
-    base = a.mode.split("+")[0]
-    MODE.update(compile={"eager": False, "graph": False, "compile": True}.get(base, base), tf32="tf32" in a.mode,
-                graph=base == "graph")
+    parts = a.mode.split("+")
+    base = parts[0]
+    comp = True if "compile" in parts else (base if base in ("reduce-overhead", "max-autotune") else False)
+    MODE.update(compile=comp, tf32="tf32" in parts, graph="graph" in parts)
     n = 20 if a.quick else 100
     res = {}
     cases = a.cases.split(",")
@@ -312,7 +313,7 @@ def main():
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--only", default="all", choices=["all", "correctness", "timings"])
     ap.add_argument("--cases", default="2d,joint,3d,helm")
-    ap.add_argument("--modes", default="eager,graph,graph+tf32,compile",
+    ap.add_argument("--modes", default="eager,graph,graph+compile",
                     help="comma list of eager | graph (CUDA-graph replay) | compile | reduce-overhead | max-autotune, "
                          "each optionally +tf32")
     ap.add_argument("--quick", action="store_true")
@@ -338,7 +339,7 @@ def main():
             cmd = [sys.executable, os.path.abspath(__file__), "--_child", "--mode", mode, "--device", a.device,
                    "--cases", a.cases] + (["--quick"] if a.quick else [])
             env = dict(os.environ)
-            if mode.split("+")[0] != "eager":                    # report recompiles / skipped CUDA graphs
+            if "compile" in mode or mode.split("+")[0] in ("reduce-overhead", "max-autotune"):   # recompiles etc.
                 env["TORCH_LOGS"] = "recompiles,perf_hints"
             out = subprocess.run(cmd, capture_output=True, text=True, env=env)
             diag = [l.strip()[:300] for l in out.stderr.splitlines()

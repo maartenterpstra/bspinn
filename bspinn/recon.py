@@ -122,7 +122,7 @@ def absolute_error(C_est, C_true, support):
     return float(((a * C_est - C_true).abs() ** 2 * s).sum().sqrt() / ((C_true.abs() ** 2 * s).sum().sqrt()))
 
 
-def virtual_body_coil(C0, sup=None, robust=True, iters=300, restarts=8, seed=0):
+def virtual_body_coil(C0, sup=None, robust=True, iters=300, restarts=8, seed=0, device=None):
     """Coil-combination weights d of a virtual body coil T(r) = d^H C(r) (Inati et al.).
 
     robust=False: dominant eigenvector of sum_r C C^H (Inati's choice, maximises mean |T|^2). It can
@@ -142,12 +142,15 @@ def virtual_body_coil(C0, sup=None, robust=True, iters=300, restarts=8, seed=0):
     Xn = X / X.abs().pow(2).sum(0).sqrt().clamp_min(1e-12)
     if Xn.shape[1] > 20000:
         Xn = Xn[:, torch.randperm(Xn.shape[1], generator=g)[:20000]]
+    if device is not None and str(device) != "cpu":       # the restarts' Adam loop on the GPU (same numbers)
+        Xn = Xn.to(device)
+        d_eig = d_eig.to(device)
     strength = lambda d: (d.conj() @ Xn).abs().min()
     best, best_s = d_eig, float(strength(d_eig))
     starts = [d_eig] + [torch.randn(N, dtype=torch.complex64, generator=g) for _ in range(restarts)]
     # all starts optimised together (Adam is element-wise, the summed losses are independent: identical
     # to one loop per start, ~(restarts + 1)x fewer operations)
-    D0 = torch.stack([d0 / d0.norm() for d0 in starts])                         # (R,N)
+    D0 = torch.stack([d0.to(Xn.device) / d0.norm() for d0 in starts])          # (R,N)
     with torch.enable_grad():
         p = torch.nn.Parameter(torch.view_as_real(D0.clone()))
         opt = torch.optim.Adam([p], lr=2e-2)
@@ -160,6 +163,7 @@ def virtual_body_coil(C0, sup=None, robust=True, iters=300, restarts=8, seed=0):
     for r in range(D.shape[0]):
         if float(st[r]) > best_s:
             best, best_s = D[r], float(st[r])
+    best = best.cpu()
     return best
 
 

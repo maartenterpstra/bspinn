@@ -905,7 +905,8 @@ def _run_stage(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, af
     """One training stage: for each iteration,  out = step_loss(sl, *draw()); out[0].backward(); Adam step;
     cosine learning-rate decay to ``eta_min``; after(it, out).  ``sls``: the host-chosen slice batch per
     iteration (lists or None), ``draw``: the iteration's random inputs (device generators ``gens``).
-    Runs eagerly, with the step compiled (cfg.compile), or replayed from a CUDA graph (cfg.cuda_graph).
+    Runs eagerly or replayed from a CUDA graph (cfg.cuda_graph, CUDA only), with the step optionally compiled
+    (cfg.compile; inside the graph: fused kernels replayed with one launch).
     Returns the outputs of the last iteration."""
     dev = prob.device
     if accel.graph_mode(cfg, dev, iters) and not (sls[0] is not None and getattr(prob, "per_slice_traj", False)):
@@ -916,7 +917,8 @@ def _run_stage(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, af
         def before(it):
             if tab is not None:
                 static_sl.copy_(tab[it])
-        return accel.train_graphed(lambda: step_loss(static_sl, *draw()), opt, base, eta_min, iters, gens,
+        fn = accel.compile_step(step_loss, cfg, iters)           # cfg.compile: fused kernels inside the graph
+        return accel.train_graphed(lambda: fn(static_sl, *draw()), opt, base, eta_min, iters, gens,
                                    before, after, log=getattr(cfg, "_log", print))
     opt = accel.adam(groups, dev)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters, eta_min=eta_min)

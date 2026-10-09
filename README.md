@@ -888,9 +888,15 @@ collocation points): eager, an iteration is ~900 kernel launches whose host-side
 time (profile: 175 ms host vs 58 ms device for 12 PINN iterations); a CUDA graph replays the whole
 iteration with one launch. `compile` (first call 7–20 s per stage) helps less. TF32 changes nothing
 measurable. Accuracy is unchanged: kernels agree with the CPU to ≤ 1e-5, the end-to-end subspace error
-is 1.37e-5 (GPU, eager or graph) vs 1.38e-5 (CPU). End to end (128², `quality="fast"`): CPU 120 s, GPU
-56 s, GPU + CUDA graphs 42 s, all 10 stages captured; the rest of the time is outside the training
-iterations (`info["timings"]` shows where).
+is 1.37e-5 (GPU, eager or graph) vs 1.38e-5 (CPU).
+
+End to end (`estimate_maps`, 128², 8 coils, `quality="fast"`: 6 plane + 2 handedness probes of 100
+iterations, 500 wire and 800 PINN iterations): **CPU 98 s, GPU eager 19 s, GPU with CUDA graphs 3.6 s**
+(plane search 0.7, handedness 0.2, wires 0.35, PINN 1.8, phase reference 0.5 s; all 10 stages captured).
+With graphs an iteration is bound by GPU execution of ~900 small kernels (~2.5 µs each);
+`cuda_graph=True, compile=True` replays inductor-fused kernels instead (fewer, larger kernels) at the cost
+of ~10 s compilation per stage shape on the first run (cached on disk afterwards): worth it for long runs
+(`quality="default"`, 3-D).
 
 What was changed for GPU throughput (all exact, covered by tests):
 
