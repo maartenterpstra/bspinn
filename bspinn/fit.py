@@ -127,6 +127,15 @@ class FitConfig:
     # shared
     lambda_norm: float = 1e-2
     lambda_img: float = 1e-4
+    # optimiser (all stages; see scripts/hyper_sweep.py)
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    lr_schedule: str = "cosine"      # 'cosine' | 'linear' | 'constant' (after the optional warm-up)
+    lr_warmup: float = 0.0           # fraction of each stage spent on a linear warm-up
+    lr_min_wires: float = 0.05       # final learning rate / initial, wire stage
+    lr_min_pinn: float = 0.1         # final learning rate / initial, PINN (and dynamic) stage
+    lr_image_wires: float = 2e-2     # learning rate of the calibration-grid image (k-space data term)
+    lr_image_pinn: float = 1e-2
     lambda_temporal: float = 0.0     # ||m_t - m_t-1||^2 on frame images (dynamic data)
     support_thresh: float = 0.08
     seed: int = 0
@@ -547,7 +556,7 @@ def _wires_setup(prob, cfg, handedness, iters, log, tag):
             wires.amp.div_(n.sqrt())
             K = getattr(model, "n_sets", 1)
             m = _image_param(prob, wires.sensitivity(prob.coords, create_graph=False), K)
-        params.append({"params": [m], "lr": 2e-2})
+        params.append({"params": [m], "lr": cfg.lr_image_wires})
     def step_loss(sl):
         Cs = sens_sets(model, prob.slice_coords(sl), create_graph=False)
         d = prob.data_loss(Cs, m, sl)
@@ -567,7 +576,7 @@ def _wires_setup(prob, cfg, handedness, iters, log, tag):
             _log(hist, it, data=d.item(), outside=out.item(), curv=curv.item())
             log(f"[{tag} h={handedness:+d}] it {it:5d}  data {d.item():.4e}  outside {out.item():.2e}")
 
-    stage = (prob, cfg, iters, params, 0.05 * cfg.lr_wires, step_loss, lambda: (),
+    stage = (prob, cfg, iters, params, cfg.lr_min_wires * cfg.lr_wires, step_loss, lambda: (),
              [_batch(prob, cfg, gen) for _ in range(iters)], [gen], after)
     return {"stage": stage, "finish": lambda o: (model, m, hist, float(o[1].detach()))}
 
@@ -614,7 +623,7 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
     if prob.data_term == "kspace":
         C0 = model.sensitivity(prob.coords, create_graph=False).detach() if m is None else None
         m = _image_param(prob, C0, K, m)
-        params.append({"params": [m], "lr": 1e-2})
+        params.append({"params": [m], "lr": cfg.lr_image_pinn})
     # compiled on a GPU: data grid + collocation in one trunk pass (fewer GEMMs; inductor fuses the rest).
     # Otherwise separate passes: uncompiled, the Laplacian on the data grid costs more than it saves
     # (CUDA graphs: 2.5 -> 3.1 ms per iteration), and on CPU everything is compute-bound.
@@ -646,7 +655,7 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
             _log(hist, it, data=d.item(), phys=phys.item())
             log(f"[pinn] it {it:5d}  data {d.item():.4e}  laplace {phys.item():.3e}")
 
-    _run_stage(prob, cfg, iters, params, 0.1 * cfg.lr_pinn, step_loss, lambda: _colloc(prob, cfg, gen, wires),
+    _run_stage(prob, cfg, iters, params, cfg.lr_min_pinn * cfg.lr_pinn, step_loss, lambda: _colloc(prob, cfg, gen, wires),
                [_batch(prob, cfg, gen) for _ in range(iters)], [gen], after)
     return m, hist
 
@@ -961,15 +970,18 @@ def _run_stage(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, af
     dev = prob.device
     if _graph_ok((prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, after)):
         return accel.train_graphed(*_graph_job(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, after))
-    opt = accel.adam(groups, dev)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters, eta_min=eta_min)
+    betas = (cfg.adam_beta1, cfg.adam_beta2)
+    opt = accel.adam(groups, dev, betas=betas)
+    base = [g["lr"] for g in opt.param_groups]
     step = accel.compile_step(step_loss, cfg, iters)
     compiled = step is not step_loss
     out = None
     for it in range(iters):
+        for g, b in zip(opt.param_groups, base):           # same closed-form schedule as the graph path
+            g["lr"] = accel.cosine_lr(b, eta_min, it, iters, accel.schedule_of(cfg))
         opt.zero_grad()
         out = step(_sl_arg(prob, sls[it], compiled), *draw())
-        out[0].backward(); opt.step(); sched.step()
+        out[0].backward(); opt.step()
         after(it, out)
     return out
 
@@ -982,7 +994,8 @@ def _graph_ok(stage):
 def _graph_job(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, after):
     """Arguments of accel.train_graphed for one stage: capturable Adam, static slice-batch tensor."""
     dev = prob.device
-    opt, base = accel.capturable_adam(groups, dev)
+    opt, base = accel.capturable_adam(groups, dev, betas=(cfg.adam_beta1, cfg.adam_beta2))
+    opt.schedule = accel.schedule_of(cfg)
     tab = None if sls[0] is None else torch.tensor(np.asarray(sls), device=dev)
     static_sl = None if tab is None else tab[0].clone()
 

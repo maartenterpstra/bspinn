@@ -96,7 +96,7 @@ def graph_mode(cfg, device, iters, warmup=3):
     return bool(getattr(cfg, "cuda_graph", False)) and on_dev and iters >= warmup + 2
 
 
-def capturable_adam(groups, device, default_lr=1e-3):
+def capturable_adam(groups, device, default_lr=1e-3, betas=(0.9, 0.999)):
     """Adam whose step can be captured in a CUDA graph: device tensors for the step counts and the
     learning rates (changed between replays with fill_, no host sync). Returns (optimizer, base lrs)."""
     groups = list(groups)
@@ -108,22 +108,22 @@ def capturable_adam(groups, device, default_lr=1e-3):
         base.append(lr)
         out.append({**g, "params": list(g["params"]), "lr": torch.tensor(lr, device=device)})
     if torch.device(device).type != "cuda":           # CPU emulation (tests): same algorithm, no capture
-        return torch.optim.Adam(out, foreach=False), base
+        return torch.optim.Adam(out, foreach=False, betas=betas), base
     # real parameters: fused Adam (one multi-tensor kernel); complex ones (the image): capturable foreach
     real = [{**g, "params": [p for p in g["params"] if not p.is_complex()]} for g in out]
     cplx = [{**g, "params": [p for p in g["params"] if p.is_complex()]} for g in out]
     if any(g["params"] for g in cplx) and any(g["params"] for g in real):
         try:
-            return _GroupedAdam(torch.optim.Adam(real, capturable=True, fused=True),
-                                torch.optim.Adam(cplx, capturable=True, foreach=True)), base
+            return _GroupedAdam(torch.optim.Adam(real, capturable=True, fused=True, betas=betas),
+                                torch.optim.Adam(cplx, capturable=True, foreach=True, betas=betas)), base
         except (RuntimeError, TypeError, ValueError):
             pass
     elif not any(g["params"] for g in cplx):
         try:
-            return torch.optim.Adam(out, capturable=True, fused=True), base
+            return torch.optim.Adam(out, capturable=True, fused=True, betas=betas), base
         except (RuntimeError, TypeError, ValueError):
             pass
-    return torch.optim.Adam(out, capturable=True, foreach=True), base
+    return torch.optim.Adam(out, capturable=True, foreach=True, betas=betas), base
 
 
 class _GroupedAdam:
@@ -170,10 +170,25 @@ class _FillBoth:
         return self.ts[0].is_cuda
 
 
-def cosine_lr(base, eta_min, it, T):
-    """CosineAnnealingLR's learning rate before step ``it`` (closed form; T = number of iterations)."""
+def schedule_of(cfg):
+    """(kind, warm-up fraction) of a FitConfig; attach to an optimizer as opt.schedule."""
+    return (getattr(cfg, "lr_schedule", "cosine"), float(getattr(cfg, "lr_warmup", 0.0)))
+
+
+def cosine_lr(base, eta_min, it, T, sched=("cosine", 0.0)):
+    """Learning rate before step ``it`` of T (closed forms). 'cosine' (default) = CosineAnnealingLR;
+    'linear' decay; 'constant'; any of them after a linear warm-up over the first ``warmup`` fraction."""
     import math
-    return eta_min + (base - eta_min) * (1 + math.cos(math.pi * it / T)) / 2
+    kind, w = sched
+    nw = int(round(w * T))
+    if it < nw:
+        return base * (it + 1) / nw
+    t, TT = it - nw, max(1, T - nw)
+    if kind == "constant":
+        return base
+    if kind == "linear":
+        return eta_min + (base - eta_min) * (1 - t / TT)
+    return eta_min + (base - eta_min) * (1 + math.cos(math.pi * t / TT)) / 2
 
 
 def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, after=None, warmup=3, log=print,
@@ -191,7 +206,7 @@ def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, aft
     Returns the outputs of the last iteration."""
     def set_lr(it):
         for g, b in zip(opt.param_groups, base_lrs):
-            g["lr"].fill_(cosine_lr(b, eta_min, it, iters))
+            g["lr"].fill_(cosine_lr(b, eta_min, it, iters, getattr(opt, "schedule", ("cosine", 0.0))))
 
     def eager(it):
         set_lr(it)
@@ -266,7 +281,7 @@ def train_graphed_many(jobs, warmup=3, log=print):
     for (step, opt, base, eta, iters, gens, before, after), s in zip(jobs, streams):
         def set_lr(it, opt=opt, base=base, eta=eta, iters=iters):
             for g, b in zip(opt.param_groups, base):
-                g["lr"].fill_(cosine_lr(b, eta, it, iters))
+                g["lr"].fill_(cosine_lr(b, eta, it, iters, getattr(opt, "schedule", ("cosine", 0.0))))
 
         def eager(it, step=step, opt=opt, before=before, after=after, set_lr=set_lr):
             set_lr(it)

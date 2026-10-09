@@ -150,7 +150,7 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print)
               {"params": [dyn.V], "lr": dcfg.lr_verts},
               {"params": [dyn.alpha], "lr": dcfg.lr_alpha}]
     if m is not None:
-        params.append({"params": [m], "lr": 1e-2})
+        params.append({"params": [m], "lr": cfg.lr_image_pinn})
     from .fit import _colloc, _physics_at, _run_stage
     gen = torch.Generator(device=prob.device).manual_seed(cfg.seed + 11)
     frame_rng = np.random.default_rng(cfg.seed + 12)
@@ -181,7 +181,7 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print)
                 f"|V| {dyn.V.abs().max().item():.3f}")
 
     frames = [sorted(frame_rng.permutation(prob.S)[:B].tolist()) for _ in range(dcfg.iters_dyn)]
-    _run_stage(prob, cfg, dcfg.iters_dyn, params, 0.1 * cfg.lr_pinn, step_loss,
+    _run_stage(prob, cfg, dcfg.iters_dyn, params, cfg.lr_min_pinn * cfg.lr_pinn, step_loss,
                lambda: _colloc(prob, cfg, gen, wires), frames, [gen], after)
     log(f"dynamic fit done in {time.time() - t0:.1f}s")
     hist["dynamic"] = dhist

@@ -939,7 +939,12 @@ iterations per mode, and per-phase wall times plus a host profile of one end-to-
 **How many iterations?** `scripts/accuracy_sweep.py` measures, on your own (preferably fully sampled)
 data and without ground truth, the k-space residual over the noise floor, the CG-SENSE error at R = 4,
 the map change relative to the longest budget and the seed-to-seed spread, for iteration budgets from
-half of `fast` to twice `default`.
+half of `fast` to twice `default`. `scripts/hyper_sweep.py` searches the optimiser and regularisation
+settings (Adam betas, learning rates and schedule, collocation batch, loss weights, network size) for
+the fastest convergence at unchanged quality: one knob at a time, greedy combination, then the budget at
+which the combination matches the current `default` preset. New FitConfig fields for it: `adam_beta1`,
+`adam_beta2`, `lr_schedule` (cosine | linear | constant), `lr_warmup`, `lr_min_wires`, `lr_min_pinn`,
+`lr_image_wires`, `lr_image_pinn` (defaults reproduce the previous behaviour).
 
 Tips: the cost scales with the calibration grid and the number of coils, not with the image matrix
 (except `solve_image`). Being launch-bound, a GPU iteration costs about the same for many more
