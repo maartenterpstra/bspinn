@@ -101,12 +101,22 @@ def check_end_to_end(dev, quick):
         C, info = estimate_maps(k, "2d", calib=24, quality="fast", device=device, verbose=False,
                                 **({"iters_pinn": 150, "iters_wires": 100} if quick else {}), **extra)
         e = subspace_error(torch.from_numpy(C)[None], torch.from_numpy(gt[:1]), sup)
-        res[name] = {"subspace_err": e, "seconds": time.time() - t}
+        from bspinn import accel
+        res[name] = {"subspace_err": e, "seconds": time.time() - t, "cuda_graph_stats": dict(accel.STATS)}
+        accel.STATS.update(captured=0, fallback=0, last_error=None)
         print(f"  estimate_maps 128^2 on {name:18s}: subspace error {e:.2e}, {time.time() - t:.1f} s", flush=True)
     return res
 
 
 # --------------------------------------------------------------------------- timings (child process)
+def on_device(prob, dev):
+    """Problems are built on the CPU; fit() / fit3d() move them to cfg.device (v10/v11 of this script did
+    not, so their per-stage timings were CPU timings)."""
+    prob = prob.to(dev)
+    assert prob.coords.device.type == torch.device(dev).type, "problem not on the benchmark device"
+    return prob
+
+
 def per_iter(dev, run, n, k0=2):
     """(result, ms per iteration, first-call overhead in s) from runs of k0 and k0 + n iterations, after a
     first call that pays the one-off costs (with cfg.compile: tracing and compiling the stage's graph,
@@ -130,7 +140,7 @@ def bench_2d(dev, n):
     d, _, _ = make_synthetic(8, (256, 256), noise=0.01)
     cfg = _cfg(calib=24, device=dev)
     from bspinn import accel; accel.configure(cfg)
-    d.prewhiten(); prob = Problem(d, cfg)
+    d.prewhiten(); prob = on_device(Problem(d, cfg), dev)
     (w, m, _, _), tw, cw = per_iter(dev, lambda k: fit_wires(prob, cfg, 1, k, **QUIET), n)
     pinn = make_pinn(prob, cfg, w, 1); wr = _wrap(pinn, prob, cfg, prev=w)
     _, tp, cp = per_iter(dev, lambda k: fit_pinn(prob, cfg, wr, m, iters=k, **QUIET), n)
@@ -171,7 +181,7 @@ def bench_joint(dev, n):
     d, _, _ = make_synthetic(8, (256, 256), noise=0.01)
     cfg = FitConfig(calib=24, log_every=10 ** 6, device=dev, joint_full=True, compile=MODE["compile"], tf32=MODE["tf32"])
     from bspinn import accel; accel.configure(cfg)
-    d.prewhiten(); prob = Problem(d, cfg)
+    d.prewhiten(); prob = on_device(Problem(d, cfg), dev)
     w, m, _, _ = fit_wires(prob, cfg, 1, 5, **QUIET)
     wr = _wrap(make_pinn(prob, cfg, w, 1), prob, cfg, prev=w)
     out = {}
@@ -198,7 +208,7 @@ def bench_3d(dev, n, helmholtz):
         d, _, _ = make_synthetic3d(8, (48, 48, 48), noise=0.01)
         cfg = _cfg(calib=(12, 12, 12), device=dev)
     from bspinn import accel; accel.configure(cfg)
-    d.prewhiten(); prob = Problem3D(d, cfg)
+    d.prewhiten(); prob = on_device(Problem3D(d, cfg), dev)
     (w, m, _, _), tw, cw = per_iter(dev, lambda k: fit_wires(prob, cfg, 1, k, **QUIET), n)
     p = make_pinn(prob, cfg, w, 1); cc = CoarseCorrection(p, prob)
     _, tp, cp = per_iter(dev, lambda k: fit_pinn(prob, cfg, cc, m, iters=k, **QUIET), n)
@@ -217,7 +227,7 @@ def check_syncs(dev, iters=6):
     from bspinn.fit import Problem, fit_pinn, fit_wires, make_pinn
     d, _, _ = make_synthetic(8, (128, 128), noise=0.01)
     cfg = _cfg(calib=24, device=dev)
-    d.prewhiten(); prob = Problem(d, cfg)
+    d.prewhiten(); prob = on_device(Problem(d, cfg), dev)
     w, m, _, _ = fit_wires(prob, cfg, 1, 2, **QUIET)
     p = make_pinn(prob, cfg, w, 1)
     sites = {}
@@ -271,6 +281,9 @@ def child(a):
             res[case] = {"error": f"{type(e).__name__}: {e}"}
         if torch.device(a.device).type == "cuda":
             res[case]["peak_mem_GB"] = torch.cuda.max_memory_allocated(a.device) / 1e9
+        from bspinn import accel
+        res[case]["cuda_graph_stats"] = dict(accel.STATS)
+        accel.STATS.update(captured=0, fallback=0, last_error=None)
     print("RESULT " + json.dumps(res), flush=True)
 
 

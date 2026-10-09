@@ -20,6 +20,8 @@ than eager because of recompilation and per-call overhead, and it was removed.)
 """
 import torch
 
+STATS = {"captured": 0, "fallback": 0, "last_error": None}     # CUDA-graph stages (for diagnostics)
+
 
 def configure(cfg):
     if getattr(cfg, "tf32", False) and torch.cuda.is_available():
@@ -144,11 +146,14 @@ def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, aft
             static[0].backward()
             opt.step()
     except Exception as e:                           # not capturable: carry on eagerly
+        STATS["fallback"] += 1
+        STATS["last_error"] = f"{type(e).__name__}: {str(e)[:300]}"
         log(f"CUDA graph capture failed ({type(e).__name__}: {str(e)[:200]}); continuing eagerly")
         torch.cuda.synchronize()
         for it in range(warmup, iters):
             out = eager(it)
         return out
+    STATS["captured"] += 1
     for it in range(warmup, iters):
         if it > warmup:
             set_lr(it)
