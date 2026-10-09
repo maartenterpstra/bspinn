@@ -353,13 +353,28 @@ class HarmonicPINN(CoilModel):
                 Bt = -g if Bw is None else Bw[..., k] - g
                 den = den + (Bt[..., 0].pow(2) + Bt[..., 1].pow(2)).mean(1).detach()
             return (num / den.clamp_min(1e-12)).mean()
+        return self._ratio(*self._lap_terms(points), slice(None))
+
+    def _lap_terms(self, points):
+        """Per point: squared Laplacian (N,P) and |B_transverse|^2 (N,P), one Taylor-mode pass."""
         x = points.unsqueeze(0).expand(self.n_coils, -1, -1) if points.dim() == 2 else points
         _, g, lap = trunk_taylor(self.net, x.detach(), self.codes[:, None, :], laplacian=True)   # (N,P,3,K), (N,P,K)
-        Bw = self._base_field(x.detach())
-        Bt = -g if Bw is None else Bw.detach() - g
-        num = lap.pow(2).sum(-1).mean(1)
-        den = (Bt[..., 0, :].pow(2) + Bt[..., 1, :].pow(2)).sum(-1).mean(1).detach()
-        return (num / den.clamp_min(1e-12)).mean()
+        with torch.no_grad():                                                  # enters only the detached norm
+            Bw = self._base_field(x.detach())
+        Bt = -g if Bw is None else Bw - g
+        return lap.pow(2).sum(-1), (Bt[..., 0, :].pow(2) + Bt[..., 1, :].pow(2)).sum(-1)
+
+    @staticmethod
+    def _ratio(num, den, sl):
+        return (num[:, sl].mean(1) / den[:, sl].mean(1).detach().clamp_min(1e-12)).mean()
+
+    def physics_loss_pair(self, p1, p2, w2):
+        """physics_loss(p1) + w2 * physics_loss(p2) in one trunk pass (object and air collocation)."""
+        if not self._taylor_ok() or p1.dim() != 2:
+            return self.physics_loss(p1) + w2 * self.physics_loss(p2)
+        n1 = p1.shape[0]
+        num, den = self._lap_terms(torch.cat([p1, p2]))
+        return self._ratio(num, den, slice(0, n1)) + w2 * self._ratio(num, den, slice(n1, None))
 
 
 # ======================================================================================
@@ -586,23 +601,36 @@ class HelmholtzPINN(CoilModel):
     def physics_loss(self, points):
         """mean|lap B_c + k^2 B_total|^2 / (mean|B_total|^2 max(|k^2|^2, 1)) + lambda_div mean|div B_c|^2 / mean|B_total|^2.
         Jacobian (for div) and Laplacian of all six outputs from one forward Taylor-mode pass."""
+        return self._combine(*self._helm_terms(points), slice(None))
+
+    def _helm_terms(self, points):
+        """Per point (N,P): Helmholtz residual, |B_total|^2, |div B_c|^2; one Taylor-mode pass."""
         x = points.detach().unsqueeze(0).expand(self.n_coils, -1, -1)
         out, J, L = trunk_taylor(self.net, x, self.codes[:, None, :], laplacian=True)   # (N,P,6), (N,P,3,6), (N,P,6)
         Bc = out.reshape(*out.shape[:-1], 3, 2)
         lap = L.reshape(*L.shape[:-1], 3, 2)
         Jr = J.reshape(*J.shape[:-1], 3, 2)                                  # [..., d_e, component d, part p]
         div = Jr[..., 0, 0, :] + Jr[..., 1, 1, :] + Jr[..., 2, 2, :]                 # (N,P,2): d_e B_e
-        Bw = self._base_field(x)
-        Bt = Bc if Bw is None else Bc + Bw.detach()
+        with torch.no_grad():                                                  # the wire field is a constant here
+            Bw = self._base_field(x)
+        Bt = Bc if Bw is None else Bc + Bw
         # wave wires already solve the Helmholtz equation: only the correction enters the residual;
         # quasi-static wires are harmonic, so their k^2 B_w term remains as a source
         Br = Bc if (Bw is None or self.wave_base) else Bt
         a, b = self.k2_re, self.k2_im
         rr = lap[..., 0] + a * Br[..., 0] - b * Br[..., 1]
         ri = lap[..., 1] + a * Br[..., 1] + b * Br[..., 0]
-        res = (rr.pow(2) + ri.pow(2)).sum(-1)
-        den = Bt.pow(2).sum((-1, -2)).mean(1).detach().clamp_min(1e-12)       # per coil
-        kk = (a.detach() ** 2 + b.detach() ** 2).clamp_min(1.0)                # |k^2|^2 without a host sync
-        helm = (res.mean(1) / (den * kk)).mean()
-        dv = ((div[..., 0] ** 2 + div[..., 1] ** 2).mean(1) / den).mean()
+        return (rr.pow(2) + ri.pow(2)).sum(-1), Bt.pow(2).sum((-1, -2)), div[..., 0] ** 2 + div[..., 1] ** 2
+
+    def _combine(self, res, bt2, div2, sl):
+        den = bt2[:, sl].mean(1).detach().clamp_min(1e-12)                    # per coil
+        kk = (self.k2_re.detach() ** 2 + self.k2_im.detach() ** 2).clamp_min(1.0)   # |k^2|^2, no host sync
+        helm = (res[:, sl].mean(1) / (den * kk)).mean()
+        dv = (div2[:, sl].mean(1) / den).mean()
         return helm + self.lambda_div * dv
+
+    def physics_loss_pair(self, p1, p2, w2):
+        """physics_loss(p1) + w2 * physics_loss(p2) in one trunk pass."""
+        n1 = p1.shape[0]
+        t = self._helm_terms(torch.cat([p1, p2]))
+        return self._combine(*t, slice(0, n1)) + w2 * self._combine(*t, slice(n1, None))

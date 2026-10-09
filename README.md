@@ -862,10 +862,11 @@ effects relative to coils in air beside a body: relative Laplacian of the maps 4
 ### 8.2 Performance and GPU
 
 ```python
-C, img, info = estimate_maps(ksp, "2d", device="cuda", compile=True, return_image=True)   # tf32=True optional
+C, img, info = estimate_maps(ksp, "2d", device="cuda", return_image=True)
+C, img, info = estimate_maps(ksp, "2d", device="cuda", compile="reduce-overhead", return_image=True)  # see below
 ```
 ```
-python -m bspinn.cli maps ksp.npy --out maps.npy --device cuda --compile [--tf32]
+python -m bspinn.cli maps ksp.npy --out maps.npy --device cuda [--compile [reduce-overhead]] [--tf32]
 python scripts/bench_gpu.py [--device cuda:0] [--quick]      # correctness (device vs CPU) + per-stage timings
 ```
 
@@ -873,30 +874,40 @@ What runs where with `device="cuda"`: every fitting stage (wires, PINN, Helmholt
 image), the full-resolution map evaluation and the CG-SENSE image (`sense_image`, torch FFTs). Only
 the inputs and outputs cross the PCIe bus.
 
+**Where the time goes on a GPU.** The calibration problems are small (2-D: 48² grid points × 8 coils,
+768 collocation points), so an iteration costs ~1000 tiny kernels and ~1400 dispatcher calls, and the
+GPU waits on the host. Measured on an RTX PRO 6000 Blackwell (eager): 2-D 256², 8 coils: wires
+23 ms/it, PINN 94 ms/it, full-resolution maps 11 ms; 3-D 48³: 41 / 145 ms/it; Helmholtz 32³: 81 /
+109 ms/it; `solve_image` 256²: 0.46 s/it (hybrid) vs 2.8 s/it (exact). End to end (128², quick
+preset) 65 s on the GPU vs 175 s on that machine's CPU, with the same accuracy (subspace error 1.37e-5
+vs 1.38e-5); kernels agree with the CPU to ≤ 1e-5.
+
 What was changed for GPU throughput (all exact, covered by tests):
 
 | change | effect |
 |---|---|
 | **Taylor-mode MLP** (`models.trunk_taylor`): value, gradient and Laplacian of the tanh trunk propagated in one forward pass (t′ = 1−t², t″ = −2t t′) instead of nested autograd | no double backward; Laplace physics 1.3–1.7×, Helmholtz physics 7.9× faster (CPU); falls back to autograd for custom potentials |
-| no autograd graph where the field is closed form or Taylor mode (`sensitivity_batched`, `field_needs_autograd`) | map evaluation in large chunks (262k points on CUDA) under `no_grad` |
-| **fused segment kernel** for the wave wires (`physics.segment_static_and_log`): Biot–Savart and the k²/(2r) term share u, v, \|u\|, \|v\|, u×v | wave-wire field fwd+bwd 850 → 580 ms (3-D, 32³) |
-| **no host syncs in the loops**: device-side random generators, fixed-size `topk` sampling instead of boolean compaction / `multinomial`, no `.item()` per iteration, CG residual checked every 10 iterations | the GPU queue never drains during training |
-| **joint image stage**: `joint_maps="hybrid"` = exact wire field at full resolution + the smooth network correction from the calibration grid, upsampled by k-space zero padding; single pass when it fits in memory (`joint_chunk=0` sizes it from free GPU memory) | same accuracy as exact maps, 3.7–6× faster per iteration |
-| `compile=True`: `torch.compile` (dynamic shapes) of the Biot–Savart, fused wave and Taylor-mode kernels | fused Triton kernels on GPU; on CPU already 1.6–3× (wires 50 → 16 ms/it, PINN 277 → 176 ms/it, 3-D Helmholtz 0.77 → 0.40 s/it); first iterations pay ~1 min compile |
+| object and air collocation in **one network pass** (`physics_loss_pair`) | physics term 348 → 183 ops forward, backward 765 → 538 |
+| no autograd graph where the field is closed form or Taylor mode (`sensitivity_batched`, `field_needs_autograd`); the wire field inside the physics norm under `no_grad` | map evaluation in large chunks (262k points on CUDA) |
+| **fused segment kernel** for the wave wires (`physics.segment_static_and_log`): Biot–Savart and the k²/(2r) term share u, v, \|u\|, \|v\|, u×v | wave-wire field fwd+bwd 850 → 580 ms (3-D, 32³, CPU) |
+| **no host syncs in the loops**: device-side random generators, fixed-size `topk` sampling instead of boolean compaction / `multinomial`, no `.item()` per iteration, CG residual checked every 10 iterations | the GPU queue never drains during training (the benchmark checks this with `torch.cuda.set_sync_debug_mode`) |
+| **fused Adam** on CUDA when all parameters are real | one optimizer kernel |
+| **joint image stage**: `joint_maps="hybrid"` = exact wire field at full resolution + the smooth network correction from the calibration grid, upsampled by k-space zero padding; one graph and one wire-field pass when it fits in memory (`joint_chunk=0` sizes it from free GPU memory) | same accuracy as exact maps, 6× faster per iteration |
+| **`compile=`**: `torch.compile` of each stage's *whole* iteration (loss forward + backward, static shapes, randomness drawn outside), compiled once and reused by later stages with the same shapes; `"reduce-overhead"` adds CUDA graphs (the whole forward/backward replayed as one launch) | targets the launch overhead above; stages under `compile_min_iters` (200, e.g. the plane/handedness search) stay eager |
 | `tf32=True` | TF32 matmuls (Ampere+); ~1e-3 relative precision in the MLP, off by default |
 
-Measured on one CPU core (no GPU was available during development), before → after, per iteration:
-2-D PINN stage 342 → 277 ms (176 ms compiled); 3-D Helmholtz 32³ wave-wire stage 0.94 → 0.77 s
-(0.40 s compiled), Helmholtz PINN stage 1.74 → 0.78 s (0.49 s compiled). **GPU timings are not
-measured here**; `scripts/bench_gpu.py` prints them (eager / compile / compile+tf32, each in a fresh
-process) together with a device-vs-CPU check of every kernel (expected ≤ 1e-5 relative) and the
-end-to-end subspace error on CPU and on the device (equal accuracy; not bitwise equal maps, since
-CPU and CUDA random streams differ).
+`compile`: an earlier version compiled the individual kernels with dynamic shapes; on the GPU above that
+was 10–40× *slower* than eager (recompilation, per-call overhead) and it was replaced by the
+whole-iteration compile. That one gives identical trajectories (test) and, on CPU, where the work is
+arithmetic rather than launches, about the same speed as eager; its GPU gain has not been measured yet.
+Compilation costs ~10–60 s per distinct graph (two per run: wires and PINN). `scripts/bench_gpu.py`
+measures eager / compile / reduce-overhead [+tf32] in fresh processes, reports the first-call (compile)
+cost separately, the recompiles and any skipped CUDA graphs, and where host syncs happen.
 
 Tips: the cost scales with the calibration grid and the number of coils, not with the image matrix
-(except `solve_image`). On a GPU, larger collocation batches (`n_colloc`) are nearly free and
-reduce gradient noise. `joint_maps="exact"` is the reference for the hybrid maps; `"interp"` is the
-cheapest and slightly biased.
+(except `solve_image`). Being launch-bound, a GPU iteration costs about the same for many more
+collocation points (`n_colloc`) or a larger calibration grid: use them. `joint_maps="exact"` is the
+reference for the hybrid maps; `"interp"` is the cheapest and slightly biased.
 
 ## 9. Code map
 
@@ -904,7 +915,7 @@ cheapest and slightly biased.
 |---|---|
 | `masks.py` | `cartesian_mask`: Cartesian undersampling patterns with a calibration block (2-D, 3-D, dynamic) |
 | `api.py` | `estimate_maps`, `sense_image`, `coil_combine`: the one-call interface of §4.0 (CLI `maps`) |
-| `accel.py` | `torch.compile` / TF32 switches (`compile=True`, `tf32=True`) |
+| `accel.py` | whole-iteration `torch.compile` (`compile=`), fused Adam, TF32 |
 | `physics.py` | closed-form Biot–Savart for polylines, B→C mapping, autograd div/curl, Maxwell residual |
 | `models.py` | `WireLoopCoils` (hard), `HarmonicPINN` (soft / hybrid correction) |
 | `fit.py` | `FitConfig`, calibration `Problem` (VarPro / k-space / NUDFT), training stages, auto-handedness |

@@ -32,7 +32,7 @@ import torch
 from torch import nn
 
 from .data import MultiCoilData, _read_cfl
-from .fit import _physics, FitConfig, Problem, _extra_penalty, _image_param, _log, fit, sens_sets
+from .fit import FitConfig, Problem, _extra_penalty, _image_param, _log, fit, sens_sets
 from .geometry import SliceGeometry, fft2c_np
 from .models import HarmonicPINN
 from .physics import grad
@@ -151,7 +151,9 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print)
               {"params": [dyn.alpha], "lr": dcfg.lr_alpha}]
     if m is not None:
         params.append({"params": [m], "lr": 1e-2})
-    opt = torch.optim.Adam(params)
+    from . import accel
+    from .fit import _colloc, _physics_at, _sl_arg
+    opt = accel.adam(params, prob.device)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, dcfg.iters_dyn, eta_min=0.1 * cfg.lr_pinn)
     gen = torch.Generator(device=prob.device).manual_seed(cfg.seed + 11)
     frame_rng = np.random.default_rng(cfg.seed + 12)
@@ -161,17 +163,25 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print)
     dhist = []
     max_disp = dcfg.max_disp_mm / prob.data.geom.half_fov if dcfg.max_disp_mm else None
     B = cfg.slice_batch or prob.S
-    for it in range(dcfg.iters_dyn):
-        fr = sorted(frame_rng.permutation(prob.S)[:B].tolist())
-        opt.zero_grad()
+    wires = [dyn.static.base] if dyn.static.base is not None else []
+
+    def step_loss(fr, pin, pair):
         C = dyn.sensitivity_frames(pts, fr)                        # (B,N,P)
         Cflat = C.permute(1, 0, 2).reshape(prob.N_model, -1)
         d = prob.data_loss(Cflat, m, fr)
-        phys = _physics(dyn, prob, cfg, gen, [dyn.static.base] if dyn.static.base is not None else [])
+        phys = _physics_at(dyn, cfg, pin, pair)
         smooth, unit, outside = dyn.regularisers(fr, prob.keep, cfg.outside_margin, max_disp)
         loss = (d + cfg.lambda_phys * phys + cfg.lambda_norm * prob.norm_loss(Cflat, fr)
                 + dcfg.lambda_smooth * smooth + dcfg.lambda_unit * unit + cfg.lambda_outside * outside
                 + _extra_penalty(dyn, C, m, cfg))
+        return loss, d, phys, smooth
+
+    step = accel.compile_step(step_loss, cfg, dcfg.iters_dyn)
+    compiled = step is not step_loss
+    for it in range(dcfg.iters_dyn):
+        fr = sorted(frame_rng.permutation(prob.S)[:B].tolist())
+        opt.zero_grad()
+        loss, d, phys, smooth = step(_sl_arg(prob, fr, compiled), *_colloc(prob, cfg, gen, wires))
         loss.backward(); opt.step(); sched.step()
         if it % cfg.log_every == 0 or it == dcfg.iters_dyn - 1:
             _log(dhist, it, data=d.item(), phys=phys.item(), smooth=smooth.item())

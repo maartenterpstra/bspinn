@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from . import accel
 from .components import MultiSetCoils
 from .data import MultiCoilData
 from .encoding import CartesianOp, NUDFTOp, NUDFTOpBatched, radial_dcf
@@ -83,8 +84,9 @@ class FitConfig:
                                      #   one single forward/backward pass when everything fits)
     joint_cg: int = 3                # CG steps on the image per map step (warm-started)
     lambda_joint_img: float = 1e-2   # Tikhonov weight on the image, relative to mean(sum_j |C_j|^2)
-    compile: bool = False            # torch.compile the hot kernels (Biot-Savart segments, Taylor-mode trunk):
-                                     #   fused elementwise kernels (Triton on GPU); first calls compile (~1 min)
+    compile: bool | str = False      # torch.compile each stage's whole iteration (see accel.py): False | True |
+                                     #   'reduce-overhead' (+ CUDA graphs) | 'max-autotune'; ~10-60 s per stage
+    compile_min_iters: int = 200     # stages with fewer iterations run eagerly (not worth compiling)
     tf32: bool = False               # allow TF32 matmuls on Ampere+ GPUs (faster, ~1e-3 relative precision)
     air_colloc: float = 0.25         # fraction of Laplace collocation points in the air around the object
                                      #   (>= 2 wire radii from any wire): keeps the network correction harmonic,
@@ -521,12 +523,10 @@ def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=pr
             K = getattr(model, "n_sets", 1)
             m = _image_param(prob, wires.sensitivity(prob.coords, create_graph=False), K)
         params.append({"params": [m], "lr": 2e-2})
-    opt = torch.optim.Adam(params)
+    opt = accel.adam(params, prob.device)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters, eta_min=0.05 * cfg.lr_wires)
-    hist = []
-    for it in range(iters):
-        sl = _batch(prob, cfg, gen)
-        opt.zero_grad()
+
+    def step_loss(sl):
         Cs = sens_sets(model, prob.slice_coords(sl), create_graph=False)
         d = prob.data_loss(Cs, m, sl)
         out, curv = wires.regularisers(prob.keep, cfg.outside_margin)
@@ -535,6 +535,15 @@ def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=pr
             out = out + cfg.lambda_fov / cfg.lambda_outside * fov_penalty(prob.keep, wires.verts, cfg.outside_margin)
         loss = d + cfg.lambda_outside * out + cfg.lambda_curv * curv + cfg.lambda_norm * prob.norm_loss(Cs, sl)
         loss = loss + _extra_penalty(model, Cs, m, cfg)
+        return loss, d, out, curv
+
+    step = accel.compile_step(step_loss, cfg, iters)
+    compiled = step is not step_loss
+    hist = []
+    for it in range(iters):
+        sl = _batch(prob, cfg, gen)
+        opt.zero_grad()
+        loss, d, out, curv = step(_sl_arg(prob, sl, compiled))
         loss.backward()
         opt.step(); sched.step()
         if it % cfg.log_every == 0 or it == iters - 1:
@@ -586,15 +595,13 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
         C0 = model.sensitivity(prob.coords, create_graph=False).detach() if m is None else None
         m = _image_param(prob, C0, K, m)
         params.append({"params": [m], "lr": 1e-2})
-    opt = torch.optim.Adam(params)
+    opt = accel.adam(params, prob.device)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters, eta_min=0.1 * cfg.lr_pinn)
-    hist = []
-    for it in range(iters):
-        sl = _batch(prob, cfg, gen)
-        opt.zero_grad()
+
+    def step_loss(sl, pin, pair):
         Cs = sens_sets(model, prob.slice_coords(sl))
         d = prob.data_loss(Cs, m, sl)
-        phys = _physics(model, prob, cfg, gen, wires)
+        phys = _physics_at(model, cfg, pin, pair)
         loss = d + cfg.lambda_phys * phys + cfg.lambda_norm * prob.norm_loss(Cs, sl) + _extra_penalty(model, Cs, m, cfg)
         for w in wires:                     # the wires keep training here: keep them outside the object too
             out, _ = w.regularisers(prob.keep, cfg.outside_margin)   # (no curvature term: it shrinks loops)
@@ -602,6 +609,15 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
             if cfg.lambda_fov:
                 from .keepout import fov_penalty
                 loss = loss + cfg.lambda_fov * fov_penalty(prob.keep, w.verts, cfg.outside_margin)
+        return loss, d, phys
+
+    step = accel.compile_step(step_loss, cfg, iters)
+    compiled = step is not step_loss
+    hist = []
+    for it in range(iters):
+        sl = _batch(prob, cfg, gen)
+        opt.zero_grad()
+        loss, d, phys = step(_sl_arg(prob, sl, compiled), *_colloc(prob, cfg, gen, wires))
         loss.backward(); opt.step(); sched.step()
         if it % cfg.log_every == 0 or it == iters - 1:
             _log(hist, it, data=d.item(), phys=phys.item())
@@ -674,7 +690,7 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
     pts_full = prob.data.geom.grid().reshape(-1, 3).to(dev)                # (S*H*W, 3)
     n_model = prob.N_model
     chunk = _joint_chunk(cfg, model, n_model, dev, pts_full.shape[0])
-    single = exact and chunk >= pts_full.shape[0]                          # whole image in one graph
+    single = (exact or hybrid) and chunk >= pts_full.shape[0]              # whole image in one graph
     if exact:
         log(f"joint full-res: exact maps, {pts_full.shape[0]} points x {n_model} coils, "
             + ("single pass" if single else f"chunks of {chunk} points"))
@@ -720,6 +736,8 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         return rssn(to_full(prob.mixC(sens_from_field(F), -2)), 1)
 
     def maps(create_graph):
+        if hybrid and create_graph:
+            return None, None                                              # computed in the loop
         if hybrid:
             return maps_from_field(hybrid_field_nograd()), None
         if single and create_graph:
@@ -747,13 +765,18 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
     ynorm = float((y.abs() ** 2).sum())
     params = [q for q in model.parameters() if q.requires_grad]
     lr = cfg.lr_joint or cfg.lr_pinn
-    opt = torch.optim.Adam(params, lr=lr)
+    opt = accel.adam(params, dev, lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, cfg.iters_joint, eta_min=0.1 * lr)
     hist = []
     for it in range(cfg.iters_joint):
         opt.zero_grad()
         C, Cg = maps(True)
-        if hybrid:
+        if hybrid and single:                                              # one graph, one wire-field pass
+            C = maps_from_field(wire_field(pts_full) + correction_up())
+            d = (M * _fft2c_t(C * x[:, None]) - y).abs().pow(2).sum() / ynorm
+            Cg = model.sensitivity(pts, create_graph=True)
+            rest = d
+        elif hybrid:
             # dL/dF on the full-resolution field, then back through (a) the exact wire field in chunks and
             # (b) the grid network + k-space upsampling (one small graph)
             Fv = hybrid_field_nograd().requires_grad_(True)
@@ -835,7 +858,9 @@ def air_points(prob, n, gen, wires, min_dist):
     dev = prob.coords.device
     idx = torch.randint(0, prob.coords.shape[0], (4 * n,), generator=gen, device=dev)
     p = prob.coords[idx].clone()
-    step = prob.__dict__.setdefault("_grid_step", float((prob.coords[1] - prob.coords[0]).abs().max()))
+    if "_grid_step" not in prob.__dict__:                     # (setdefault would evaluate -> sync every call)
+        prob._grid_step = float((prob.coords[1] - prob.coords[0]).abs().max())
+    step = prob._grid_step
     p = p + 0.5 * step * torch.randn(p.shape, generator=gen, device=dev)
     na = getattr(prob, "normal_axis", None)
     if na is not None and prob.__class__.__name__ == "Problem":
@@ -859,14 +884,34 @@ def _device_gen(prob, seed):
     return torch.Generator(device=prob.device).manual_seed(seed)
 
 
+def _colloc(prob, cfg, gen, wires):
+    """This iteration's collocation points: (inside the object, in the air or None)."""
+    n_air = int(round(cfg.air_colloc * cfg.n_colloc))
+    pin = prob.collocation(cfg.n_colloc - n_air, gen)
+    pair = air_points(prob, n_air, gen, wires, 2 * max(cfg.wire_radius, 0.02)) if n_air > 0 else None
+    return pin, pair
+
+
+def _physics_at(model, cfg, pin, pair):
+    if pair is None:
+        return model.physics_loss(pin)
+    if hasattr(model, "physics_loss_pair"):                  # both point sets in one network pass
+        return model.physics_loss_pair(pin, pair, cfg.air_colloc)
+    return model.physics_loss(pin) + cfg.air_colloc * model.physics_loss(pair)
+
+
 def _physics(model, prob, cfg, gen, wires):
     """Laplace (or Helmholtz) residual of the network correction: inside the object and, with
     weight air_colloc, in the surrounding air (source-free too, as long as we stay off the wires)."""
-    n_air = int(round(cfg.air_colloc * cfg.n_colloc))
-    phys = model.physics_loss(prob.collocation(cfg.n_colloc - n_air, gen))
-    if n_air > 0:
-        phys = phys + cfg.air_colloc * model.physics_loss(air_points(prob, n_air, gen, wires, 2 * max(cfg.wire_radius, 0.02)))
-    return phys
+    return _physics_at(model, cfg, *_colloc(prob, cfg, gen, wires))
+
+
+def _sl_arg(prob, sl, compiled):
+    """Slice batch for a compiled step: an index tensor (a list would be a compile-time constant and
+    recompile for every new batch). Eager: unchanged."""
+    if sl is None or not compiled or getattr(prob, "per_slice_traj", False):
+        return sl
+    return torch.tensor(sl, device=prob.device)
 
 
 # ===================================================================================== driver

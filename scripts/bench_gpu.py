@@ -10,9 +10,10 @@
    * end to end: estimate_maps on a synthetic 2-D case on CPU and on the device; both subspace
      errors against the ground truth are printed (the random collocation streams differ between
      CPU and CUDA generators, so the maps are not bitwise equal, only equally accurate).
-2. Timings per optimisation iteration (ms/it, after warm-up, torch.cuda.synchronize around each
-   stage), for eager | compile | compile+tf32, each mode in a fresh subprocess (torch.compile and the
-   TF32 switches are process-global):
+2. Timings per optimisation iteration (ms/it, from the difference of a short and a long run, so that
+   per-stage setup cancels; the one-off cost of the first call, i.e. compilation, is *_first_call_s), for
+   eager | compile | reduce-overhead (compile + CUDA graphs) [+tf32], each mode in a fresh subprocess
+   (torch.compile and the TF32 switches are process-global):
      2d     8 coils, 256x256, calib 24: wire stage, PINN stage, full-res maps evaluation
      joint  the solve_image stage on 256x256: hybrid vs exact maps
      3d     8 coils, 48^3, calib 12^3: wire stage, PINN stage (Laplace)
@@ -102,23 +103,38 @@ def check_end_to_end(dev, quick):
 
 
 # --------------------------------------------------------------------------- timings (child process)
+def per_iter(dev, run, n, k0=2):
+    """(result, ms per iteration, first-call overhead in s) from runs of k0 and k0 + n iterations, after a
+    first call that pays the one-off costs (with cfg.compile: tracing and compiling the stage's graph,
+    reused by later stages with the same shapes)."""
+    _, t0 = timed(dev, lambda: run(k0), 1)                                  # warm caches / compile
+    _, t1 = timed(dev, lambda: run(k0), 1)
+    r, t2 = timed(dev, lambda: run(k0 + n), 1)
+    ms = (t2 - t1) / n
+    return r, ms, max(0.0, (t0 - t1) / 1e3)
+
+
+def _cfg(**kw):
+    from bspinn.fit import FitConfig
+    return FitConfig(log_every=10 ** 6, compile=MODE["compile"], tf32=MODE["tf32"], compile_min_iters=0, **kw)
+
+
 def bench_2d(dev, n):
     from bspinn.data import make_synthetic
-    from bspinn.fit import FitConfig, Problem, _wrap, fit_pinn, fit_wires, make_pinn
+    from bspinn.fit import Problem, _wrap, fit_pinn, fit_wires, make_pinn
     d, _, _ = make_synthetic(8, (256, 256), noise=0.01)
-    cfg = FitConfig(calib=24, log_every=10 ** 6, device=dev, compile=MODE["compile"], tf32=MODE["tf32"])
+    cfg = _cfg(calib=24, device=dev)
     from bspinn import accel; accel.configure(cfg)
     d.prewhiten(); prob = Problem(d, cfg)
-    fit_wires(prob, cfg, 1, 3, **QUIET)                                       # warm-up / compile
-    (w, m, _, _), tw = timed(dev, lambda: fit_wires(prob, cfg, 1, n, **QUIET), n)
+    (w, m, _, _), tw, cw = per_iter(dev, lambda k: fit_wires(prob, cfg, 1, k, **QUIET), n)
     pinn = make_pinn(prob, cfg, w, 1); wr = _wrap(pinn, prob, cfg, prev=w)
-    fit_pinn(prob, cfg, wr, m, iters=3, **QUIET)
-    _, tp = timed(dev, lambda: fit_pinn(prob, cfg, wr, m, iters=n, **QUIET), n)
+    _, tp, cp = per_iter(dev, lambda k: fit_pinn(prob, cfg, wr, m, iters=k, **QUIET), n)
     pts = torch.from_numpy(np.asarray(d.geom.grid(), np.float32).reshape(-1, 3))      # full-res 256^2 grid
     pinn.to(dev)
     pinn.sensitivity_batched(pts.to(dev))
     _, te = timed(dev, lambda: pinn.sensitivity_batched(pts.to(dev)), 1)
-    return {"wire_ms_per_it": tw, "pinn_ms_per_it": tp, "maps_eval_ms": te}
+    return {"wire_ms_per_it": tw, "pinn_ms_per_it": tp, "maps_eval_ms": te,
+            "wire_first_call_s": cw, "pinn_first_call_s": cp}
 
 
 def bench_joint(dev, n):
@@ -144,49 +160,89 @@ def bench_joint(dev, n):
 
 
 def bench_3d(dev, n, helmholtz):
-    from bspinn.fit import FitConfig, fit_pinn, fit_wires, make_pinn
+    from bspinn.fit import fit_pinn, fit_wires, make_pinn
     from bspinn.models import tissue_k2
     from bspinn.volume import CoarseCorrection, Problem3D, make_synthetic3d
     if helmholtz:
         k2 = tissue_k2(3.0, 50, 0.6, 0.12)
         d, _, _ = make_synthetic3d(8, (32, 32, 32), noise=0.01, wave_k2=k2, voxel=(7.5,) * 3, normalise="object")
-        cfg = FitConfig(calib=(12, 12, 12), physics="helmholtz", log_every=10 ** 6, device=dev)
+        cfg = _cfg(calib=(12, 12, 12), physics="helmholtz", device=dev)
     else:
         d, _, _ = make_synthetic3d(8, (48, 48, 48), noise=0.01)
-        cfg = FitConfig(calib=(12, 12, 12), log_every=10 ** 6, device=dev)
-    cfg.compile, cfg.tf32 = MODE["compile"], MODE["tf32"]
+        cfg = _cfg(calib=(12, 12, 12), device=dev)
     from bspinn import accel; accel.configure(cfg)
     d.prewhiten(); prob = Problem3D(d, cfg)
-    fit_wires(prob, cfg, 1, 2, **QUIET)
-    (w, m, _, _), tw = timed(dev, lambda: fit_wires(prob, cfg, 1, n, **QUIET), n)
+    (w, m, _, _), tw, cw = per_iter(dev, lambda k: fit_wires(prob, cfg, 1, k, **QUIET), n)
     p = make_pinn(prob, cfg, w, 1); cc = CoarseCorrection(p, prob)
-    fit_pinn(prob, cfg, cc, m, iters=2, **QUIET)
-    _, tp = timed(dev, lambda: fit_pinn(prob, cfg, cc, m, iters=n, **QUIET), n)
-    return {"wire_ms_per_it": tw, "pinn_ms_per_it": tp}
+    _, tp, cp = per_iter(dev, lambda k: fit_pinn(prob, cfg, cc, m, iters=k, **QUIET), n)
+    return {"wire_ms_per_it": tw, "pinn_ms_per_it": tp, "wire_first_call_s": cw, "pinn_first_call_s": cp}
 
 
 MODE = {"compile": False, "tf32": False}
 
 
+def check_syncs(dev, iters=6):
+    """Host-device synchronisations inside the training loops (torch.cuda.set_sync_debug_mode): where
+    they happen, per stage. Logging iterations (.item()) are excluded by a large log_every."""
+    import traceback
+    import warnings
+    from bspinn.data import make_synthetic
+    from bspinn.fit import Problem, fit_pinn, fit_wires, make_pinn
+    d, _, _ = make_synthetic(8, (128, 128), noise=0.01)
+    cfg = _cfg(calib=24, device=dev)
+    d.prewhiten(); prob = Problem(d, cfg)
+    w, m, _, _ = fit_wires(prob, cfg, 1, 2, **QUIET)
+    p = make_pinn(prob, cfg, w, 1)
+    sites = {}
+
+    def show(message, category, filename, lineno, file=None, line=None):
+        if "synchroniz" in str(message):
+            st = [f"{os.path.basename(f.filename)}:{f.lineno}" for f in traceback.extract_stack()
+                  if "bspinn" in f.filename and "bench_gpu" not in f.filename]
+            key = " < ".join(st[::-1][:3])
+            sites[key] = sites.get(key, 0) + 1
+    old = warnings.showwarning
+    warnings.showwarning = show
+    torch.cuda.set_sync_debug_mode(1)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            warnings.showwarning = show
+            fit_wires(prob, cfg, 1, iters + 1, **QUIET)
+            fit_pinn(prob, cfg, p, m, iters=iters + 1, **QUIET)
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+        warnings.showwarning = old
+    # the last iteration of each stage logs (2 .item() calls): expected
+    return {"syncs_per_2_stages_of_%d_it" % (iters + 1): sites}
+
+
 def child(a):
-    MODE.update(compile="compile" in a.mode, tf32="tf32" in a.mode)
-    n = 5 if a.quick else 20
+    base = a.mode.split("+")[0]
+    MODE.update(compile={"eager": False, "compile": True}.get(base, base), tf32="tf32" in a.mode)
+    n = 20 if a.quick else 100
     res = {}
-    for case in a.cases.split(","):
+    cases = a.cases.split(",")
+    if base == "eager" and torch.device(a.device).type == "cuda":
+        cases = ["syncs"] + cases
+    for case in cases:
+        if torch.device(a.device).type == "cuda":
+            torch.cuda.synchronize(a.device); torch.cuda.reset_peak_memory_stats(a.device)
         try:
-            if case == "2d":
+            if case == "syncs":
+                res[case] = check_syncs(a.device)
+            elif case == "2d":
                 res[case] = bench_2d(a.device, n)
             elif case == "joint":
-                res[case] = bench_joint(a.device, max(2, n // 4))
+                res[case] = bench_joint(a.device, max(2, n // 20))
             elif case == "3d":
-                res[case] = bench_3d(a.device, max(2, n // 4), False)
+                res[case] = bench_3d(a.device, n // 2, False)
             elif case == "helm":
-                res[case] = bench_3d(a.device, max(2, n // 4), True)
+                res[case] = bench_3d(a.device, n // 2, True)
         except Exception as e:                                     # report and carry on
             res[case] = {"error": f"{type(e).__name__}: {e}"}
         if torch.device(a.device).type == "cuda":
             res[case]["peak_mem_GB"] = torch.cuda.max_memory_allocated(a.device) / 1e9
-            torch.cuda.reset_peak_memory_stats(a.device)
     print("RESULT " + json.dumps(res), flush=True)
 
 
@@ -195,7 +251,8 @@ def main():
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--only", default="all", choices=["all", "correctness", "timings"])
     ap.add_argument("--cases", default="2d,joint,3d,helm")
-    ap.add_argument("--modes", default="eager,compile,compile+tf32")
+    ap.add_argument("--modes", default="eager,compile,reduce-overhead,reduce-overhead+tf32",
+                    help="comma list of eager | compile | reduce-overhead | max-autotune, each optionally +tf32")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--out", default="bench_gpu.json")
     ap.add_argument("--_child", action="store_true", help=argparse.SUPPRESS)
@@ -217,15 +274,25 @@ def main():
             print(f"timings: {mode}", flush=True)
             cmd = [sys.executable, os.path.abspath(__file__), "--_child", "--mode", mode, "--device", a.device,
                    "--cases", a.cases] + (["--quick"] if a.quick else [])
-            out = subprocess.run(cmd, capture_output=True, text=True)
+            env = dict(os.environ)
+            if mode.split("+")[0] != "eager":                    # report recompiles / skipped CUDA graphs
+                env["TORCH_LOGS"] = "recompiles,perf_hints"
+            out = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            diag = [l.strip()[:300] for l in out.stderr.splitlines()
+                    if "Recompiling function" in l or "skipping cudagraphs" in l.lower() or "graph break" in l.lower()]
             line = [l for l in out.stdout.splitlines() if l.startswith("RESULT ")]
             if not line:
                 report["timings"][mode] = {"error": out.stderr[-2000:]}
                 print("  failed:\n" + out.stderr[-2000:], flush=True)
                 continue
             r = json.loads(line[-1][7:])
+            if diag:
+                r["_compile_diagnostics"] = {"count": len(diag), "first": diag[:20]}
             report["timings"][mode] = r
             for case, v in r.items():
+                if isinstance(v, dict) and "first" in v:
+                    print(f"  compile diagnostics: {v['count']} lines (see {a.out})", flush=True)
+                    continue
                 print(f"  {case:6s} " + ", ".join(f"{k} {x:.1f}" if isinstance(x, float) else f"{k} {x}"
                                                 for k, x in v.items()), flush=True)
     json.dump(report, open(a.out, "w"), indent=1)

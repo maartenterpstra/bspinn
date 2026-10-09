@@ -726,43 +726,50 @@ def test_taylor_mode_matches_autograd():
     assert torch.allclose(hp.physics_loss(pts), want, rtol=1e-4)
 
 
-def test_compiled_kernels_match_eager():
-    """accel.enable_compile (torch.compile of the Biot-Savart, wave-wire and Taylor-mode kernels) gives
-    the same fields, physics losses and parameter gradients as eager execution."""
-    import pytest
-    from bspinn import accel
-    from bspinn.models import HarmonicPINN, HelmholtzPINN, WireLoopCoils, WaveWireLoopCoils
+def test_compiled_step_matches_eager():
+    """cfg.compile: the whole iteration (forward + backward) compiled once per stage gives the same
+    optimisation trajectory as eager execution (wires and PINN stage, multi-slice batches included)."""
+    import copy
+    from bspinn.data import make_synthetic
+    from bspinn.fit import FitConfig, Problem, fit_pinn, fit_wires, make_pinn
+    d, _, _ = make_synthetic(4, (24, 24), n_slices=3, noise=0.01)
+    d.prewhiten()
+    out = {}
+    for comp in (False, True):
+        cfg = FitConfig(calib=12, log_every=1, compile=comp, compile_min_iters=0, slice_batch=2, n_colloc=64)
+        prob = Problem(copy.deepcopy(d), cfg)
+        try:
+            w, m, hw, _ = fit_wires(prob, cfg, 1, 4, log=lambda *a: None)
+            p = make_pinn(prob, cfg, w, 1)
+            torch.nn.init.normal_(p.net[-1].weight, std=0.05)
+            m, hp = fit_pinn(prob, cfg, p, m, log=lambda *a: None, iters=4)
+        except Exception as e:                               # no C++ toolchain / unsupported platform
+            if comp:
+                pytest.skip(f"torch.compile unavailable: {e}")
+            raise
+        out[comp] = ([h["data"] for h in hw], [h["data"] for h in hp], p.base.verts.detach().clone())
+    for a, b in zip(out[False][:2], out[True][:2]):
+        assert np.allclose(a, b, rtol=1e-3), (a, b)
+    assert torch.allclose(out[False][2], out[True][2], atol=1e-4)
+
+
+def test_physics_loss_pair_matches_two_calls():
+    """physics_loss_pair (object + air collocation in one network pass) == two physics_loss calls."""
+    from bspinn.models import HarmonicPINN, HelmholtzPINN, WaveWireLoopCoils, WireLoopCoils
     torch.manual_seed(0)
     w = WireLoopCoils(3, 1, 8, 1)
     with torch.no_grad():
         w.verts.normal_(0, 0.3); w.verts.add_(torch.tensor([1.5, 0, 0])); w.amp.fill_(1)
-    p = HarmonicPINN(3, "complex", 6, 32, 3, 1, base=w)
-    torch.nn.init.normal_(p.net[-1].weight, std=0.1)
-    hp = HelmholtzPINN(3, 6, 32, 3, 1, base=w, k2_init=0.5 - 0.2j)
     ww = WaveWireLoopCoils(3, 1, 8, 1, k2_init=2 - 1j)
     with torch.no_grad():
         ww.verts.copy_(w.verts); ww.amp.fill_(1)
-    pts = torch.randn(64, 3) * 0.4
-
-    def run():
-        out = []
-        for mdl, f in ((p, lambda: p.physics_loss(pts) + p.field(pts).pow(2).mean()),
-                       (hp, lambda: hp.physics_loss(pts)),
-                       (w, lambda: w.field(pts).pow(2).mean()),
-                       (ww, lambda: ww.field(pts).pow(2).mean())):
-            mdl.zero_grad()
-            v = f(); v.backward()
-            out.append((v.detach().clone(), [torch.zeros_like(q) if q.grad is None else q.grad.clone() for q in mdl.parameters()]))
-        return out
-
-    ref = run()
-    try:
-        accel.enable_compile()
-        got = run()
-    except Exception as e:                                   # no C++ toolchain / unsupported platform
-        pytest.skip(f"torch.compile unavailable: {e}")
-    finally:
-        accel.disable_compile()
-    for (v0, g0), (v1, g1) in zip(ref, got):
-        assert torch.allclose(v0, v1, rtol=1e-4, atol=1e-7)
-        assert all(torch.allclose(a, b, rtol=1e-3, atol=1e-6) for a, b in zip(g0, g1))
+    for m in (HarmonicPINN(3, "real", 6, 32, 3, 1, base=w), HarmonicPINN(3, "complex", 6, 32, 3, 1, base=w),
+              HelmholtzPINN(3, 6, 32, 3, 1, base=w, k2_init=.5 - .2j), HelmholtzPINN(3, 6, 32, 3, 1, base=ww)):
+        torch.nn.init.normal_(m.net[-1].weight, std=0.1)
+        a, b = torch.randn(40, 3) * .4, torch.randn(13, 3) * .8
+        ps = [q for q in m.parameters() if q.requires_grad]
+        l1 = m.physics_loss(a) + 0.25 * m.physics_loss(b)
+        l2 = m.physics_loss_pair(a, b, 0.25)
+        g1 = torch.autograd.grad(l1, ps, allow_unused=True); g2 = torch.autograd.grad(l2, ps, allow_unused=True)
+        assert torch.allclose(l1, l2, rtol=1e-5)
+        assert all((x is None and y is None) or torch.allclose(x, y, rtol=1e-4, atol=1e-6) for x, y in zip(g1, g2))

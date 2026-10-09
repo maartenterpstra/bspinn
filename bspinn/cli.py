@@ -121,7 +121,8 @@ def main(argv=None):
     pm.add_argument("--normalise", default="rss", choices=["rss", "none"])
     pm.add_argument("--phase-ref", default="inati", choices=["inati", "model", "coil"])
     pm.add_argument("--device", default="cpu", help="cpu | cuda | cuda:1 ...")
-    pm.add_argument("--compile", action="store_true", help="torch.compile the hot kernels (first iterations compile)")
+    pm.add_argument("--compile", nargs="?", const=True, default=False, metavar="MODE",
+                    help="torch.compile each stage's iteration; MODE: default | reduce-overhead (CUDA graphs) | max-autotune")
     pm.add_argument("--tf32", action="store_true", help="TF32 matmuls on Ampere+ GPUs")
     pm.add_argument("--threads", type=int, default=0)
     pm.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="any FitConfig field, e.g. iters_pinn=1000")
@@ -265,6 +266,9 @@ def _run_maps(a):
         if key not in defaults:
             raise SystemExit(f"unknown option {key}")
         t = type(defaults[key])
+        if key == "compile" and val.lower() not in ("0", "1", "true", "false", "yes", "no"):
+            over[key] = val                                       # a torch.compile mode
+            continue
         over[key] = (val.lower() in ("1", "true", "yes")) if t is bool else t(val)
     over.setdefault("compile", a.compile)
     over.setdefault("tf32", a.tf32)

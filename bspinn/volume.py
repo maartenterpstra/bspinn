@@ -331,6 +331,10 @@ class CoarseCorrection(CoilModel):
     def physics_loss(self, points):
         return self.pinn.physics_loss(points)
 
+    def physics_loss_pair(self, p1, p2, w2):
+        f = getattr(self.pinn, "physics_loss_pair", None)
+        return f(p1, p2, w2) if f else self.pinn.physics_loss(p1) + w2 * self.pinn.physics_loss(p2)
+
 
 # ===================================================================================== driver
 B0_ORIENTATIONS = {0: "zyx", 1: "yzx", 2: "yxz"}      # B0 (z) along array axis 0 / 1 / 2

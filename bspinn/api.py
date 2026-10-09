@@ -91,7 +91,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         (``acs=`` to change it), and never samples outside the acquired data. The fit then uses every
         acquired sample in its calibration grid; ``return_image`` unfolds the rest by CG-SENSE.
         ``info['mask']``, ``info['R_effective']`` report what was used.
-    cfg_overrides : any other FitConfig field (e.g. lambda_phys=0.1, field_mode='complex').
+    cfg_overrides : any other FitConfig field (e.g. lambda_phys=0.1, field_mode='complex'). GPU:
+        compile=True | 'reduce-overhead' (torch.compile of each stage's iteration, + CUDA graphs),
+        tf32=True (README §8.2).
 
     Returns
     -------

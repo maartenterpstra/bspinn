@@ -102,8 +102,9 @@ def fit_shared(files, cfg: FitConfig, out_dir, slices_per_volume=0, steps=3000, 
         pinn = HarmonicPINN(prob.N_model, cfg.field_mode, cfg.latent, cfg.width, cfg.depth, h, base=wires, net=trunk).to(cfg.device)
         vols.append({"path": p, "data": data, "prob": prob, "pinn": pinn, "h": h})
     own = [q for v in vols for n, q in v["pinn"].named_parameters() if not n.startswith("net.")]
-    opt = torch.optim.Adam([{"params": trunk.parameters(), "lr": cfg.lr_pinn},
-                            {"params": own, "lr": cfg.lr_pinn}])
+    from . import accel
+    opt = accel.adam([{"params": trunk.parameters(), "lr": cfg.lr_pinn},
+                      {"params": own, "lr": cfg.lr_pinn}], cfg.device)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps, eta_min=0.1 * cfg.lr_pinn)
     gen = torch.Generator(device=cfg.device).manual_seed(cfg.seed + 7)       # collocation sampled on-device
     slice_rng = np.random.default_rng(cfg.seed + 8)                            # slice choice on the host
