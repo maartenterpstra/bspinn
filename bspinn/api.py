@@ -235,17 +235,23 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
 def _select_plane(kst, mst, spacing, noise, cfg, log, meta=None):
     """kst (S,N,X,Y), mst (S,1,X,Y) or None. Returns (plane, scores)."""
     from .data import MultiCoilData
-    from .fit import Problem, fit_wires
+    from .fit import Problem, fit_wires_many
     from .geometry import SliceGeometry
     S, N, X, Y = kst.shape
-    scores = {}
-    for pl in ("axial", "coronal", "coronal_t"):
+    scores, hscores, items = {}, {}, []
+    planes = ("axial", "coronal", "coronal_t")
+    for pl in planes:
         d = MultiCoilData(kst.copy(), SliceGeometry((X, Y), spacing, np.zeros(S), pl), mask=mst, noise=noise,
                           meta=dict(meta or {}))
         d.prewhiten()
         prob = Problem(d, cfg).to(cfg.device)
-        scores[pl] = min(fit_wires(prob, cfg, h, cfg.iters_auto, log=lambda *a: None)[3] for h in (1, -1))
+        items += [(prob, 1), (prob, -1)]
+    res = fit_wires_many(items, cfg, cfg.iters_auto)               # 6 probes, concurrently on a GPU
+    for i, pl in enumerate(planes):
+        hscores[pl] = {1: res[2 * i][3], -1: res[2 * i + 1][3]}
+        scores[pl] = min(hscores[pl].values())
     best = min(scores, key=scores.get)
+    meta_out = {"handedness_scores": hscores[best]}
     log("B0 orientation (plane) scores: " + ", ".join(f"{k} {v:.3e}" for k, v in scores.items()) + f" -> {best}")
     if best != "axial" and min(scores["coronal"], scores["coronal_t"]) > 0.85 * max(scores["coronal"], scores["coronal_t"]):
         import warnings
@@ -254,7 +260,7 @@ def _select_plane(kst, mst, spacing, noise, cfg, log, meta=None):
                f"{scores['coronal_t']:.3e}); picked {best!r}. Pass plane= if you know the acquisition.")
         warnings.warn(msg)
         log("warning: " + msg)
-    return best, scores
+    return best, scores, meta_out
 
 
 def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
@@ -265,7 +271,13 @@ def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
     scores = None
     if plane == "auto":
         with accel.phase("plane_search", cfg.device):
-            plane, scores = _select_plane(ksp[None], None if mask is None else mask[None, None], spacing, noise, cfg, log)
+            plane, scores, ps = _select_plane(ksp[None], None if mask is None else mask[None, None], spacing, noise,
+                                              cfg, log)
+        if cfg.handedness == 0:     # the plane search fitted both handednesses on exactly this problem: reuse
+            hs = ps["handedness_scores"]
+            cfg = copy.copy(cfg)
+            cfg.handedness = min(hs, key=hs.get)
+            log(f"handedness from the plane search: {cfg.handedness:+d} (data loss +1: {hs[1]:.3e}, -1: {hs[-1]:.3e})")
     geom = SliceGeometry((X, Y), spacing, np.zeros(1), plane)
     data = MultiCoilData(ksp[None], geom, mask=None if mask is None else mask[None, None], noise=noise)
     model, prob, hist, extra = fit(data, cfg, log=log)
@@ -313,7 +325,7 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     scores = None
     if plane == "auto":
         mt_ = mt if mt is not None else (np.abs(kt).sum(1, keepdims=True) > 0)
-        plane, scores = _select_plane(kt, mt_, spacing, noise, cfg, log, meta={"dynamic": True})
+        plane, scores, _ = _select_plane(kt, mt_, spacing, noise, cfg, log, meta={"dynamic": True})
     geom = SliceGeometry((X, Y), spacing, np.zeros(T), plane)               # frames = co-located slices
     data = MultiCoilData(kt, geom, mask=mt, noise=noise, meta={"dynamic": True})
     if mt is None:

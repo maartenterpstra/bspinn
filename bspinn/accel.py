@@ -109,7 +109,65 @@ def capturable_adam(groups, device, default_lr=1e-3):
         out.append({**g, "params": list(g["params"]), "lr": torch.tensor(lr, device=device)})
     if torch.device(device).type != "cuda":           # CPU emulation (tests): same algorithm, no capture
         return torch.optim.Adam(out, foreach=False), base
+    # real parameters: fused Adam (one multi-tensor kernel); complex ones (the image): capturable foreach
+    real = [{**g, "params": [p for p in g["params"] if not p.is_complex()]} for g in out]
+    cplx = [{**g, "params": [p for p in g["params"] if p.is_complex()]} for g in out]
+    if any(g["params"] for g in cplx) and any(g["params"] for g in real):
+        try:
+            return _GroupedAdam(torch.optim.Adam(real, capturable=True, fused=True),
+                                torch.optim.Adam(cplx, capturable=True, foreach=True)), base
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    elif not any(g["params"] for g in cplx):
+        try:
+            return torch.optim.Adam(out, capturable=True, fused=True), base
+        except (RuntimeError, TypeError, ValueError):
+            pass
     return torch.optim.Adam(out, capturable=True, foreach=True), base
+
+
+class _GroupedAdam:
+    """Two Adam instances with matching param_groups (same order as the caller's groups), stepped together."""
+
+    def __init__(self, a, b):
+        self.opts = (a, b)
+
+    @property
+    def param_groups(self):
+        return _ZipGroups(self.opts[0].param_groups, self.opts[1].param_groups)
+
+    def zero_grad(self, set_to_none=True):
+        for o in self.opts:
+            o.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        for o in self.opts:
+            o.step()
+
+
+class _ZipGroups(list):
+    """param_groups view for the learning-rate updates: group i of both optimizers shares one lr tensor."""
+
+    def __init__(self, ga, gb):
+        super().__init__([_LrPair(a, b) for a, b in zip(ga, gb)])
+
+
+class _LrPair(dict):
+    def __init__(self, a, b):
+        super().__init__(lr=_FillBoth(a["lr"], b["lr"]))
+
+
+class _FillBoth:
+    def __init__(self, *ts):
+        self.ts = ts
+
+    def fill_(self, v):
+        for t in self.ts:
+            t.fill_(v)
+
+    @property
+    def is_cuda(self):
+        return self.ts[0].is_cuda
 
 
 def cosine_lr(base, eta_min, it, T):
@@ -118,7 +176,8 @@ def cosine_lr(base, eta_min, it, T):
     return eta_min + (base - eta_min) * (1 + math.cos(math.pi * it / T)) / 2
 
 
-def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, after=None, warmup=3, log=print):
+def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, after=None, warmup=3, log=print,
+                  post=None):
     """Run ``iters`` iterations of  out = step(); out[0].backward(); opt.step()  with the iterations after
     ``warmup`` replayed from one CUDA graph (forward, backward and optimizer: one launch per iteration).
 
@@ -126,6 +185,8 @@ def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, aft
              with the graph, so every replay draws new numbers) and reads per-iteration inputs from static
              tensors that ``before(it)`` fills (device-to-device copies) before each iteration.
     after(it, out): called after every iteration with the (static) outputs, e.g. for logging.
+    post(): optional work after the optimizer step, inside the graph (e.g. an in-place image update).
+    step() may run partial backward passes itself (gradients accumulate); out[0] is backpropagated last.
     If capture fails (an operation that is not capturable), the remaining iterations run eagerly.
     Returns the outputs of the last iteration."""
     def set_lr(it):
@@ -140,6 +201,8 @@ def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, aft
         out = step()
         out[0].backward()
         opt.step()
+        if post:
+            post()
         if after:
             after(it, out)
         return out
@@ -167,6 +230,8 @@ def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, aft
             static = step()
             static[0].backward()
             opt.step()
+            if post:
+                post()
     except Exception as e:                           # not capturable: carry on eagerly
         STATS["fallback"] += 1
         STATS["last_error"] = f"{type(e).__name__}: {str(e)[:300]}"
@@ -185,3 +250,78 @@ def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, aft
         if after:
             after(it, static)
     return static
+
+
+def train_graphed_many(jobs, warmup=3, log=print):
+    """Several independent train_graphed jobs (tuples of its positional arguments) with their replays
+    interleaved on one CUDA stream each, so that small stages run concurrently on the GPU. Results equal
+    running the jobs one after another. CPU emulation and capture failures: sequential / eager."""
+    if not jobs:
+        return []
+    if not jobs[0][1].param_groups[0]["lr"].is_cuda:
+        return [train_graphed(*j, warmup=warmup, log=log) for j in jobs]
+    cur = torch.cuda.current_stream()
+    streams = [torch.cuda.Stream() for _ in jobs]
+    state = []
+    for (step, opt, base, eta, iters, gens, before, after), s in zip(jobs, streams):
+        def set_lr(it, opt=opt, base=base, eta=eta, iters=iters):
+            for g, b in zip(opt.param_groups, base):
+                g["lr"].fill_(cosine_lr(b, eta, it, iters))
+
+        def eager(it, step=step, opt=opt, before=before, after=after, set_lr=set_lr):
+            set_lr(it)
+            if before:
+                before(it)
+            opt.zero_grad(set_to_none=True)
+            out = step()
+            out[0].backward()
+            opt.step()
+            if after:
+                after(it, out)
+            return out
+        s.wait_stream(cur)
+        st = {"eager": eager, "set_lr": set_lr, "iters": iters, "before": before, "after": after, "out": None}
+        with torch.cuda.stream(s):
+            for it in range(min(warmup, iters)):
+                st["out"] = eager(it)
+        try:
+            g = torch.cuda.CUDAGraph()
+            for gen in gens:
+                g.register_generator_state(gen)
+            with torch.cuda.stream(s):
+                set_lr(warmup)
+                if before:
+                    before(warmup)
+                opt.zero_grad(set_to_none=True)
+            with torch.cuda.graph(g, stream=s):
+                static = step()
+                static[0].backward()
+                opt.step()
+            st["graph"], st["static"] = g, static
+            STATS["captured"] += 1
+        except Exception as e:
+            STATS["fallback"] += 1
+            STATS["last_error"] = f"{type(e).__name__}: {str(e)[:300]}"
+            log(f"CUDA graph capture failed ({type(e).__name__}: {str(e)[:200]}); this stage continues eagerly")
+            torch.cuda.synchronize()
+            st["graph"] = None
+        state.append(st)
+    for it in range(warmup, max(st["iters"] for st in state)):
+        for st, s in zip(state, streams):
+            if it >= st["iters"]:
+                continue
+            with torch.cuda.stream(s):
+                if st["graph"] is None:
+                    st["out"] = st["eager"](it)
+                    continue
+                if it > warmup:
+                    st["set_lr"](it)
+                    if st["before"]:
+                        st["before"](it)
+                st["graph"].replay()
+                st["out"] = st["static"]
+                if st["after"]:
+                    st["after"](it, st["static"])
+    for s in streams:
+        cur.wait_stream(s)
+    return [st["out"] for st in state]

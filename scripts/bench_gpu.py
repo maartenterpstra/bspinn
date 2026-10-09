@@ -86,28 +86,50 @@ def hp_loss(m, x):
 
 
 def check_end_to_end(dev, quick):
+    """estimate_maps end to end: subspace error against the ground truth, wall time, per-phase times
+    (info['timings']), CUDA-graph captures; a host profile of the 2-D fast GPU run."""
     from bspinn.api import estimate_maps
     from bspinn.data import make_synthetic
     from bspinn.recon import subspace_error
+    from bspinn.volume import make_synthetic3d
     d, gt, obj = make_synthetic(8, (128, 128), noise=0.01)
-    k = d.kspace[0]
-    sup = torch.from_numpy((np.abs(obj[:1]) > 0).astype(np.float32))           # object support
+    k2 = d.kspace[0]
+    sup2 = torch.from_numpy((np.abs(obj[:1]) > 0).astype(np.float32))
+    cuda = torch.device(dev).type == "cuda"
+    q = {"iters_pinn": 150, "iters_wires": 100} if quick else {}
+    runs = [("2d fast cpu", "2d", "cpu", dict(quality="fast", **q)),
+            ("2d fast eager", "2d", dev, dict(quality="fast", cuda_graph=False, **q))]
+    if cuda:
+        runs.append(("2d fast cuda_graph", "2d", dev, dict(quality="fast", **q)))
+        if not quick:
+            runs += [("2d default cuda_graph", "2d", dev, dict(quality="default")),
+                     ("2d default cuda_graph+compile", "2d", dev, dict(quality="default", compile=True)),
+                     ("2d fast solve_image cuda_graph", "2d", dev, dict(quality="fast", solve_image=True)),
+                     ("3d fast cuda_graph", "3d", dev, dict(quality="fast", axes="auto"))]
+    d3 = gt3 = sup3 = None
     res = {}
-    runs = [("cpu", "cpu", {}), (dev, dev, {"cuda_graph": False})]
-    if torch.device(dev).type == "cuda":
-        runs.append((dev + " cuda_graph", dev, {"cuda_graph": True}))
-    for name, device, extra in runs:
+    for name, layout, device, kw in runs:
         import cProfile
         import pstats
-        pr = cProfile.Profile() if "cuda_graph" in name else None   # where the wall time goes (host view)
+        if layout == "3d" and d3 is None:
+            d3, gt3, obj3 = make_synthetic3d(8, (48, 48, 48), noise=0.01)
+            sup3 = torch.from_numpy((np.abs(obj3) > 0).astype(np.float32))
+        pr = cProfile.Profile() if name == "2d fast cuda_graph" else None   # where the wall time goes (host)
         t = time.time()
         if pr:
             pr.enable()
-        C, info = estimate_maps(k, "2d", calib=24, quality="fast", device=device, verbose=False,
-                                **({"iters_pinn": 150, "iters_wires": 100} if quick else {}), **extra)
+        if layout == "2d":
+            out = estimate_maps(k2, "2d", calib=24, device=device, verbose=False, **kw)
+        else:
+            out = estimate_maps(d3.kspace, "3d", calib=12, device=device, verbose=False, **kw)
         if pr:
             pr.disable()
-        e = subspace_error(torch.from_numpy(C)[None], torch.from_numpy(gt[:1]), sup)
+        C, info = out[0], out[-1]
+        if layout == "2d":
+            e = subspace_error(torch.from_numpy(C)[None], torch.from_numpy(gt[:1]), sup2)
+        else:      # volumes: first spatial axis as the "slice" axis of the metric
+            e = subspace_error(torch.from_numpy(C).permute(1, 0, 2, 3), torch.from_numpy(gt3).permute(1, 0, 2, 3),
+                               sup3.reshape(gt3.shape[1:]))
         from bspinn import accel
         res[name] = {"subspace_err": e, "seconds": time.time() - t, "phase_seconds": info.get("timings"),
                      "cuda_graph_stats": dict(accel.STATS)}
@@ -118,13 +140,9 @@ def check_end_to_end(dev, quick):
             res[name]["cprofile_top_cumulative"] = [
                 {"function": f"{os.path.basename(f)}:{ln}({fn})", "calls": v[1], "cum_s": round(v[3], 3),
                  "self_s": round(v[2], 3)} for (f, ln, fn), v in top]
-            top = sorted(st.stats.items(), key=lambda kv: -kv[1][2])[:25]
-            res[name]["cprofile_top_self"] = [
-                {"function": f"{os.path.basename(f)}:{ln}({fn})", "calls": v[1], "self_s": round(v[2], 3)}
-                for (f, ln, fn), v in top]
         ph = info.get("timings") or {}
-        print(f"  estimate_maps 128^2 on {name:18s}: subspace error {e:.2e}, {time.time() - t:.1f} s  "
-              + " ".join(f"{a} {b:.1f}" for a, b in ph.items()), flush=True)
+        print(f"  {name:32s}: subspace error {e:.2e}, {time.time() - t:6.1f} s  "
+              + " ".join(f"{a} {b:.2f}" for a, b in ph.items()), flush=True)
     return res
 
 
@@ -165,12 +183,40 @@ def bench_2d(dev, n):
     pinn = make_pinn(prob, cfg, w, 1); wr = _wrap(pinn, prob, cfg, prev=w)
     _, tp, cp = per_iter(dev, lambda k: fit_pinn(prob, cfg, wr, m, iters=k, **QUIET), n)
     prof = profile_stage(dev, lambda: fit_pinn(prob, cfg, wr, m, iters=12, **QUIET))
+    prof["per_iteration_device_us_by_kernel"] = kernel_breakdown(
+        dev, lambda k: fit_pinn(prob, cfg, wr, m, iters=k, **QUIET), 12, 52)
     pts = torch.from_numpy(np.asarray(d.geom.grid(), np.float32).reshape(-1, 3))      # full-res 256^2 grid
     pinn.to(dev)
     pinn.sensitivity_batched(pts.to(dev))
     _, te = timed(dev, lambda: pinn.sensitivity_batched(pts.to(dev)), 1)
     return {"wire_ms_per_it": tw, "pinn_ms_per_it": tp, "maps_eval_ms": te,
             "wire_first_call_s": cw, "pinn_first_call_s": cp, "pinn_profile_12_it": prof}
+
+
+def kernel_breakdown(dev, run, k1, k2):
+    """Device time per iteration by kernel, from profiles of runs with k1 and k2 iterations (the difference
+    removes warm-up, capture and setup): what one steady-state iteration (e.g. a graph replay) consists of."""
+    if torch.device(dev).type != "cuda":
+        return {}
+    from torch.profiler import ProfilerActivity, profile
+
+    def kern(k):
+        with profile(activities=[ProfilerActivity.CUDA]) as pr:
+            run(k)
+            sync(dev)
+        out = {}
+        for e in pr.events():
+            if e.device_type.name == "CUDA":
+                out[e.name[:90]] = out.get(e.name[:90], 0.0) + e.device_time_total if hasattr(e, "device_time_total") \
+                    else out.get(e.name[:90], 0.0) + e.cuda_time_total
+        return out
+    try:
+        a, b = kern(k1), kern(k2)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    diff = {n: (b.get(n, 0.0) - a.get(n, 0.0)) / (k2 - k1) for n in b}
+    top = sorted(diff.items(), key=lambda kv: -kv[1])[:25]
+    return {"total_us": sum(v for v in diff.values() if v > 0), "top": [{"kernel": n, "us": round(v, 2)} for n, v in top]}
 
 
 def profile_stage(dev, run):

@@ -576,7 +576,7 @@ def test_plane_auto_finds_inplane_b0():
     from bspinn.data import make_synthetic
     from bspinn.fit import FitConfig
     d, _, _ = make_synthetic(8, (48, 48), plane="coronal", noise=0.005)
-    best, sc = _select_plane(d.kspace, None, (1.0, 1.0), None, FitConfig(calib=16, iters_auto=60), lambda *a: None)
+    best, sc, _ = _select_plane(d.kspace, None, (1.0, 1.0), None, FitConfig(calib=16, iters_auto=60), lambda *a: None)
     assert best in ("coronal", "coronal_t") and sc["axial"] > min(sc.values()), sc
 
 

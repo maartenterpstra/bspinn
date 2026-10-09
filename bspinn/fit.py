@@ -497,6 +497,25 @@ def _image_param(prob, C0, K, m_prev=None):
 
 # ===================================================================================== wires
 def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=print, tag="wires"):
+    """Wire-loop stage: (model, image parameter or None, history, final data loss)."""
+    spec = _wires_setup(prob, cfg, handedness, iters, log, tag)
+    return spec["finish"](_run_stage(*spec["stage"]))
+
+
+def fit_wires_many(items, cfg: FitConfig, iters: int, log=None):
+    """Independent wire stages, e.g. the plane / orientation / handedness probes: items = [(prob, h), ...].
+    Same results as calling fit_wires for each in turn; on CUDA with graphs the stages are captured once
+    each and their replays interleaved on separate streams (small problems: they run concurrently)."""
+    quiet = log or (lambda *a, **k: None)
+    specs = [_wires_setup(p, cfg, h, iters, quiet, "wires") for p, h in items]
+    if len(specs) > 1 and all(_graph_ok(sp["stage"]) for sp in specs):
+        outs = accel.train_graphed_many([_graph_job(*sp["stage"]) for sp in specs], log=quiet)
+    else:
+        outs = [_run_stage(*sp["stage"]) for sp in specs]
+    return [sp["finish"](o) for sp, o in zip(specs, outs)]
+
+
+def _wires_setup(prob, cfg, handedness, iters, log, tag):
     torch.manual_seed(cfg.seed)
     gen = _device_gen(prob, cfg.seed + 5)
     if getattr(cfg, "physics", "laplace") == "helmholtz":
@@ -545,10 +564,9 @@ def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=pr
             _log(hist, it, data=d.item(), outside=out.item(), curv=curv.item())
             log(f"[{tag} h={handedness:+d}] it {it:5d}  data {d.item():.4e}  outside {out.item():.2e}")
 
-    o = _run_stage(prob, cfg, iters, params, 0.05 * cfg.lr_wires, step_loss, lambda: (),
-                   [_batch(prob, cfg, gen) for _ in range(iters)], [gen], after)
-    d = o[1]
-    return model, m, hist, float(d.detach())
+    stage = (prob, cfg, iters, params, 0.05 * cfg.lr_wires, step_loss, lambda: (),
+             [_batch(prob, cfg, gen) for _ in range(iters)], [gen], after)
+    return {"stage": stage, "finish": lambda o: (model, m, hist, float(o[1].detach()))}
 
 
 # ===================================================================================== pinn
@@ -760,11 +778,11 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
     ynorm = float((y.abs() ** 2).sum())
     params = [q for q in model.parameters() if q.requires_grad]
     lr = cfg.lr_joint or cfg.lr_pinn
-    opt = accel.adam(params, dev, lr=lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, cfg.iters_joint, eta_min=0.1 * lr)
     hist = []
-    for it in range(cfg.iters_joint):
-        opt.zero_grad()
+    state = {}
+
+    def step():
+        """One map step for the current image x (partial backward passes happen inside; returns the rest)."""
         C, Cg = maps(True)
         if hybrid and single:                                              # one graph, one wire-field pass
             C = maps_from_field(wire_field(pts_full) + correction_up())
@@ -807,12 +825,31 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         for w in wires:
             out, _ = w.regularisers(prob.keep, cfg.outside_margin)
             rest = rest + cfg.lambda_outside * out
-        rest.backward(); opt.step(); sched.step()
+        state["C"] = C
+        return rest, d
+
+    def post():                                                            # image update for the new maps
         with torch.no_grad():
-            x = _cg_image(C.detach(), y, M, box, lam, x, cfg.joint_cg)
+            x.copy_(_cg_image(state["C"].detach(), y, M, box, lam, x, cfg.joint_cg))
+
+    def after(it, o):
         if it % cfg.log_every == 0 or it == cfg.iters_joint - 1:
-            _log(hist, it, data=d.item())
-            log(f"[joint full-res] it {it:5d}  data {d.item():.4e}")
+            _log(hist, it, data=o[1].item())
+            log(f"[joint full-res] it {it:5d}  data {o[1].item():.4e}")
+
+    if accel.graph_mode(cfg, dev, cfg.iters_joint):                        # the whole iteration, CG included
+        opt, base = accel.capturable_adam(params, dev, default_lr=lr)
+        accel.train_graphed(step, opt, base, 0.1 * lr, cfg.iters_joint, [gen], None, after,
+                            log=log, post=post)
+    else:
+        opt = accel.adam(params, dev, lr=lr)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, cfg.iters_joint, eta_min=0.1 * lr)
+        for it in range(cfg.iters_joint):
+            opt.zero_grad()
+            o = step()
+            o[0].backward(); opt.step(); sched.step()
+            post()
+            after(it, o)
     with torch.no_grad():
         C, _ = maps(False)
         x = _cg_image(C, y, M, box, lam, x, 20, check=True)
@@ -909,17 +946,8 @@ def _run_stage(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, af
     (cfg.compile; inside the graph: fused kernels replayed with one launch).
     Returns the outputs of the last iteration."""
     dev = prob.device
-    if accel.graph_mode(cfg, dev, iters) and not (sls[0] is not None and getattr(prob, "per_slice_traj", False)):
-        opt, base = accel.capturable_adam(groups, dev)
-        tab = None if sls[0] is None else torch.tensor(np.asarray(sls), device=dev)
-        static_sl = None if tab is None else tab[0].clone()
-
-        def before(it):
-            if tab is not None:
-                static_sl.copy_(tab[it])
-        fn = accel.compile_step(step_loss, cfg, iters)           # cfg.compile: fused kernels inside the graph
-        return accel.train_graphed(lambda: fn(static_sl, *draw()), opt, base, eta_min, iters, gens,
-                                   before, after, log=getattr(cfg, "_log", print))
+    if _graph_ok((prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, after)):
+        return accel.train_graphed(*_graph_job(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, after))
     opt = accel.adam(groups, dev)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters, eta_min=eta_min)
     step = accel.compile_step(step_loss, cfg, iters)
@@ -931,6 +959,25 @@ def _run_stage(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, af
         out[0].backward(); opt.step(); sched.step()
         after(it, out)
     return out
+
+
+def _graph_ok(stage):
+    prob, cfg, iters, sls = stage[0], stage[1], stage[2], stage[7]
+    return accel.graph_mode(cfg, prob.device, iters) and not (sls[0] is not None and getattr(prob, "per_slice_traj", False))
+
+
+def _graph_job(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, after):
+    """Arguments of accel.train_graphed for one stage: capturable Adam, static slice-batch tensor."""
+    dev = prob.device
+    opt, base = accel.capturable_adam(groups, dev)
+    tab = None if sls[0] is None else torch.tensor(np.asarray(sls), device=dev)
+    static_sl = None if tab is None else tab[0].clone()
+
+    def before(it):
+        if tab is not None:
+            static_sl.copy_(tab[it])
+    fn = accel.compile_step(step_loss, cfg, iters)               # cfg.compile: fused kernels inside the graph
+    return (lambda: fn(static_sl, *draw()), opt, base, eta_min, iters, gens, before, after)
 
 
 def _sl_arg(prob, sl, compiled):
@@ -994,8 +1041,8 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
     if h == 0:
         scores = {}
         with accel.phase("handedness_search", cfg.device):
-            for hh in (+1, -1):
-                _, _, _, scores[hh] = fit_wires(prob, cfg, hh, cfg.iters_auto, log=lambda *a: None)
+            r = fit_wires_many([(prob, +1), (prob, -1)], cfg, cfg.iters_auto)
+            scores = {+1: r[0][3], -1: r[1][3]}
         h = min(scores, key=scores.get)
         log(f"handedness auto-selected: {h:+d}  (data loss +1: {scores[1]:.3e}, -1: {scores[-1]:.3e})")
         history["handedness_scores"] = {str(k): v for k, v in scores.items()}

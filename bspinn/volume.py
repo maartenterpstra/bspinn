@@ -346,14 +346,21 @@ def select_orientation(data: VolumeData, cfg: FitConfig, log=print):
     """Unknown B0 direction: short wire fits with B0 along each array axis (both handednesses);
     the orientation with the lowest calibration data loss wins. Returns the axes string."""
     import copy
-    scores = {}
-    for ax, axes in B0_ORIENTATIONS.items():
+    from .fit import fit_wires_many
+    scores, hscores, items = {}, {}, []
+    names = list(B0_ORIENTATIONS.values())
+    for axes in names:
         d = copy.copy(data)
         d.geom = VolumeGeometry(data.geom.shape, data.geom.voxel, axes)
         prob = Problem3D(d, cfg).to(cfg.device)
-        scores[axes] = min(fit_wires(prob, cfg, hh, cfg.iters_auto, log=lambda *a: None)[3] for hh in (1, -1))
+        items += [(prob, 1), (prob, -1)]
+    res = fit_wires_many(items, cfg, cfg.iters_auto)               # 6 probes, concurrently on a GPU
+    for i, axes in enumerate(names):
+        hscores[axes] = {1: res[2 * i][3], -1: res[2 * i + 1][3]}
+        scores[axes] = min(hscores[axes].values())
     best = min(scores, key=scores.get)
     log("B0 orientation scores (data loss): " + ", ".join(f"{a} {v:.3e}" for a, v in scores.items()) + f" -> {best}")
+    select_orientation.last_handedness_scores = hscores[best]       # reused by fit3d (same problem)
     return best, scores
 
 
@@ -380,9 +387,16 @@ def fit3d(data: VolumeData, cfg: FitConfig, log=print, orientation: str = "given
         f"data term '{prob.data_term}', {prob.support_pts.shape[0]} support points, correction grid {prob.coarse_shape}")
     hist = {"orientation": data.geom.axes, "orientation_scores": orient_scores}
     h = cfg.handedness
+    if h == 0 and orientation == "auto":      # the orientation search fitted both handednesses on this problem
+        sc = select_orientation.last_handedness_scores
+        h = min(sc, key=sc.get)
+        hist["handedness_scores"] = {str(k): v for k, v in sc.items()}
+        log(f"handedness {h:+d} from the orientation search (data loss +1: {sc[1]:.3e}, -1: {sc[-1]:.3e})")
     if h == 0:
         with accel.phase("handedness_search", cfg.device):
-            sc = {hh: fit_wires(prob, cfg, hh, cfg.iters_auto, log=lambda *a: None)[3] for hh in (1, -1)}
+            from .fit import fit_wires_many
+            r = fit_wires_many([(prob, 1), (prob, -1)], cfg, cfg.iters_auto)
+            sc = {1: r[0][3], -1: r[1][3]}
         h = min(sc, key=sc.get)
         hist["handedness_scores"] = {str(k): v for k, v in sc.items()}
         log(f"handedness {h:+d}  (data loss +1: {sc[1]:.3e}, -1: {sc[-1]:.3e})")
