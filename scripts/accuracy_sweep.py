@@ -59,29 +59,32 @@ def calib_mask(shape, calib):
     return m
 
 
-def noise_sigma(k, sampled):
-    """Per-coil noise std from the k-space periphery (outer shell beyond 90 % of the radius), robust
-    (median absolute value of real/imag parts / 0.6745)."""
+def noise_cov(k, sampled):
+    """Coil noise covariance (N, N) from the k-space periphery (outer shell beyond 90 % of the sampled
+    radius): real coil noise is correlated, so the floor must be simulated with it."""
     grids = np.meshgrid(*[np.linspace(-1, 1, n) for n in k.shape[1:]], indexing="ij")
     r = np.sqrt(sum(g ** 2 for g in grids)) / np.sqrt(len(grids))
     shell = (r > 0.9 * r[sampled].max()) & sampled
     if shell.sum() < 50:
         shell = (r > 0.8 * r[sampled].max()) & sampled
     v = k[:, shell]
-    return np.median(np.abs(np.concatenate([v.real, v.imag], 1)), axis=1) / 0.6745
+    return (v @ v.conj().T) / v.shape[1]
 
 
-def residual_over_floor(k, C, sampled, acs, sigma, ax, rng):
+def residual_over_floor(k, C, sampled, acs, psi, ax, rng):
     y = k * sampled[None]
     den = np.maximum((np.abs(C) ** 2).sum(0), 1e-12)
+
     def resid(data):
         x = (C.conj() * ifft(data, ax)).sum(0) / den
         return (data - fft(C * x[None], ax)) * sampled[None]
     out = sampled & ~acs
     er = (np.abs(resid(y)[:, out]) ** 2).sum()
+    L = np.linalg.cholesky(psi + 1e-12 * np.trace(psi).real / len(psi) * np.eye(len(psi)))
     fl = 0.0
     for _ in range(2):
-        n = sigma[(slice(None),) + (None,) * (k.ndim - 1)] * (rng.normal(size=k.shape) + 1j * rng.normal(size=k.shape)) / np.sqrt(2)
+        w = (rng.normal(size=k.shape) + 1j * rng.normal(size=k.shape)) / np.sqrt(2)
+        n = np.einsum("ij,j...->i...", L, w)
         fl += (np.abs(resid(n * sampled[None])[:, out]) ** 2).sum() / 2
     return float(er / max(fl, 1e-30))
 
@@ -167,15 +170,27 @@ def main():
             continue
         k = np.moveaxis(k, a.coil_axis, 0).astype(np.complex64)
         ax = tuple(range(1, k.ndim))
-        sampled = np.abs(k).sum(0) > 0
+        mag = np.abs(k).sum(0)
+        sampled = mag > 1e-6 * mag.max()               # (zero-filled / numerically zero edges are not data)
         acs = calib_mask(k.shape[1:], (calib,) * (k.ndim - 1)) & sampled
-        sigma = (np.std(np.load(a.noise_npy).reshape(-1, k.shape[0]), axis=0) if a.noise_npy
-                 else noise_sigma(k, sampled))
+        if a.noise_npy:
+            nz = np.load(a.noise_npy).reshape(-1, k.shape[0])
+            psi = (nz.T @ nz.conj()) / nz.shape[0]
+        else:
+            psi = noise_cov(k, sampled)
         rss = np.sqrt((np.abs(ifft(k, ax)) ** 2).sum(0))
-        obj = rss > 0.1 * np.percentile(rss, 99)
+        noise_rss = float(np.sqrt(np.trace(psi).real))         # per-pixel noise RSS (orthonormal FFT)
+        snr = float(np.percentile(rss, 99) / max(noise_rss, 1e-30))
+        obj = rss > max(0.1 * np.percentile(rss, 99), 4 * noise_rss)
+        if obj.sum() < 10:
+            obj = rss >= np.percentile(rss, 90)
+        peak = np.unravel_index(np.argmax(np.abs(k).sum(0)), k.shape[1:])
+        peak_offset = [int(p - n // 2) for p, n in zip(peak, k.shape[1:])]    # k-space centre convention check
+        low_signal = bool(snr < 10 or obj.mean() > 0.9)
         R = a.R if a.layout == "2d" else (2, a.R / 2)
         und = cartesian_mask(k.shape[1:], R=R, acs=calib, extent=sampled) & sampled
-        print(f"== {name}: {k.shape}, sampled {sampled.mean():.2f}, object {obj.mean():.2f}, "
+        print(f"== {name}: {k.shape}, sampled {sampled.mean():.2f}, object {obj.mean():.2f}, SNR {snr:.0f}, "
+              f"k-space peak offset {peak_offset}{'  [LOW SIGNAL: excluded from the pooled summary]' if low_signal else ''}, "
               f"undersampled R_eff {sampled.sum() / und.sum():.2f}", flush=True)
         runs, maps = [], {}
         for b in a.budgets:
@@ -190,7 +205,7 @@ def main():
                 nr = float(np.linalg.norm((x - ref_img)[obj]) / np.linalg.norm(ref_img[obj]))
                 r = {"budget": b, "seed": seed, "seconds": sec, "phase_seconds": info.get("timings"),
                      "data_loss": float(info["data_loss"]) if info.get("data_loss") is not None else None,
-                     "residual_over_floor": residual_over_floor(k, C, sampled, acs, sigma, ax, rng),
+                     "residual_over_floor": residual_over_floor(k, C, sampled, acs, psi, ax, rng),
                      f"sense_nrmse_R{a.R:g}": nr, "handedness": info.get("handedness"),
                      "plane": info.get("plane") or info.get("orientation")}
                 maps[(b, seed)] = C
@@ -215,10 +230,36 @@ def main():
             sp = "-" if v["seed_spread"] is None else f"{v['seed_spread']:.2e}"
             print(f"  {b:9s} {v['seconds']:7.1f}  {v['residual_over_floor']:14.4f}  {v[f'sense_nrmse_R{a.R:g}']:11.4f}"
                   f"  {v['change_vs_longest']:17.2e}  {sp}", flush=True)
-        report["files"][name] = {"shape": list(k.shape), "object_fraction": float(obj.mean()),
+        report["files"][name] = {"shape": list(k.shape), "object_fraction": float(obj.mean()), "snr": snr,
+                                 "sampled_fraction": float(sampled.mean()), "kspace_peak_offset": peak_offset,
+                                 "low_signal": low_signal,
                                  "summary": summary, "runs": runs}
         json.dump(report, open(a.out, "w"), indent=1)
+    pooled(report, a)
+    json.dump(report, open(a.out, "w"), indent=1)
     print(f"wrote {a.out}")
+
+
+def pooled(report, a):
+    """Median over the (not low-signal) inputs of each metric relative to the 'default' budget."""
+    ref = "default" if "default" in a.budgets else a.budgets[-1]
+    fs = [f for f in report["files"].values() if not f.get("low_signal")]
+    if not fs:
+        return
+    sk = f"sense_nrmse_R{a.R:g}"
+    out = {}
+    print(f"pooled over {len(fs)} inputs, relative to '{ref}' (median [min, max]):")
+    for b in a.budgets:
+        row = {}
+        for key in ("residual_over_floor", sk):
+            v = [f["summary"][b][key] / f["summary"][ref][key] for f in fs]
+            row[key] = [float(np.median(v)), float(min(v)), float(max(v))]
+        row["seconds"] = float(np.median([f["summary"][b]["seconds"] for f in fs]))
+        out[b] = row
+        print(f"  {b:9s} {row['seconds']:6.1f} s  residual {row['residual_over_floor'][0]:.4f} "
+              f"[{row['residual_over_floor'][1]:.4f}, {row['residual_over_floor'][2]:.4f}]  SENSE {row[sk][0]:.3f} "
+              f"[{row[sk][1]:.3f}, {row[sk][2]:.3f}]")
+    report["pooled_relative_to_" + ref] = out
 
 
 if __name__ == "__main__":
