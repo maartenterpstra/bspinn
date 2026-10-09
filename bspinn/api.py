@@ -31,7 +31,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-2, mask_maps=False, support_threshold=0.1,
-                  support_dilate=2, undersample=None, **cfg_overrides):
+                  support_dilate=2, undersample=None, solve_image=False, **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
     Parameters
@@ -78,6 +78,12 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         image (calibration region, Hann window, 5-pixel smoothing) above ``support_threshold`` x its
         99th percentile, holes filled, dilated by ``support_dilate`` pixels. Lower the threshold or
         dilate more if the mask clips the object edge (masked maps make SENSE zero there).
+    solve_image : solve for the full-resolution image jointly with the maps (NLINV-style): after the
+        calibration fit, maps and image are refined together on ALL acquired k-space (the maps stay
+        physics-constrained; the image is solved by CG-SENSE inside the acquired k-space extent at every
+        step). Implies ``return_image``; the returned image is that joint solution. 2-D (and dynamic
+        with rank=0) only. Iterations: ``iters_joint`` (default 300), image regularisation
+        ``lambda_joint_img`` (relative, default 1e-2).
     undersample : retrospective Cartesian undersampling of (fully sampled) ``ksp`` before the fit: an
         acceleration R (float, or (R1, R2) in 3-D), a dict of ``bspinn.masks.cartesian_mask`` options
         (e.g. ``dict(R=4, pattern='vd', partial_fourier=0.75, seed=1)``) or a ready bool mask. The
@@ -138,6 +144,13 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         setattr(cfg, k, v)
     if cfg.compress:
         raise ValueError("compress is not supported by estimate_maps (maps are returned for the input channels)")
+    if solve_image:
+        if layout == "3d":
+            raise ValueError("solve_image is implemented for 2-D (and dynamic with rank=0) data")
+        if layout == "dynamic" and rank != 0:
+            raise ValueError("solve_image with dynamic data needs rank=0 (one static map set)")
+        cfg.joint_full = True
+        return_image = True
     under_info = {}
     if undersample is not None:
         ksp, mask, under_info = _apply_undersampling(ksp, mask, undersample, layout, cfg.calib)
@@ -170,15 +183,30 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         if sup.shape != ksp.shape[1:3 if layout == "dynamic" else None]:
             raise ValueError(f"mask_maps array must have the spatial shape {ksp.shape[1:3 if layout == 'dynamic' else None]}")
     C = _finish(C, sup, layout, phase_ref, normalise)
+    x_solved = None
+    xf = info.pop("_xfull", None)
+    if xf is not None:                         # joint full-resolution image, in the convention of the maps
+        f = np.asarray(xf) * prob.scale
+        cax = 1 if layout == "dynamic" else 0
+        Cd = C_raw if M is None else (np.einsum("ij,tj...->ti...", np.asarray(M), C_raw) if layout == "dynamic"
+                                      else np.einsum("ij,j...->i...", np.asarray(M), C_raw))   # data channels
+        Cn = C_raw / np.maximum(np.sqrt((np.abs(Cd) ** 2).sum(cax, keepdims=True)), 1e-30)   # RSS as in the joint stage
+        g = (Cn.conj() * C).sum(cax) / np.maximum((np.abs(Cn) ** 2).sum(cax), 1e-30)
+        f = f[0] if layout == "2d" else f
+        x_solved = (f / np.where(np.abs(g) > 0, g, 1)).astype(np.complex64)
     # joint-fit image, interpolated to the full matrix, in the convention of the returned maps
     info["image_joint"] = _joint_image(info.pop("_m", None), prob, C_raw, C, layout)
     if layout == "dynamic":
         C = np.moveaxis(C, 0, -1)                       # (T,N,X,Y) -> (N,X,Y,T)
         if info["image_joint"] is not None:
             info["image_joint"] = np.moveaxis(info["image_joint"], 0, -1)
+    if x_solved is not None and layout == "dynamic":
+        x_solved = np.moveaxis(x_solved, 0, -1)
     if mask_maps is not False and mask_maps is not None:
         sx = sup[..., None] if layout == "dynamic" else sup         # dynamic: same support for all frames
         C = C * sx[None]
+        if x_solved is not None:
+            x_solved = x_solved * sx
         if info["image_joint"] is not None:
             info["image_joint"] = info["image_joint"] * sx
     info.update(under_info)
@@ -188,6 +216,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     C = C.astype(np.complex64)
     if not return_image:
         return C, info
+    if x_solved is not None:
+        info["image_solved_jointly"] = True
+        return C, x_solved, info
     img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda)
     return C, img, info
 
@@ -233,7 +264,7 @@ def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
     with torch.enable_grad():
         C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
     return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob,
-               "_m": extra["image_lowres"], "plane": plane, "plane_scores": scores}
+               "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores}
 
 
 def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
@@ -279,7 +310,7 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
             C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
         return np.broadcast_to(C[None], (T, N, X, Y)).copy(), {
             "handedness": extra["handedness"], "data_loss": _last(hist), "rank": 0, "model": model, "problem": prob,
-            "_m": extra["image_lowres"], "plane": plane, "plane_scores": scores}
+            "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores}
     from .dynamic import DynConfig, fit_dynamic
     dcfg = DynConfig(rank=rank, iters_dyn=iters_dynamic or max(300, cfg.iters_pinn // 2))
     dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log)

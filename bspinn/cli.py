@@ -123,6 +123,8 @@ def main(argv=None):
     pm.add_argument("--device", default="cpu")
     pm.add_argument("--threads", type=int, default=0)
     pm.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="any FitConfig field, e.g. iters_pinn=1000")
+    pm.add_argument("--solve-image", action="store_true",
+                    help="solve maps and the full-resolution image jointly on all acquired k-space (2-D); writes --image")
     pm.add_argument("--undersample", type=float, nargs="+", default=None, metavar="R",
                     help="retrospective Cartesian undersampling: R (or R1 R2 in 3-D); calibration block = --calib")
     pm.add_argument("--undersample-mask", default=None, help="use this bool .npy mask instead of generating one")
@@ -268,13 +270,15 @@ def _run_maps(a):
         under = np.load(a.undersample_mask).astype(bool)
     elif a.undersample:
         under = _mask_opts(a, R=a.undersample)
-    res = estimate_maps(k, a.layout, return_image=bool(a.image), undersample=under, coil_axis=a.coil_axis, mask=mask, spacing=a.spacing, plane=a.plane,
+    res = estimate_maps(k, a.layout, return_image=bool(a.image) or a.solve_image, solve_image=a.solve_image, undersample=under, coil_axis=a.coil_axis, mask=mask, spacing=a.spacing, plane=a.plane,
                                axes=a.axes, calib=calib, noise=noise, physics=a.physics, b0_tesla=a.b0,
                                model=a.model, rank=a.rank, quality=a.quality, normalise=a.normalise,
                                phase_ref=a.phase_ref, device=a.device, threads=a.threads,
                                mask_maps=np.load(a.mask_maps) if isinstance(a.mask_maps, str) else a.mask_maps,
                                support_threshold=a.support_threshold, support_dilate=a.support_dilate, **over)
-    maps, info = (res[0], res[2]) if a.image else res
+    maps, info = (res[0], res[2]) if (a.image or a.solve_image) else res
+    if a.solve_image and not a.image:
+        a.image = a.out.replace(".npy", "") + "_image.npy"
     maps = np.moveaxis(maps, 0, a.coil_axis)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     np.save(a.out, maps)

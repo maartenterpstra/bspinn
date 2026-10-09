@@ -357,6 +357,28 @@ What matters:
   With a regular lattice a support constraint (`mask_maps=True`) helps, with random-like patterns the
   full-FOV maps do; λ = 1e-2 beats 1e-3 everywhere (also at R = 2), so it is now the default
   `sense_lambda` of `return_image`. This knee is noise-limited beyond R ≈ 3 for plain SENSE.
+* **Joint image solve** (`solve_image=True`, CLI `--solve-image`; 2-D and dynamic with `rank=0`): after
+  the calibration fit, maps and a full-resolution image are refined together on all acquired k-space,
+  NLINV-style. Each iteration solves the image by a few warm-started CG-SENSE steps inside the acquired
+  k-space extent and takes an Adam step on the maps (same physics penalty, norm and keep-out). The maps
+  are RSS-normalised inside the stage, so one Tikhonov weight (`lambda_joint_img`, default 1e-2) acts
+  uniformly. `joint_maps="exact"` (default) evaluates the maps at every pixel and back-propagates the
+  data-term gradient in chunks; `"interp"` uses the calibration grid plus k-space interpolation (about
+  40× faster, but it biases the exact field). `lambda_joint_prox` keeps the maps near the calibration
+  solution. **Measured value: small; it only helps when calibration data are scarce.** Image error vs the fully sampled image, magnitude NRMSE:
+
+  | data | calibration maps + CG-SENSE | joint, exact | joint, interp | cost (exact / calib) |
+  |---|---|---|---|---|
+  | synthetic 64², R_net 2.0 (map error) | 0.0787 (6.4e-5) | 0.0792 (7.3e-5) | – | 2.3× |
+  | knee15, uniform R4 + ACS 24 (R_net 3.3) | 0.1763 | 0.1756 | 0.1784 | 7.6× |
+  | knee15, uniform R3 + ACS 8 (R_net 2.9) | 0.1267 | **0.1209** | 0.1333 | 16× |
+
+  With a fully sampled calibration block of normal size the physics-constrained calibration maps are
+  already as good as the data allow; with a small one (8 lines) the joint fit gains ~5 %, at 16× the
+  cost (the exact variant runs about 30 s per iteration at 320×368, 15 coils, one CPU core). An early version that solved the image against the raw (unnormalised) maps
+  appeared to gain 11 % on the knee; that came from its spatially varying effective regularisation, and
+  its own starting image was much worse (0.42). It is kept as an option for experiments and
+  calibration-poor data; the benchmark was not rerun with it.
 * **Image reconstruction**: `return_image=True` / `sense_image` only estimates k-space inside the
   acquired extent (first..last sampled line per axis). Zero-padded edges, partial-Fourier gaps and a
   cropped readout stay empty, as in a zero-filled reconstruction; undersampling inside the extent is

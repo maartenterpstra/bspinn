@@ -652,3 +652,28 @@ def test_estimate_maps_with_own_mask_and_calibration_warning():
         warnings.simplefilter("always")
         estimate_maps(k, "2d", undersample=cartesian_mask(k.shape[1:], R=3, acs=4), calib=12, **few)
     assert any("calibration block" in str(x.message) for x in w)
+
+
+def test_solve_image_joint_full_resolution():
+    from bspinn.api import _cfft, estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.fit import upsample_maps
+    d, _, _ = make_synthetic(4, (32, 40), noise=0.005)
+    k = d.kspace[0].copy(); k[:, :, :3] = 0; k[:, :, -3:] = 0          # zero-padded PE edges
+    few = dict(plane="axial", calib=12, iters_auto=5, iters_wires=20, iters_pinn=20, iters_joint=10, verbose=False)
+    C, x, info = estimate_maps(k, "2d", solve_image=True, undersample=dict(R=2, pattern="uniform"), **few)
+    assert info["image_solved_jointly"] and x.shape == (32, 40) and np.isfinite(x).all()
+    m = info["mask"]; ku = k * m[None]
+    r = np.linalg.norm((_cfft(C * x[None], (1, 2)) - ku)[:, m]) / np.linalg.norm(ku[:, m])
+    assert r < 0.5                                   # the joint image explains the acquired samples
+    K = np.abs(_cfft(x, (0, 1))) ** 2
+    # nothing extrapolated outside the acquired extent (only the smooth gauge of the returned maps spills a little;
+    # extrapolating CG-SENSE put 20-25 % there on real data)
+    assert K[:, :3].sum() + K[:, -3:].sum() < 0.02 * K.sum()
+    with pytest.raises(ValueError):
+        estimate_maps(np.stack([k] * 2, -1), "dynamic", solve_image=True, rank=1, **few)
+    # band-limited map interpolation keeps point values on the coarse grid
+    import torch
+    g = torch.randn(1, 2, 8, 10, dtype=torch.complex64)
+    up = upsample_maps(g, (16, 20))
+    assert torch.allclose(up[..., ::2, ::2], g, atol=1e-5)
