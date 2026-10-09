@@ -2,6 +2,9 @@
 
     python scripts/accuracy_sweep.py data/*.npz --device cuda --out sweep.json
     python scripts/accuracy_sweep.py knee.npz --key kspace --coil-axis 0 --calib 24 --seeds 0 1 2
+    # from your own dataset object: dataloader_v2.get_dataloader(base_folder)[i]['kspace']
+    python scripts/accuracy_sweep.py --loader dataloader_v2:get_dataloader --base-folder /path/to/data \
+        --random 8 --device cuda --out sweep.json          # or --indices 0 17 523 ...
 
 Each input: a .npz (array under --key, default 'kspace') or .npy with 2-D multi-coil k-space (coils, x, y)
 (--layout 3d: (coils, x, y, z)). Fully sampled data are best: the metrics retrospectively undersample.
@@ -90,9 +93,50 @@ def subspace_change(C, R, obj):
     return float(e[obj].mean())
 
 
+def _to_numpy(x):
+    if hasattr(x, "detach"):                       # torch tensor
+        x = x.detach().cpu()
+        if not x.is_complex() and x.shape[-1] == 2:  # real view (..., 2) of complex data
+            import torch
+            x = torch.view_as_complex(x.contiguous())
+        x = x.numpy()
+    return np.asarray(x)
+
+
+def iter_inputs(a, report):
+    """(name, k-space array) for the files and/or the dataset items."""
+    for path in a.files:
+        arr = np.load(path)
+        yield os.path.basename(path), _to_numpy(arr[a.key] if hasattr(arr, "files") else arr)
+    if a.loader:
+        import importlib
+        sys.path.insert(0, os.getcwd())             # your module, importable from where you run this
+        mod, fn = a.loader.split(":")
+        ds = getattr(importlib.import_module(mod), fn)(a.base_folder) if a.base_folder else \
+            getattr(importlib.import_module(mod), fn)()
+        n = len(ds)
+        idx = a.indices if a.indices else \
+            sorted(np.random.default_rng(a.pick_seed).choice(n, size=min(a.random or 6, n), replace=False).tolist())
+        report["dataset"] = {"loader": a.loader, "length": n, "indices": idx}
+        print(f"dataset {a.loader}: {n} items, using {idx}", flush=True)
+        for i in idx:
+            item = ds[i]
+            k = _to_numpy(item[a.key] if isinstance(item, dict) else item)
+            meta = {key: str(item[key])[:120] for key in ("source", "dataset", "filename", "fname", "slice", "contrast")
+                    if isinstance(item, dict) and key in item}
+            report.setdefault("item_meta", {})[f"item{i}"] = meta
+            yield f"item{i}", k
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("files", nargs="+")
+    ap.add_argument("files", nargs="*")
+    ap.add_argument("--loader", default=None, metavar="MODULE:FUNCTION",
+                    help="dataset factory, called as FUNCTION(base_folder); items are dicts with --key")
+    ap.add_argument("--base-folder", default=None)
+    ap.add_argument("--indices", type=int, nargs="*", default=None, help="dataset items to use")
+    ap.add_argument("--random", type=int, default=0, help="or: this many random items (seeded, --pick-seed)")
+    ap.add_argument("--pick-seed", type=int, default=0)
     ap.add_argument("--key", default="kspace")
     ap.add_argument("--coil-axis", type=int, default=0)
     ap.add_argument("--layout", default="2d", choices=["2d", "3d"])
@@ -115,9 +159,12 @@ def main():
     report = {"device": a.device, "budgets": {b: BUDGETS[b] for b in a.budgets}, "seeds": a.seeds,
               "R": a.R, "calib": calib, "files": {}}
     rng = np.random.default_rng(0)
-    for path in a.files:
-        arr = np.load(path)
-        k = np.asarray(arr[a.key] if hasattr(arr, "files") else arr)
+    for name, k in iter_inputs(a, report):
+        if a.layout == "2d" and k.ndim == 4:        # (slices, coils, x, y) volume: its middle slice
+            name, k = f"{name}_slice{k.shape[0] // 2}", k[k.shape[0] // 2]
+        if k.ndim != (3 if a.layout == "2d" else 4):
+            print(f"skipping {name}: expected (coils, x, y{', z' if a.layout == '3d' else ''}), got {k.shape}")
+            continue
         k = np.moveaxis(k, a.coil_axis, 0).astype(np.complex64)
         ax = tuple(range(1, k.ndim))
         sampled = np.abs(k).sum(0) > 0
@@ -128,7 +175,6 @@ def main():
         obj = rss > 0.1 * np.percentile(rss, 99)
         R = a.R if a.layout == "2d" else (2, a.R / 2)
         und = cartesian_mask(k.shape[1:], R=R, acs=calib, extent=sampled) & sampled
-        name = os.path.basename(path)
         print(f"== {name}: {k.shape}, sampled {sampled.mean():.2f}, object {obj.mean():.2f}, "
               f"undersampled R_eff {sampled.sum() / und.sum():.2f}", flush=True)
         runs, maps = [], {}
