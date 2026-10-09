@@ -506,7 +506,10 @@ def fit_wires_many(items, cfg: FitConfig, iters: int, log=None):
     """Independent wire stages, e.g. the plane / orientation / handedness probes: items = [(prob, h), ...].
     Same results as calling fit_wires for each in turn; on CUDA with graphs the stages are captured once
     each and their replays interleaved on separate streams (small problems: they run concurrently)."""
+    import copy
     quiet = log or (lambda *a, **k: None)
+    cfg = copy.copy(cfg)
+    cfg.compile = False        # short probes on different geometries: compiling each would cost far more
     specs = [_wires_setup(p, cfg, h, iters, quiet, "wires") for p, h in items]
     if len(specs) > 1 and all(_graph_ok(sp["stage"]) for sp in specs):
         outs = accel.train_graphed_many([_graph_job(*sp["stage"]) for sp in specs], log=quiet)
@@ -612,10 +615,18 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
         C0 = model.sensitivity(prob.coords, create_graph=False).detach() if m is None else None
         m = _image_param(prob, C0, K, m)
         params.append({"params": [m], "lr": 1e-2})
+    # GPU: data grid + collocation in one trunk pass (fewer, larger kernels; the extra Laplacian rows on
+    # the data grid are free there). CPU: separate passes (compute-bound; no wasted Laplacian).
+    joint_pass = getattr(model, "sensitivity_and_physics", None) if prob.device.type == "cuda" else None
+
     def step_loss(sl, pin, pair):
-        Cs = sens_sets(model, prob.slice_coords(sl))
+        r = joint_pass(prob.slice_coords(sl), pin, pair, cfg.air_colloc) if joint_pass else None
+        if r is not None:                    # data grid + collocation in one trunk pass
+            Cs, phys = r[0][None], r[1]
+        else:
+            Cs = sens_sets(model, prob.slice_coords(sl))
+            phys = _physics_at(model, cfg, pin, pair)
         d = prob.data_loss(Cs, m, sl)
-        phys = _physics_at(model, cfg, pin, pair)
         loss = d + cfg.lambda_phys * phys + cfg.lambda_norm * prob.norm_loss(Cs, sl) + _extra_penalty(model, Cs, m, cfg)
         for w in wires:                     # the wires keep training here: keep them outside the object too
             out, _ = w.regularisers(prob.keep, cfg.outside_margin)   # (no curvature term: it shrinks loops)

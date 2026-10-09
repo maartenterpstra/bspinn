@@ -797,3 +797,31 @@ def test_cuda_graph_stage_plumbing_matches_eager():
     for a, b in zip(out[False][:2], out[True][:2]):
         assert np.allclose(a, b, rtol=1e-4), (a, b)
     assert torch.allclose(out[False][2], out[True][2], atol=1e-5)
+
+
+def test_fused_trunk_paths_match():
+    """GPU code paths, checked on CPU: the stacked Taylor-mode trunk (one matmul per layer) equals
+    trunk_taylor, and sensitivity_and_physics (data grid + collocation in one pass) equals the
+    separate sensitivity / physics_loss_pair calls, values and parameter gradients."""
+    from bspinn.models import HarmonicPINN, WireLoopCoils, make_trunk, trunk_taylor, trunk_taylor_stacked
+    torch.manual_seed(0)
+    net = make_trunk(3 + 5, 32, 3, 2).double()
+    x = torch.randn(4, 50, 3, dtype=torch.float64)
+    z = torch.randn(4, 1, 5, dtype=torch.float64)
+    for lap in (True, False):
+        a, b = trunk_taylor(net, x, z, lap), trunk_taylor_stacked(net, x, z, lap)
+        assert all((u is None and v is None) or torch.allclose(u, v, atol=1e-12) for u, v in zip(a, b))
+    w = WireLoopCoils(3, 1, 8, 1)
+    with torch.no_grad():
+        w.verts.normal_(0, 0.3); w.verts.add_(torch.tensor([1.5, 0, 0])); w.amp.fill_(1)
+    for mode in ("real", "complex"):
+        p = HarmonicPINN(3, mode, 6, 32, 3, 1, base=w)
+        torch.nn.init.normal_(p.net[-1].weight, std=0.1)
+        pts, c1, c2 = torch.rand(30, 3) - .5, torch.randn(20, 3) * .4, torch.randn(7, 3) * .8
+        ps = [q for q in p.parameters() if q.requires_grad]
+        C1, ph1 = p.sensitivity(pts), p.physics_loss_pair(c1, c2, .25)
+        C2, ph2 = p.sensitivity_and_physics(pts, c1, c2, .25)
+        assert torch.allclose(C1, C2, atol=1e-6) and torch.allclose(ph1, ph2, rtol=1e-5)
+        g1 = torch.autograd.grad((C1.abs() ** 2).sum() + ph1, ps, allow_unused=True)
+        g2 = torch.autograd.grad((C2.abs() ** 2).sum() + ph2, ps, allow_unused=True)
+        assert all((u is None and v is None) or torch.allclose(u, v, rtol=1e-4, atol=1e-5) for u, v in zip(g1, g2))

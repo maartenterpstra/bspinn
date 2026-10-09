@@ -70,7 +70,9 @@ class CoilModel(nn.Module):
 
     def sensitivity(self, points: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
         """Complex sensitivities, shape (N, P)."""
-        B = self.field(points, create_graph=create_graph)
+        return self._sens_from_field(self.field(points, create_graph=create_graph))
+
+    def _sens_from_field(self, B):
         if B.shape[-1] == 1:
             Bx, By = B[:, :, 0, 0], B[:, :, 1, 0]
         else:
@@ -216,7 +218,10 @@ def trunk_taylor(net: nn.Sequential, x: torch.Tensor, z: torch.Tensor, laplacian
 
     x: (..., 3); z: latent codes broadcastable to (..., L), e.g. (N, 1, L) for per-coil codes (their
     first-layer contribution is computed once per code, not per point).
-    Returns phi (..., K), dphi/dx (..., 3, K), lap phi (..., K) (None if laplacian=False)."""
+    Returns phi (..., K), dphi/dx (..., 3, K), lap phi (..., K) (None if laplacian=False).
+    On CUDA the stacked variant (trunk_taylor_stacked: one matmul per layer) is used."""
+    if x.is_cuda:
+        return trunk_taylor_stacked(net, x, z, laplacian)
     layers = list(net)
     W0, b0 = layers[0].weight, layers[0].bias
     Wx, Wz = W0[:, :3], W0[:, 3:]
@@ -242,6 +247,50 @@ def trunk_taylor(net: nn.Sequential, x: torch.Tensor, z: torch.Tensor, laplacian
             raise TypeError("Taylor-mode propagation supports Linear/Tanh trunks only")
     if laplacian and L is None:
         L = torch.zeros_like(h)
+    return h, T, L
+
+
+def trunk_taylor_stacked(net: nn.Sequential, x: torch.Tensor, z: torch.Tensor, laplacian: bool = True):
+    """trunk_taylor with value, the 3 tangents and the Laplacian stacked as rows of one tensor
+    (..., R, width), R = 5 (4 without Laplacian): one matmul per Linear layer instead of three. On a GPU
+    the matmuls of these small problems are latency-bound kernels (~30 us each), the extra stack copies
+    are cheap elementwise kernels, so this is ~3x fewer GEMMs per pass. Same values as trunk_taylor."""
+    layers = list(net)
+    W0, b0 = layers[0].weight, layers[0].bias
+    Wx, Wz = W0[:, :3], W0[:, 3:]
+    zc = torch.nn.functional.linear(z, Wz, b0)
+    h = torch.nn.functional.linear(x, Wx) + zc                               # (..., width)
+    T = Wx.T.expand(*h.shape[:-1], 3, W0.shape[0])
+    rows = [h.unsqueeze(-2), T]
+    S = None
+    have_L = False
+    for layer in layers[1:]:
+        if isinstance(layer, nn.Tanh):
+            if S is not None:
+                h, T = S[..., 0, :], S[..., 1:4, :]
+                L = S[..., 4, :] if have_L else None
+            else:
+                L = None
+            t = torch.tanh(h)
+            sd = 1 - t * t
+            Tn = T * sd.unsqueeze(-2)
+            if laplacian:
+                q = (T * T).sum(-2)
+                Ln = (-2 * t * sd) * q if L is None else L * sd - 2 * t * sd * q
+                S = torch.cat([t.unsqueeze(-2), Tn, Ln.unsqueeze(-2)], -2)
+                have_L = True
+            else:
+                S = torch.cat([t.unsqueeze(-2), Tn], -2)
+        elif isinstance(layer, nn.Linear):
+            if S is None:
+                S = torch.cat(rows, -2)
+            R = S.shape[-2]
+            bias = torch.cat([layer.bias[None], layer.bias.new_zeros(R - 1, layer.bias.shape[0])], 0)
+            S = S @ layer.weight.T + bias                                          # (..., R, out)
+        else:
+            raise TypeError("Taylor-mode propagation supports Linear/Tanh trunks only")
+    h, T = S[..., 0, :], S[..., 1:4, :]
+    L = S[..., 4, :] if have_L else (torch.zeros_like(h) if laplacian else None)
     return h, T, L
 
 
@@ -367,6 +416,30 @@ class HarmonicPINN(CoilModel):
     @staticmethod
     def _ratio(num, den, sl):
         return (num[:, sl].mean(1) / den[:, sl].mean(1).detach().clamp_min(1e-12)).mean()
+
+    def sensitivity_and_physics(self, pts, pin, pair=None, w2=0.0):
+        """sensitivity(pts) and physics_loss(pin) [+ w2 * physics_loss(pair)] from ONE Taylor-mode pass of
+        the trunk over all points (data grid and collocation concatenated): fewer, larger matmuls.
+        Same values as the separate calls. None if not applicable (generic potential, per-coil points)."""
+        if not self._taylor_ok() or pts.dim() != 2:
+            return None
+        P0, n1 = pts.shape[0], pin.shape[0]
+        allp = torch.cat([pts, pin] + ([pair] if pair is not None else []))
+        x = allp.unsqueeze(0).expand(self.n_coils, -1, -1)
+        _, g, lap = trunk_taylor(self.net, x, self.codes[:, None, :], laplacian=True)
+        B = -g[:, :P0]
+        Bw = self._base_field(x[:, :P0])                                        # wires train too: with graph
+        C = self._sens_from_field(B if Bw is None else B + Bw)
+        gc = g[:, P0:]
+        with torch.no_grad():
+            Bwc = self._base_field(x[:, P0:])
+        Bt = -gc if Bwc is None else Bwc - gc
+        num = lap[:, P0:].pow(2).sum(-1)
+        den = (Bt[..., 0, :].pow(2) + Bt[..., 1, :].pow(2)).sum(-1)
+        phys = self._ratio(num, den, slice(0, n1))
+        if pair is not None:
+            phys = phys + w2 * self._ratio(num, den, slice(n1, None))
+        return C, phys
 
     def physics_loss_pair(self, p1, p2, w2):
         """physics_loss(p1) + w2 * physics_loss(p2) in one trunk pass (object and air collocation)."""

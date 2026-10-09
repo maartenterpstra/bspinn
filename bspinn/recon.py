@@ -153,11 +153,19 @@ def virtual_body_coil(C0, sup=None, robust=True, iters=300, restarts=8, seed=0, 
     D0 = torch.stack([d0.to(Xn.device) / d0.norm() for d0 in starts])          # (R,N)
     with torch.enable_grad():
         p = torch.nn.Parameter(torch.view_as_real(D0.clone()))
-        opt = torch.optim.Adam([p], lr=2e-2)
-        for _ in range(iters):
+
+        def step():
             dc = torch.view_as_complex(p); dc = dc / dc.norm(dim=1, keepdim=True)
-            loss = -torch.log((dc.conj() @ Xn).abs() ** 2 + 1e-6).mean(1).sum()
-            opt.zero_grad(); loss.backward(); opt.step()
+            return (-torch.log((dc.conj() @ Xn).abs() ** 2 + 1e-6).mean(1).sum(),)
+        if Xn.is_cuda and iters > 5:                 # one CUDA graph replay per Adam step (constant lr)
+            from .accel import capturable_adam, train_graphed
+            opt, base = capturable_adam([{"params": [p], "lr": 2e-2}], Xn.device)
+            train_graphed(step, opt, base, 2e-2, iters, log=lambda *a: None)
+        else:
+            opt = torch.optim.Adam([p], lr=2e-2)
+            for _ in range(iters):
+                loss = step()[0]
+                opt.zero_grad(); loss.backward(); opt.step()
     D = torch.view_as_complex(p.detach()); D = D / D.norm(dim=1, keepdim=True)
     st = (D.conj() @ Xn).abs().min(1).values
     for r in range(D.shape[0]):
