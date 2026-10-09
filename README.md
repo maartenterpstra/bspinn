@@ -876,12 +876,16 @@ the inputs and outputs cross the PCIe bus.
 
 **Measured on an RTX PRO 6000 Blackwell** (torch 2.14, `scripts/bench_gpu.py`), ms per iteration:
 
-| stage | eager | `cuda_graph` (default) | `compile` |
-|---|---|---|---|
-| 2-D 256², 8 coils, calib 24: wires / PINN | 5.1 / 11.2 | **0.75 / 2.5** | 3.4 / 6.4 |
-| 3-D 48³, calib 12³: wires / PINN | 5.6 / 12.7 | **1.9 / 3.3** | 3.3 / 8.6 |
-| Helmholtz 32³: wave wires / PINN | 9.8 / 17.9 | **1.8 / 4.6** | 5.8 / 10.3 |
-| `solve_image` 256²: hybrid / exact | 17.6 / 34 | (eager) | — |
+| stage | eager | `compile` | `cuda_graph` (default) | `cuda_graph` + `compile` |
+|---|---|---|---|---|
+| 2-D 256², 8 coils, calib 24: wires / PINN | 5.1 / 11.2 | 3.4 / 6.4 | 0.77 / 2.6 | **0.34 / 1.36** |
+| 3-D 48³, calib 12³: wires / PINN | 5.6 / 12.7 | 3.3 / 8.6 | 1.3 / 3.4 | **0.64 / 1.8** |
+| Helmholtz 32³: wave wires / PINN | 9.8 / 17.9 | 5.8 / 10.3 | 2.1 / 4.8 | **1.6 / 2.7** |
+| `solve_image` 256²: hybrid / exact | 17.6 / 34 | | 21 / 34 | |
+
+`compile` costs 1–4 s per stage with a warm inductor cache (~10–20 s the very first time on a machine),
+so `cuda_graph=True, compile=True` (`--compile` on the CLI) pays off for long runs — `quality="default"`
+(2500 PINN iterations: ~3 s saved per slice), 3-D, `fit-dataset` — and not for a 4-second `fast` run.
 
 Full-resolution maps (256²): 10 ms. The calibration problems are tiny (2-D: 48² grid × 8 coils, 768
 collocation points): eager, an iteration is ~900 kernel launches whose host-side cost exceeds the GPU
@@ -894,9 +898,8 @@ End to end (`estimate_maps`, 128², 8 coils, `quality="fast"`: 6 plane + 2 hande
 iterations, 500 wire and 800 PINN iterations): **CPU 98 s, GPU eager 19 s, GPU with CUDA graphs 3.6 s**
 (plane search 0.7, handedness 0.2, wires 0.35, PINN 1.8, phase reference 0.5 s; all 10 stages captured).
 With graphs an iteration is bound by GPU execution of ~900 small kernels (~2.5 µs each);
-`cuda_graph=True, compile=True` replays inductor-fused kernels instead (fewer, larger kernels) at the cost
-of ~10 s compilation per stage shape on the first run (cached on disk afterwards): worth it for long runs
-(`quality="default"`, 3-D).
+`cuda_graph=True, compile=True` replays inductor-fused kernels instead (~2.2× fewer launches, 1.3–2.3×
+faster iterations, table above).
 
 What was changed for GPU throughput (all exact, covered by tests):
 
@@ -910,7 +913,7 @@ What was changed for GPU throughput (all exact, covered by tests):
 | **fused Adam** on CUDA when all parameters are real | one optimizer kernel |
 | **joint image stage**: `joint_maps="hybrid"` = exact wire field at full resolution + the smooth network correction from the calibration grid, upsampled by k-space zero padding; one graph and one wire-field pass when it fits in memory (`joint_chunk=0` sizes it from free GPU memory) | same accuracy as exact maps, 6× faster per iteration |
 | **`cuda_graph=True`** (default; CUDA only): after 3 eager warm-up iterations, each stage's whole iteration (collocation draws, forward, backward, Adam step) is captured once as a CUDA graph and replayed: one launch per iteration instead of ~1000. Learning rates are device tensors (closed-form cosine schedule), slice batches are copied into static index tensors, the device random generators are registered with the graph (new numbers every replay). Falls back to eager if capture fails | 4–7× faster iterations (table); same trajectory as eager (CPU test of the code path; GPU end-to-end accuracy identical) |
-| `compile=` (experimental): `torch.compile` of each stage's whole iteration (static shapes, randomness drawn outside, one graph per stage) | 1.5–2× faster than eager on the GPU, slower than CUDA graphs, 7–20 s compile per stage; much slower on a many-core CPU |
+| `compile=True`: `torch.compile` of each stage's whole iteration (static shapes, randomness drawn outside, one graph per stage); with `cuda_graph` the compiled kernels are what the graph replays | with CUDA graphs a further 1.3–2.3×; alone 1.5–2× over eager; avoid on a many-core CPU |
 | `tf32=True` | TF32 matmuls (Ampere+); ~1e-3 relative precision in the MLP, off by default |
 
 `scripts/bench_gpu.py` measures eager / graph / compile [+tf32] in fresh processes, reports first-call
