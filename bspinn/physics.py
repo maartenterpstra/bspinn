@@ -54,6 +54,31 @@ def biot_savart_polyline(verts: torch.Tensor, points: torch.Tensor, eps: float =
     return (axb * factor.unsqueeze(-1)).sum(dim=-3)          # sum over segments
 
 
+def segment_static_and_log(verts: torch.Tensor, points: torch.Tensor, core: float = 0.0, eps: float = 1e-9):
+    """Shared-geometry evaluation of two closed-form segment integrals (summed over segments):
+      static: Biot-Savart field of unit current (as biot_savart_polyline, incl. the Rankine core);
+      vlog:   sum (d x (P - A)) * int_0^1 dt / |P - A - t d|  (the k^2/(2r) term of the wave kernel).
+    Both use u = A - P, v = B - P, |u|, |v| and u x v (= d x (P - A)), so one pass replaces two.
+    verts (..., M, 3), points (P, 3) or broadcastable  ->  two (..., P, 3) tensors."""
+    A = verts.unsqueeze(-2)
+    Bv = torch.roll(verts, shifts=-1, dims=-2).unsqueeze(-2)
+    u = A - points
+    v = Bv - points
+    nu = torch.linalg.norm(u, dim=-1)
+    nv = torch.linalg.norm(v, dim=-1)
+    uxv = torch.cross(u, v, dim=-1)
+    udv = (u * v).sum(-1)
+    fac = (nu + nv) / (nu * nv * (nu * nv + udv) + eps)
+    d = Bv - A
+    nd = torch.linalg.norm(d, dim=-1)
+    if core > 0:
+        d2 = (uxv * uxv).sum(-1) / (nd * nd).clamp_min(1e-12)
+        fac = fac * (d2 / core ** 2).clamp(max=1.0)
+    ad = -(u * d).sum(-1)                  # (P - A) . d  (not |u|^2 - u.v: that cancels in float32)
+    I = torch.log((nd * nv + nd * nd - ad).clamp_min(1e-12) / (nd * nu - ad).clamp_min(1e-12)) / nd
+    return (uxv * fac.unsqueeze(-1)).sum(-3), (uxv * I.unsqueeze(-1)).sum(-3)
+
+
 def transverse_to_sensitivity(Bx: torch.Tensor, By: torch.Tensor, handedness: int) -> torch.Tensor:
     """C = Bx + i*h*By (inputs may be real or complex tensors)."""
     return Bx + 1j * handedness * By

@@ -447,7 +447,9 @@ def test_helmholtz_needs_3d_and_wave_maps_match_training():
     torch.nn.init.normal_(pinn.net[-1].weight, std=0.05)
     train = CoarseCorrection(pinn, p).sensitivity(p.coords, create_graph=False).detach()
     ev_ = volume_maps(pinn, p, shape=p.calib).reshape(4, -1)
-    assert float((train - ev_).norm() / train.norm()) < 1e-5
+    # the two paths broadcast the points differently (per-coil vs shared), so float32 rounding differs;
+    # the closed-form kernels themselves are accurate to ~6e-6 against float64
+    assert float((train - ev_).norm() / train.norm()) < 2e-5
 
 
 @pytest.mark.parametrize("layout,shape", [("2d", (4, 24, 20)), ("3d", (4, 12, 12, 10)), ("dynamic", (4, 20, 20, 3))])
@@ -677,3 +679,90 @@ def test_solve_image_joint_full_resolution():
     g = torch.randn(1, 2, 8, 10, dtype=torch.complex64)
     up = upsample_maps(g, (16, 20))
     assert torch.allclose(up[..., ::2, ::2], g, atol=1e-5)
+
+
+def test_taylor_mode_matches_autograd():
+    """trunk_taylor (value, gradient, Laplacian in one forward pass) == nested autograd; and the
+    Laplace / Helmholtz physics losses built on it equal the autograd reference implementations."""
+    from bspinn.models import HarmonicPINN, HelmholtzPINN, WireLoopCoils, make_trunk, trunk_taylor
+    from bspinn.physics import grad
+    torch.manual_seed(0)
+    net = make_trunk(3 + 5, 32, 3, 2).double()
+    x = torch.randn(4, 50, 3, dtype=torch.float64, requires_grad=True)
+    z = torch.randn(4, 1, 5, dtype=torch.float64)
+    h, T, L = trunk_taylor(net, x, z)
+    ref = net(torch.cat([x, z.expand(-1, 50, -1)], -1))
+    assert torch.allclose(h, ref, atol=1e-12)
+    for k in range(2):
+        g = grad(ref[..., k], x)
+        lap = sum(grad(g[..., e], x)[..., e] for e in range(3))
+        assert torch.allclose(T[..., k], g, atol=1e-10) and torch.allclose(L[..., k], lap, atol=1e-9)
+    # physics losses vs autograd reference
+    w = WireLoopCoils(3, 1, 8, 1)
+    with torch.no_grad():
+        w.verts.normal_(0, 0.3); w.verts.add_(torch.tensor([1.5, 0, 0])); w.amp.fill_(1)
+    p = HarmonicPINN(3, "complex", 6, 32, 3, 1, base=w)
+    torch.nn.init.normal_(p.net[-1].weight, std=0.1)
+    pts = torch.randn(40, 3) * 0.4
+    xx = pts.unsqueeze(0).repeat(3, 1, 1).requires_grad_(True)
+    phi = p.potential(xx); Bw = p._base_field(xx); num = 0; den = 0
+    for k in range(2):
+        g = grad(phi[..., k], xx); lap = sum(grad(g[..., d], xx)[..., d] for d in range(3))
+        num = num + lap.pow(2).mean(1); Bt = Bw[..., k] - g
+        den = den + (Bt[..., 0].pow(2) + Bt[..., 1].pow(2)).mean(1)
+    assert torch.allclose(p.physics_loss(pts), (num / den).mean(), rtol=1e-4)
+    hp = HelmholtzPINN(3, 6, 32, 3, 1, base=w, k2_init=0.5 - 0.2j)
+    torch.nn.init.normal_(hp.net[-1].weight, std=0.1)
+    xx = pts.unsqueeze(0).repeat(3, 1, 1).requires_grad_(True)
+    Bc = hp._net(xx); Bt = Bc + hp._base_field(xx); a, b = hp.k2_re, hp.k2_im; res = 0; div = [0, 0]
+    for d in range(3):
+        lp = []
+        for q in range(2):
+            g = grad(Bc[..., d, q], xx); div[q] = div[q] + g[..., d]; lp.append(sum(grad(g[..., e], xx)[..., e] for e in range(3)))
+        fr, fi = Bt[..., d, 0], Bt[..., d, 1]
+        res = res + (lp[0] + a * fr - b * fi).pow(2) + (lp[1] + a * fi + b * fr).pow(2)
+    den = Bt.pow(2).sum((-1, -2)).mean(1)
+    want = (res.mean(1) / (den * max(abs(hp.k2) ** 2, 1.0))).mean() + hp.lambda_div * ((div[0] ** 2 + div[1] ** 2).mean(1) / den).mean()
+    assert torch.allclose(hp.physics_loss(pts), want, rtol=1e-4)
+
+
+def test_compiled_kernels_match_eager():
+    """accel.enable_compile (torch.compile of the Biot-Savart, wave-wire and Taylor-mode kernels) gives
+    the same fields, physics losses and parameter gradients as eager execution."""
+    import pytest
+    from bspinn import accel
+    from bspinn.models import HarmonicPINN, HelmholtzPINN, WireLoopCoils, WaveWireLoopCoils
+    torch.manual_seed(0)
+    w = WireLoopCoils(3, 1, 8, 1)
+    with torch.no_grad():
+        w.verts.normal_(0, 0.3); w.verts.add_(torch.tensor([1.5, 0, 0])); w.amp.fill_(1)
+    p = HarmonicPINN(3, "complex", 6, 32, 3, 1, base=w)
+    torch.nn.init.normal_(p.net[-1].weight, std=0.1)
+    hp = HelmholtzPINN(3, 6, 32, 3, 1, base=w, k2_init=0.5 - 0.2j)
+    ww = WaveWireLoopCoils(3, 1, 8, 1, k2_init=2 - 1j)
+    with torch.no_grad():
+        ww.verts.copy_(w.verts); ww.amp.fill_(1)
+    pts = torch.randn(64, 3) * 0.4
+
+    def run():
+        out = []
+        for mdl, f in ((p, lambda: p.physics_loss(pts) + p.field(pts).pow(2).mean()),
+                       (hp, lambda: hp.physics_loss(pts)),
+                       (w, lambda: w.field(pts).pow(2).mean()),
+                       (ww, lambda: ww.field(pts).pow(2).mean())):
+            mdl.zero_grad()
+            v = f(); v.backward()
+            out.append((v.detach().clone(), [torch.zeros_like(q) if q.grad is None else q.grad.clone() for q in mdl.parameters()]))
+        return out
+
+    ref = run()
+    try:
+        accel.enable_compile()
+        got = run()
+    except Exception as e:                                   # no C++ toolchain / unsupported platform
+        pytest.skip(f"torch.compile unavailable: {e}")
+    finally:
+        accel.disable_compile()
+    for (v0, g0), (v1, g1) in zip(ref, got):
+        assert torch.allclose(v0, v1, rtol=1e-4, atol=1e-7)
+        assert all(torch.allclose(a, b, rtol=1e-3, atol=1e-6) for a, b in zip(g0, g1))

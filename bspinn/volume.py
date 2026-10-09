@@ -258,9 +258,11 @@ class Problem3D:
 
     def collocation(self, n, gen):
         """Points throughout the imaged volume (the PDE domain is genuinely 3-D here)."""
-        idx = torch.randint(0, self.support_pts.shape[0], (n,), generator=gen)
-        p = self.support_pts[idx.to(self.support_pts.device)].clone()
-        return p + (0.5 * (self.coords[1] - self.coords[0]).abs().max() * torch.randn(p.shape, generator=gen)).to(p.device)
+        dev = gen.device
+        idx = torch.randint(0, self.support_pts.shape[0], (n,), generator=gen, device=dev)
+        p = self.support_pts[idx].clone()
+        step = self.__dict__.setdefault("_grid_step", float((self.coords[1] - self.coords[0]).abs().max()))
+        return p + 0.5 * step * torch.randn(p.shape, generator=gen, device=dev)
 
     def data_loss(self, Cs, m=None, sl=None, return_images=False):
         if Cs.dim() == 2:
@@ -309,6 +311,9 @@ class CoarseCorrection(CoilModel):
     def base(self):
         return self.pinn.base
 
+    def field_needs_autograd(self):
+        return self.pinn.field_needs_autograd()
+
     def gain(self):
         return self.pinn.gain()
 
@@ -350,6 +355,8 @@ def fit3d(data: VolumeData, cfg: FitConfig, log=print, orientation: str = "given
     """Fit the Biot–Savart model to 3-D data. Returns (model, prob, history, extra).
     ``orientation='auto'`` picks the B0 axis from the data (see ``select_orientation``)."""
     cfg.validate("fit3d")
+    from .accel import configure
+    configure(cfg)
     if cfg.threads:
         torch.set_num_threads(cfg.threads)
     torch.manual_seed(cfg.seed)

@@ -73,14 +73,19 @@ class FitConfig:
                                      #   ALL acquired k-space (NLINV-style; 2-D Cartesian). Maps stay on the
                                      #   calibration grid and are interpolated to full resolution in k-space
     iters_joint: int = 300           # joint full-resolution iterations (map steps)
-    joint_maps: str = "exact"        # 'exact': maps evaluated at every full-resolution pixel (gradient
-                                     #   back-propagated in chunks) | 'interp': calibration grid + k-space
-                                     #   interpolation (faster, biases the exact field near steep regions)
+    joint_maps: str = "hybrid"       # 'hybrid': exact wire field at every pixel + smooth network correction from
+                                     #   the calibration grid (k-space upsampled) | 'exact': everything at every
+                                     #   pixel | 'interp': whole maps from the calibration grid (biased near wires)
     lambda_joint_prox: float = 0.0   # proximal weight: ||C - C_calib||^2 / ||C_calib||^2 on the calibration grid
                                      #   (keeps the joint maps near the calibration solution)
     lr_joint: float = 0.0            # learning rate of the joint stage (0 = lr_pinn)
+    joint_chunk: int = 0             # points per chunk in the exact joint stage (0 = auto: from free GPU memory;
+                                     #   one single forward/backward pass when everything fits)
     joint_cg: int = 3                # CG steps on the image per map step (warm-started)
     lambda_joint_img: float = 1e-2   # Tikhonov weight on the image, relative to mean(sum_j |C_j|^2)
+    compile: bool = False            # torch.compile the hot kernels (Biot-Savart segments, Taylor-mode trunk):
+                                     #   fused elementwise kernels (Triton on GPU); first calls compile (~1 min)
+    tf32: bool = False               # allow TF32 matmuls on Ampere+ GPUs (faster, ~1e-3 relative precision)
     air_colloc: float = 0.25         # fraction of Laplace collocation points in the air around the object
                                      #   (>= 2 wire radii from any wire): keeps the network correction harmonic,
                                      #   hence smooth, outside the object too. 0 = object only
@@ -155,8 +160,8 @@ class FitConfig:
                 err.append("--joint-full is implemented for 2-D Cartesian data (fit); not for 3-D, dynamic or shared")
             if self.model not in ("pinn", "wires") or self.multiset:
                 err.append("--joint-full needs --model pinn|wires with a single map set")
-            if self.joint_maps not in ("exact", "interp"):
-                err.append("--joint-maps must be exact|interp")
+            if self.joint_maps not in ("exact", "interp", "hybrid"):
+                err.append("--joint-maps must be hybrid|exact|interp")
         if context == "dynamic":
             if self.model != "pinn" or self.init != "wires" or self.field_mode != "real":
                 err.append("dynamic: needs --model pinn --init wires --field-mode real")
@@ -369,11 +374,12 @@ class Problem:
     def collocation(self, n, gen):
         """Points inside the imaged object, jittered in-plane and spread through a slab
         along the slice normal (gives the PDE a 3-D domain even for one 2-D slice)."""
-        idx = torch.randint(0, self.support_pts.shape[0], (n,), generator=gen)
-        p = self.support_pts[idx.to(self.support_pts.device)].clone()
-        jit = 0.02 * torch.randn(p.shape, generator=gen)
-        jit[:, self.normal_axis] = (2 * torch.rand(n, generator=gen) - 1) * self.cfg.slab
-        return p + jit.to(p.device)
+        dev = gen.device
+        idx = torch.randint(0, self.support_pts.shape[0], (n,), generator=gen, device=dev)
+        p = self.support_pts[idx].clone()
+        jit = 0.02 * torch.randn(p.shape, generator=gen, device=dev)
+        jit[:, self.normal_axis] = (2 * torch.rand(n, generator=gen, device=dev) - 1) * self.cfg.slab
+        return p + jit
 
     def data_loss(self, Cs, m=None, sl=None, return_images=False):
         """Cs: (K,N,P) or (N,P) sensitivities on the calibration grid of slices ``sl``."""
@@ -443,7 +449,8 @@ def _log(hist, it, **kw):
 
 def _batch(prob, cfg, gen):
     if cfg.slice_batch and prob.S > cfg.slice_batch and (not prob.noncart or prob.per_slice_traj):
-        return sorted(torch.randperm(prob.S, generator=gen)[:cfg.slice_batch].tolist())
+        rng = prob.__dict__.setdefault("_slice_rng", np.random.default_rng(cfg.seed + 101))   # host-side: no GPU sync
+        return sorted(rng.permutation(prob.S)[:cfg.slice_batch].tolist())
     return None
 
 
@@ -486,7 +493,7 @@ def _image_param(prob, C0, K, m_prev=None):
 # ===================================================================================== wires
 def fit_wires(prob: Problem, cfg: FitConfig, handedness: int, iters: int, log=print, tag="wires"):
     torch.manual_seed(cfg.seed)
-    gen = torch.Generator().manual_seed(cfg.seed + 5)
+    gen = _device_gen(prob, cfg.seed + 5)
     if getattr(cfg, "physics", "laplace") == "helmholtz":
         from .models import WaveWireLoopCoils, tissue_k2
         k2 = tissue_k2(cfg.b0_tesla, cfg.eps_r, cfg.sigma, prob.data.geom.half_fov / 1000.0)
@@ -567,7 +574,7 @@ def make_pinn(prob, cfg, wires, h):
 
 def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None):
     iters = iters or cfg.iters_pinn
-    gen = torch.Generator().manual_seed(cfg.seed + 2)
+    gen = _device_gen(prob, cfg.seed + 2)
     named = list(model.named_parameters())
     k2p = [q for n, q in named if n.endswith(("k2_re", "k2_im")) and q.requires_grad]
     params = [{"params": [q for n, q in named if not n.endswith(("k2_re", "k2_im"))], "lr": cfg.lr_pinn}]
@@ -621,10 +628,10 @@ def upsample_maps(Cg, full):
     return _ifft2c_t(Kp) * float(np.sqrt(H * W / (h * w)))
 
 
-def _cg_image(C, y, M, box, lam, x0, iters):
+def _cg_image(C, y, M, box, lam, x0, iters, check=False):
     """Few CG steps of (C^H F^H M F C + lam) x = C^H F^H M y per slice, x restricted to the acquired
     k-space extent ``box`` (no extrapolation). C (S,N,H,W), y (S,N,H,W), M (S,1,H,W), box (H,W)."""
-    band = (lambda x: x) if bool(box.all()) else (lambda x: _ifft2c_t(_fft2c_t(x) * box))
+    band = (lambda x: x) if box is None else (lambda x: _ifft2c_t(_fft2c_t(x) * box))
     def A(x):
         return band((C.conj() * _ifft2c_t(M * _fft2c_t(C * x[:, None]))).sum(1)) + lam * x
     b = band((C.conj() * _ifft2c_t(M * y)).sum(1))
@@ -635,7 +642,7 @@ def _cg_image(C, y, M, box, lam, x0, iters):
         al = rs / (p.conj() * Ap).real.sum().clamp_min(1e-30)
         x = x + al * p; r = r - al * Ap
         rn = (r.conj() * r).real.sum()
-        if rn < 1e-12 * (b.conj() * b).real.sum():
+        if check and rn < 1e-12 * (b.conj() * b).real.sum():                 # host sync: only when asked
             break
         p = r + (rn / rs) * p; rs = rn
     return x
@@ -656,15 +663,21 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
     y = prob.ks_full.to(dev)                                               # (S,N,H,W)
     S, N, H, W = y.shape
     M = torch.from_numpy(np.asarray(prob.data.mask, np.float32)).to(dev)   # (S,1,H,W)
-    box = torch.from_numpy(acquired_extent(np.asarray(prob.data.mask).any(axis=(0, 1)))).to(dev)
+    box_np = acquired_extent(np.asarray(prob.data.mask).any(axis=(0, 1)))
+    box = None if box_np.all() else torch.from_numpy(box_np).to(dev)
     pts = prob.coords
-    gen = torch.Generator().manual_seed(cfg.seed + 9)
+    gen = _device_gen(prob, cfg.seed + 9)
     wires = wire_modules(model)
 
-    exact = cfg.joint_maps == "exact"
+    hybrid = cfg.joint_maps == "hybrid" and isinstance(model, HarmonicPINN) and model.base is not None
+    exact = cfg.joint_maps in ("exact", "hybrid") and not hybrid           # (wires-only model: exact is cheap)
     pts_full = prob.data.geom.grid().reshape(-1, 3).to(dev)                # (S*H*W, 3)
     n_model = prob.N_model
-    chunk = max(256, 65536 // max(1, n_model))                            # forward-mode limit per call
+    chunk = _joint_chunk(cfg, model, n_model, dev, pts_full.shape[0])
+    single = exact and chunk >= pts_full.shape[0]                          # whole image in one graph
+    if exact:
+        log(f"joint full-res: exact maps, {pts_full.shape[0]} points x {n_model} coils, "
+            + ("single pass" if single else f"chunks of {chunk} points"))
 
     def to_full(Cflat):                                                    # (N, S*H*W) -> (S, N, H, W)
         return Cflat.reshape(Cflat.shape[0], S, H, W).permute(1, 0, 2, 3)
@@ -675,7 +688,42 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         vary ~1000x between deep tissue and the conductors)."""
         return C / (C.abs().pow(2).sum(dim, keepdim=True).sqrt() + 1e-12)
 
+    h_, w_ = prob.calib
+
+    def sens_from_field(B):                                                # CoilModel.sensitivity on a field
+        if B.shape[-1] == 1:
+            Bx, By = B[..., 0, 0], B[..., 1, 0]
+        else:
+            Bx = torch.complex(B[..., 0, 0], B[..., 0, 1]); By = torch.complex(B[..., 1, 0], B[..., 1, 1])
+        return (Bx + 1j * model.handedness * By) * model.gain()[:, None]
+
+    def wire_field(points):                                               # (N,P,3,K), closed form
+        Bw = model.base.field(points)
+        if model.K == 2:
+            th = model.base.theta
+            Bw = torch.cat([Bw * torch.cos(th)[:, None, None, None], Bw * torch.sin(th)[:, None, None, None]], -1)
+        return Bw
+
+    def correction_up():                                                   # (N,S*H*W,3,K) from the grid
+        Bc = model.correction_field(pts)                                   # (N,S*h*w,3,K), with graph
+        Nn, _, _, K = Bc.shape
+        g = Bc.reshape(Nn, S, h_, w_, 3 * K).permute(1, 0, 4, 2, 3).reshape(S, Nn * 3 * K, h_, w_)
+        up = upsample_maps(g.to(torch.complex64), (H, W)).real              # band-limited interpolation
+        return up.reshape(S, Nn, 3 * K, H, W).permute(1, 0, 3, 4, 2).reshape(Nn, S * H * W, 3, K)
+
+    def hybrid_field_nograd():
+        with torch.no_grad():
+            Bw = torch.cat([wire_field(pts_full[i:i + chunk]) for i in range(0, pts_full.shape[0], chunk)], 1)
+            return Bw + correction_up()
+
+    def maps_from_field(F):
+        return rssn(to_full(prob.mixC(sens_from_field(F), -2)), 1)
+
     def maps(create_graph):
+        if hybrid:
+            return maps_from_field(hybrid_field_nograd()), None
+        if single and create_graph:
+            return None, None                                              # computed with the graph in the loop
         if exact:
             with torch.no_grad():
                 Cf = torch.cat([model.sensitivity(pts_full[i:i + chunk], create_graph=False)
@@ -695,7 +743,7 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         Cg0 = model.sensitivity(pts, create_graph=False).detach()          # calibration solution (prox anchor)
         C0, _ = maps(False)
         lam = cfg.lambda_joint_img * float((C0.abs() ** 2).sum(1).mean())
-        x = _cg_image(C0, y, M, box, lam, torch.zeros(S, H, W, dtype=torch.complex64, device=dev), 30)
+        x = _cg_image(C0, y, M, box, lam, torch.zeros(S, H, W, dtype=torch.complex64, device=dev), 30, check=True)
     ynorm = float((y.abs() ** 2).sum())
     params = [q for q in model.parameters() if q.requires_grad]
     lr = cfg.lr_joint or cfg.lr_pinn
@@ -705,7 +753,26 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
     for it in range(cfg.iters_joint):
         opt.zero_grad()
         C, Cg = maps(True)
-        if exact:
+        if hybrid:
+            # dL/dF on the full-resolution field, then back through (a) the exact wire field in chunks and
+            # (b) the grid network + k-space upsampling (one small graph)
+            Fv = hybrid_field_nograd().requires_grad_(True)
+            Cv = maps_from_field(Fv)
+            d = (M * _fft2c_t(Cv * x[:, None]) - y).abs().pow(2).sum() / ynorm
+            d.backward()
+            gF = Fv.grad
+            for i in range(0, pts_full.shape[0], chunk):
+                (wire_field(pts_full[i:i + chunk]) * gF[:, i:i + chunk]).sum().backward()
+            (correction_up() * gF).sum().backward()
+            C = Cv.detach()
+            Cg = model.sensitivity(pts, create_graph=True)
+            rest = 0.0
+        elif single:                                                       # one graph: no recomputation
+            C = rssn(to_full(prob.mixC(model.sensitivity(pts_full, create_graph=True), -2)), 1)
+            d = (M * _fft2c_t(C * x[:, None]) - y).abs().pow(2).sum() / ynorm
+            Cg = model.sensitivity(pts, create_graph=True)
+            rest = d
+        elif exact:
             Cv = C.detach().requires_grad_(True)
             d = (M * _fft2c_t(Cv * x[:, None]) - y).abs().pow(2).sum() / ynorm
             d.backward()
@@ -730,8 +797,25 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             log(f"[joint full-res] it {it:5d}  data {d.item():.4e}")
     with torch.no_grad():
         C, _ = maps(False)
-        x = _cg_image(C, y, M, box, lam, x, 20)
+        x = _cg_image(C, y, M, box, lam, x, 20, check=True)
     return x.detach(), hist
+
+
+def _joint_chunk(cfg, model, n_coils, dev, n_points):
+    """Points per chunk for exact full-resolution map evaluation with a graph. CPU: the historical
+    65536 point-coils per call. CUDA: from the free memory (half of it), possibly all points at once."""
+    if cfg.joint_chunk:
+        return int(cfg.joint_chunk)
+    if dev.type != "cuda":
+        return max(256, 65536 // max(1, n_coils))
+    free, _ = torch.cuda.mem_get_info(dev)
+    width, depth = getattr(cfg, "width", 64), getattr(cfg, "depth", 4)
+    # saved activations per point-coil: value + 3 tangents per layer (fp32), x3 for backward temporaries,
+    # plus the wire terms (vertices x ~12 floats)
+    verts = sum(w.verts[0].numel() // 3 for w in wire_modules(model)) or 12
+    bytes_pp = 4 * (4 * width * (depth + 1) * 3 + 12 * verts)
+    per_point = bytes_pp * n_coils
+    return max(1024, int(0.5 * free // per_point))
 
 
 def wire_modules(model):
@@ -748,21 +832,31 @@ def air_points(prob, n, gen, wires, min_dist):
     jittered through the slab), outside the object, and at least ``min_dist`` from every wire."""
     if n <= 0:
         return None
-    idx = torch.randint(0, prob.coords.shape[0], (4 * n,), generator=gen).to(prob.coords.device)
+    dev = prob.coords.device
+    idx = torch.randint(0, prob.coords.shape[0], (4 * n,), generator=gen, device=dev)
     p = prob.coords[idx].clone()
-    step = float((prob.coords[1] - prob.coords[0]).abs().max())
-    p = p + (0.5 * step * torch.randn(p.shape, generator=gen)).to(p.device)
+    step = prob.__dict__.setdefault("_grid_step", float((prob.coords[1] - prob.coords[0]).abs().max()))
+    p = p + 0.5 * step * torch.randn(p.shape, generator=gen, device=dev)
     na = getattr(prob, "normal_axis", None)
     if na is not None and prob.__class__.__name__ == "Problem":
-        p[:, na] = ((2 * torch.rand(p.shape[0], generator=gen) - 1) * prob.cfg.slab).to(p.device)
+        p[:, na] = (2 * torch.rand(p.shape[0], generator=gen, device=dev) - 1) * prob.cfg.slab
     with torch.no_grad():
         keep = prob.keep.distance(p) > 0
         if wires:
             from .keepout import segment_samples
             ws = torch.cat([segment_samples(w.verts.detach(), 4).reshape(-1, 3) for w in wires])
             keep &= torch.cdist(p, ws).min(1).values > min_dist
-    p = p[keep][:n]
-    return p if p.shape[0] >= 8 else None
+        # fixed-size draw: admissible candidates first, in random order (static shapes, no host sync;
+        # topk is ~50x faster than multinomial without replacement)
+        score = keep.float() + torch.rand(keep.shape, generator=gen, device=dev)
+        pick = torch.topk(score, n, sorted=False).indices
+    return p[pick]
+
+
+def _device_gen(prob, seed):
+    """Random generator on the problem's device: sampling happens where the data are (no host
+    round-trip per iteration). On CPU identical to torch.Generator().manual_seed(seed)."""
+    return torch.Generator(device=prob.device).manual_seed(seed)
 
 
 def _physics(model, prob, cfg, gen, wires):
@@ -770,9 +864,8 @@ def _physics(model, prob, cfg, gen, wires):
     weight air_colloc, in the surrounding air (source-free too, as long as we stay off the wires)."""
     n_air = int(round(cfg.air_colloc * cfg.n_colloc))
     phys = model.physics_loss(prob.collocation(cfg.n_colloc - n_air, gen))
-    pa = air_points(prob, n_air, gen, wires, 2 * max(cfg.wire_radius, 0.02))
-    if pa is not None:
-        phys = phys + cfg.air_colloc * model.physics_loss(pa)
+    if n_air > 0:
+        phys = phys + cfg.air_colloc * model.physics_loss(air_points(prob, n_air, gen, wires, 2 * max(cfg.wire_radius, 0.02)))
     return phys
 
 
@@ -781,7 +874,7 @@ def _fit_free(prob, cfg, history, t0, log):
     """No-physics ablation: smooth neural maps, distilled to low-res division maps, then the same
     data term with a Sobolev smoothness penalty in place of the Biot–Savart constraint."""
     from .models import FreeMaps
-    gen = torch.Generator().manual_seed(cfg.seed + 3)
+    gen = _device_gen(prob, cfg.seed + 3)
     model = FreeMaps(prob.N_model, cfg.latent, cfg.width, cfg.depth).to(prob.device)
     rss = (prob.I.abs() ** 2).sum(1, keepdim=True).sqrt().clamp_min(1e-6)
     target = (prob.I / rss).permute(1, 0, 2, 3).reshape(prob.N, -1)
@@ -804,6 +897,8 @@ def _fit_free(prob, cfg, history, t0, log):
 
 def fit(data: MultiCoilData, cfg: FitConfig, log=print):
     cfg.validate("fit")
+    from .accel import configure
+    configure(cfg)
     if cfg.threads:
         torch.set_num_threads(cfg.threads)
     torch.manual_seed(cfg.seed)

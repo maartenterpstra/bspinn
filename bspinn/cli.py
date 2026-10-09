@@ -120,7 +120,9 @@ def main(argv=None):
     pm.add_argument("--quality", default="default", choices=["fast", "default"])
     pm.add_argument("--normalise", default="rss", choices=["rss", "none"])
     pm.add_argument("--phase-ref", default="inati", choices=["inati", "model", "coil"])
-    pm.add_argument("--device", default="cpu")
+    pm.add_argument("--device", default="cpu", help="cpu | cuda | cuda:1 ...")
+    pm.add_argument("--compile", action="store_true", help="torch.compile the hot kernels (first iterations compile)")
+    pm.add_argument("--tf32", action="store_true", help="TF32 matmuls on Ampere+ GPUs")
     pm.add_argument("--threads", type=int, default=0)
     pm.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="any FitConfig field, e.g. iters_pinn=1000")
     pm.add_argument("--solve-image", action="store_true",
@@ -264,6 +266,8 @@ def _run_maps(a):
             raise SystemExit(f"unknown option {key}")
         t = type(defaults[key])
         over[key] = (val.lower() in ("1", "true", "yes")) if t is bool else t(val)
+    over.setdefault("compile", a.compile)
+    over.setdefault("tf32", a.tf32)
     calib = None if a.calib is None else (a.calib[0] if len(a.calib) == 1 else tuple(a.calib))
     under = None
     if a.undersample_mask:

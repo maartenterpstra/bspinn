@@ -105,14 +105,15 @@ def fit_shared(files, cfg: FitConfig, out_dir, slices_per_volume=0, steps=3000, 
     opt = torch.optim.Adam([{"params": trunk.parameters(), "lr": cfg.lr_pinn},
                             {"params": own, "lr": cfg.lr_pinn}])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps, eta_min=0.1 * cfg.lr_pinn)
-    gen = torch.Generator().manual_seed(cfg.seed + 7)
+    gen = torch.Generator(device=cfg.device).manual_seed(cfg.seed + 7)       # collocation sampled on-device
+    slice_rng = np.random.default_rng(cfg.seed + 8)                            # slice choice on the host
     hist = []
     for it in range(steps):
         v = vols[it % len(vols)]
         prob, pinn = v["prob"], v["pinn"]
         sl = None
         if cfg.slice_batch and prob.S > cfg.slice_batch:
-            sl = sorted(torch.randperm(prob.S, generator=gen)[:cfg.slice_batch].tolist())
+            sl = sorted(slice_rng.permutation(prob.S)[:cfg.slice_batch].tolist())
         opt.zero_grad()
         C = pinn.sensitivity(prob.slice_coords(sl))
         d = prob.data_loss(C, None, sl)

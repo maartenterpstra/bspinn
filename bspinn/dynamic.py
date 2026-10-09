@@ -153,15 +153,16 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print)
         params.append({"params": [m], "lr": 1e-2})
     opt = torch.optim.Adam(params)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, dcfg.iters_dyn, eta_min=0.1 * cfg.lr_pinn)
-    gen = torch.Generator().manual_seed(cfg.seed + 11)
+    gen = torch.Generator(device=prob.device).manual_seed(cfg.seed + 11)
+    frame_rng = np.random.default_rng(cfg.seed + 12)
     h, w = prob.calib
     pts = prob.coords.reshape(prob.S, h * w, 3)[0]                 # all frames share the grid
-    sup = prob.support_pts[torch.randperm(prob.support_pts.shape[0], generator=gen)[:1024].to(prob.device)]
+    sup = prob.support_pts[torch.randperm(prob.support_pts.shape[0], generator=gen, device=prob.device)[:1024]]
     dhist = []
     max_disp = dcfg.max_disp_mm / prob.data.geom.half_fov if dcfg.max_disp_mm else None
     B = cfg.slice_batch or prob.S
     for it in range(dcfg.iters_dyn):
-        fr = sorted(torch.randperm(prob.S, generator=gen)[:B].tolist())
+        fr = sorted(frame_rng.permutation(prob.S)[:B].tolist())
         opt.zero_grad()
         C = dyn.sensitivity_frames(pts, fr)                        # (B,N,P)
         Cflat = C.permute(1, 0, 2).reshape(prob.N_model, -1)

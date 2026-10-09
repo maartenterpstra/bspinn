@@ -79,13 +79,22 @@ class CoilModel(nn.Module):
         C = transverse_to_sensitivity(Bx, By, self.handedness)
         return C * self.gain()[:, None]
 
-    def sensitivity_batched(self, points: torch.Tensor, chunk: int = 16384) -> torch.Tensor:
-        """Inference-time evaluation on large grids (no graph kept)."""
+    def field_needs_autograd(self) -> bool:
+        """True if evaluating the field requires autograd (spatial derivatives by backprop)."""
+        return True
+
+    def sensitivity_batched(self, points: torch.Tensor, chunk: int | None = None) -> torch.Tensor:
+        """Inference-time evaluation on large grids, on the model's device, returned on the CPU.
+        No autograd graph when the field is computed in closed form / by Taylor mode."""
+        params = list(self.parameters())
+        dev = params[0].device if params else points.device
+        chunk = chunk or (262144 if dev.type == "cuda" else 16384)
         out = []
+        ctx = torch.enable_grad if self.field_needs_autograd() else torch.no_grad
         for i in range(0, points.shape[0], chunk):
-            p = points[i:i + chunk]
-            with torch.enable_grad():
-                out.append(self.sensitivity(p, create_graph=False).detach())
+            p = points[i:i + chunk].to(dev)
+            with ctx():
+                out.append(self.sensitivity(p, create_graph=False).detach().cpu())
         return torch.cat(out, dim=1)
 
     def physics_loss(self, points: torch.Tensor) -> torch.Tensor:
@@ -104,6 +113,9 @@ class WireLoopCoils(CoilModel):
         self.amp = nn.Parameter(torch.zeros(n_coils, loops_per_coil))   # real loop currents
         self.theta = nn.Parameter(torch.zeros(n_coils))                  # receive-chain phase
         self.core = 0.0          # conductor radius (normalised); set from FitConfig.wire_radius
+
+    def field_needs_autograd(self):
+        return False
 
     def gain(self):
         return torch.exp(1j * self.theta)
@@ -195,24 +207,47 @@ class WireLoopCoils(CoilModel):
         return outside, curv
 
 
-def trunk_value_and_grad(net: nn.Sequential, x: torch.Tensor, z: torch.Tensor):
-    """Value and spatial gradient of a Linear/Tanh MLP at inputs cat[x, z] by forward-mode
-    propagation of the three tangents d/dx_i. Same result as autograd.grad, but a single
-    differentiable pass (no double backward), ~3-5x faster for training on large 3-D grids.
-    x: (..., 3), z: (..., L)  ->  phi (..., K), dphi/dx (..., 3, K)."""
+def trunk_taylor(net: nn.Sequential, x: torch.Tensor, z: torch.Tensor, laplacian: bool = True):
+    """Value, spatial gradient and (optionally) spatial Laplacian of a Linear/Tanh MLP at cat[x, z],
+    by forward ("Taylor-mode") propagation in ONE differentiable pass: no autograd.grad, no double
+    backward. Value, tangents and Laplacian are kept as separate contiguous tensors (one matmul each per
+    layer; stacking them into one matmul was 2x slower on CPU because of the per-layer concat). tanh: t' = 1 - t^2, t'' = -2 t t'; for y = tanh(a):
+    grad y = t' grad a, lap y = t' lap a + t'' |grad a|^2.
+
+    x: (..., 3); z: latent codes broadcastable to (..., L), e.g. (N, 1, L) for per-coil codes (their
+    first-layer contribution is computed once per code, not per point).
+    Returns phi (..., K), dphi/dx (..., 3, K), lap phi (..., K) (None if laplacian=False)."""
     layers = list(net)
-    W0 = layers[0].weight
-    h = torch.nn.functional.linear(torch.cat([x, z], -1), W0, layers[0].bias)
-    T = W0[:, :3].T.expand(*h.shape[:-1], 3, W0.shape[0])                    # (..., 3, width)
+    W0, b0 = layers[0].weight, layers[0].bias
+    Wx, Wz = W0[:, :3], W0[:, 3:]
+    zc = torch.nn.functional.linear(z, Wz, b0)                               # (..., width), per code
+    h = torch.nn.functional.linear(x, Wx) + zc
+    T = Wx.T.expand(*h.shape[:-1], 3, W0.shape[0])                           # (..., 3, width)
+    L = None
     for layer in layers[1:]:
         if isinstance(layer, nn.Tanh):
-            h = torch.tanh(h)
-            T = T * (1 - h * h).unsqueeze(-2)
+            t = torch.tanh(h)
+            s = 1 - t * t
+            if laplacian:
+                q = (T * T).sum(-2)
+                L = (-2 * t * s) * q if L is None else L * s - 2 * t * s * q
+            T = T * s.unsqueeze(-2)
+            h = t
         elif isinstance(layer, nn.Linear):
             h = torch.nn.functional.linear(h, layer.weight, layer.bias)
-            T = T @ layer.weight.T
+            T = T @ layer.weight.T                                                # contiguous, no concat copies
+            if L is not None:
+                L = torch.nn.functional.linear(L, layer.weight)
         else:
-            raise TypeError("forward-mode gradient supports Linear/Tanh trunks only")
+            raise TypeError("Taylor-mode propagation supports Linear/Tanh trunks only")
+    if laplacian and L is None:
+        L = torch.zeros_like(h)
+    return h, T, L
+
+
+def trunk_value_and_grad(net: nn.Sequential, x: torch.Tensor, z: torch.Tensor):
+    """Value and spatial gradient (see trunk_taylor): phi (..., K), dphi/dx (..., 3, K)."""
+    h, T, _ = trunk_taylor(net, x, z, laplacian=False)
     return h, T
 
 
@@ -248,8 +283,21 @@ class HarmonicPINN(CoilModel):
             return torch.ones(self.n_coils, dtype=torch.complex64, device=self.theta.device)
         return torch.exp(1j * self.theta)
 
+    def field_needs_autograd(self):
+        return not self._taylor_ok()
+
+    def _taylor_ok(self):
+        """Taylor-mode applies to the standard potential (a Linear/Tanh trunk); subclasses that override
+        ``potential`` (e.g. analytic test potentials) use autograd."""
+        return (type(self).potential is HarmonicPINN.potential
+                and all(isinstance(l, (nn.Linear, nn.Tanh)) for l in self.net))
+
     def correction_field(self, points, create_graph=True):
         """-grad Phi_NN only (no wire part); (N,P,3,K)."""
+        if self._taylor_ok():
+            x = points.unsqueeze(0).expand(self.n_coils, -1, -1) if points.dim() == 2 else points
+            _, g, _ = trunk_taylor(self.net, x, self.codes[:, None, :], laplacian=False)
+            return -g
         x = self._xin(points)
         phi = self.potential(x)
         return torch.stack([-grad(phi[..., k], x, create_graph) for k in range(self.K)], dim=-1)
@@ -275,16 +323,15 @@ class HarmonicPINN(CoilModel):
         z = self.codes[:, None, :].expand(-1, x.shape[1], -1)
         return self.net(torch.cat([x, z], dim=-1))                     # (N,P,K)
 
-    forward_mode = True        # small batches: spatial gradient by forward-mode tangents (trunk_value_and_grad)
+    forward_mode = True        # spatial derivatives by forward (Taylor-mode) propagation, see trunk_taylor
 
     def field(self, points, create_graph=True):
-        x = self._xin(points)
-        if (self.forward_mode and x.shape[0] * x.shape[1] <= 65536
-                and all(isinstance(l, (nn.Linear, nn.Tanh)) for l in self.net)):
-            z = self.codes[:, None, :].expand(-1, x.shape[1], -1)
-            _, g = trunk_value_and_grad(self.net, x, z)                       # (N,P,3,K)
+        x = points.unsqueeze(0).expand(self.n_coils, -1, -1) if points.dim() == 2 else points
+        if self._taylor_ok():
+            _, g, _ = trunk_taylor(self.net, x, self.codes[:, None, :], laplacian=False)
             B = -g
-        else:
+        else:                                                                 # generic trunk: autograd
+            x = self._xin(points)
             phi = self.potential(x)
             B = torch.stack([-grad(phi[..., k], x, create_graph) for k in range(self.K)], dim=-1)
         Bw = self._base_field(x)
@@ -292,18 +339,26 @@ class HarmonicPINN(CoilModel):
 
     def physics_loss(self, points):
         """Relative Laplace residual mean(lap Phi^2) / mean(|B_transverse|^2), per coil.
-        (The wire part of the field is harmonic analytically and contributes no residual.)"""
-        x = self._xin(points)
-        phi = self.potential(x)
-        num = 0.0
-        den = 0.0
-        Bw = self._base_field(x)
-        for k in range(self.K):
-            g = grad(phi[..., k], x)
-            lap = sum(grad(g[..., d], x)[..., d] for d in range(3))
-            num = num + lap.pow(2).mean(1)
-            Bt = -g if Bw is None else Bw[..., k] - g
-            den = den + (Bt[..., 0].pow(2) + Bt[..., 1].pow(2)).mean(1).detach()
+        (The wire part of the field is harmonic analytically and contributes no residual.)
+        Value, gradient and Laplacian come from one forward Taylor-mode pass (no double backward)."""
+        if not self._taylor_ok():                                             # generic potential: autograd
+            x = self._xin(points)
+            phi = self.potential(x)
+            Bw = self._base_field(x)
+            num = den = 0.0
+            for k in range(self.K):
+                g = grad(phi[..., k], x)
+                lap = sum(grad(g[..., d], x)[..., d] for d in range(3))
+                num = num + lap.pow(2).mean(1)
+                Bt = -g if Bw is None else Bw[..., k] - g
+                den = den + (Bt[..., 0].pow(2) + Bt[..., 1].pow(2)).mean(1).detach()
+            return (num / den.clamp_min(1e-12)).mean()
+        x = points.unsqueeze(0).expand(self.n_coils, -1, -1) if points.dim() == 2 else points
+        _, g, lap = trunk_taylor(self.net, x.detach(), self.codes[:, None, :], laplacian=True)   # (N,P,3,K), (N,P,K)
+        Bw = self._base_field(x.detach())
+        Bt = -g if Bw is None else Bw.detach() - g
+        num = lap.pow(2).sum(-1).mean(1)
+        den = (Bt[..., 0, :].pow(2) + Bt[..., 1, :].pow(2)).sum(-1).mean(1).detach()
         return (num / den.clamp_min(1e-12)).mean()
 
 
@@ -371,8 +426,7 @@ class WaveWireLoopCoils(WireLoopCoils):
 
     def field(self, points, create_graph=True, verts=None):
         """(N,P,3,2): real and imaginary parts of the complex field."""
-        static = super().field(points, create_graph, verts)[..., 0]  # (N,P,3) real
-        static = static + self._wave_1r(points, verts)                # closed-form k^2/(2r) term (complex)
+        static = self._static_and_1r(points, verts)                   # Biot-Savart + closed-form k^2/(2r), one pass
         if self.coarse is not None and points is self.coarse[0] and verts is None:
             # the wave part is smooth (non-singular): evaluate it on the coarse grid, upsample trilinearly
             _, pc, fs, cs = self.coarse
@@ -384,6 +438,16 @@ class WaveWireLoopCoils(WireLoopCoils):
             w = self._wave(points, create_graph, verts)
         B = static + w
         return torch.stack([B.real, B.imag], -1)
+
+    def _static_and_1r(self, points, verts):
+        """Static Biot-Savart field + 0.5 k^2 * (closed-form 1/r integral), sharing the segment geometry."""
+        from . import physics
+        V = self.verts if verts is None else verts
+        pts = points[:, None, None] if points.dim() == 3 else points
+        st, vl = physics.segment_static_and_log(V, pts, core=self.core)    # (N,L,P,3) each
+        st = (st * self.amp[..., None, None]).sum(-3)
+        vl = (vl * self.amp[..., None, None]).sum(-3)
+        return st + 0.5 * torch.complex(self.k2_re, self.k2_im) * vl
 
     def _wave_1r(self, points, verts):
         """Leading term of the wave kernel, k^2/(2r): along a straight segment dl x R = d x (P - A) is
@@ -501,6 +565,9 @@ class HelmholtzPINN(CoilModel):
         re, im = Bw[..., 0], Bw[..., 1]
         return torch.stack([re * c - im * s_, re * s_ + im * c], -1)
 
+    def field_needs_autograd(self):
+        return False                                                         # direct network output + wires
+
     def _net(self, x):
         z = self.codes[:, None, :].expand(-1, x.shape[1], -1)
         out = self.net(torch.cat([x, z], dim=-1))                         # (N,P,6)
@@ -517,30 +584,25 @@ class HelmholtzPINN(CoilModel):
         return Bc if Bw is None else Bc + Bw
 
     def physics_loss(self, points):
-        """mean|lap B_c + k^2 B_total|^2 / (mean|B_total|^2 max(|k^2|^2, 1)) + lambda_div mean|div B_c|^2 / mean|B_total|^2."""
-        from .physics import grad
-        x = points.detach().unsqueeze(0).repeat(self.n_coils, 1, 1).requires_grad_(True)
-        Bc = self._net(x)                                                  # (N,P,3,2)
+        """mean|lap B_c + k^2 B_total|^2 / (mean|B_total|^2 max(|k^2|^2, 1)) + lambda_div mean|div B_c|^2 / mean|B_total|^2.
+        Jacobian (for div) and Laplacian of all six outputs from one forward Taylor-mode pass."""
+        x = points.detach().unsqueeze(0).expand(self.n_coils, -1, -1)
+        out, J, L = trunk_taylor(self.net, x, self.codes[:, None, :], laplacian=True)   # (N,P,6), (N,P,3,6), (N,P,6)
+        Bc = out.reshape(*out.shape[:-1], 3, 2)
+        lap = L.reshape(*L.shape[:-1], 3, 2)
+        Jr = J.reshape(*J.shape[:-1], 3, 2)                                  # [..., d_e, component d, part p]
+        div = Jr[..., 0, 0, :] + Jr[..., 1, 1, :] + Jr[..., 2, 2, :]                 # (N,P,2): d_e B_e
         Bw = self._base_field(x)
         Bt = Bc if Bw is None else Bc + Bw.detach()
         # wave wires already solve the Helmholtz equation: only the correction enters the residual;
         # quasi-static wires are harmonic, so their k^2 B_w term remains as a source
         Br = Bc if (Bw is None or self.wave_base) else Bt
         a, b = self.k2_re, self.k2_im
-        res = 0.0
-        div = [0.0, 0.0]
-        for d in range(3):
-            lap = []
-            for p in range(2):
-                g = grad(Bc[..., d, p], x)
-                div[p] = div[p] + g[..., d]
-                lap.append(sum(grad(g[..., e], x)[..., e] for e in range(3)))
-            fr, fi = Br[..., d, 0], Br[..., d, 1]
-            rr = lap[0] + a * fr - b * fi
-            ri = lap[1] + a * fi + b * fr
-            res = res + rr.pow(2) + ri.pow(2)
+        rr = lap[..., 0] + a * Br[..., 0] - b * Br[..., 1]
+        ri = lap[..., 1] + a * Br[..., 1] + b * Br[..., 0]
+        res = (rr.pow(2) + ri.pow(2)).sum(-1)
         den = Bt.pow(2).sum((-1, -2)).mean(1).detach().clamp_min(1e-12)       # per coil
-        kk = max(abs(self.k2) ** 2, 1.0)
+        kk = (a.detach() ** 2 + b.detach() ** 2).clamp_min(1.0)                # |k^2|^2 without a host sync
         helm = (res.mean(1) / (den * kk)).mean()
-        dv = ((div[0] ** 2 + div[1] ** 2).mean(1) / den).mean()
+        dv = ((div[..., 0] ** 2 + div[..., 1] ** 2).mean(1) / den).mean()
         return helm + self.lambda_div * dv

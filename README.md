@@ -10,11 +10,12 @@ scalar potential. Works for any number of coils, single or multiple slices, Cart
 python -m bspinn.cli fit ksp.cfl --out runs/mydata                     # any BART / fastMRI / npy dataset
 python -m bspinn.cli fit ksp.cfl --traj traj.cfl --noise noise.cfl --out runs/radial
 python -m bspinn.cli synthetic --coils 12 --out runs/synth            # validation with ground truth
-python -m pytest tests                                                 # 40 tests, ~12 min
+python -m pytest tests                                                 # 62 tests, ~4 min
 ```
 
 Requirements: Python ≥ 3.10, PyTorch ≥ 2.0, NumPy, matplotlib (figures), h5py (fastMRI only).
-Runs on CPU; uses a GPU-free autograd PDE residual, so a 2-CPU laptop fits a slice in 5–20 min.
+Runs on CPU (a 2-CPU laptop fits a slice in 5–20 min) or on a GPU (`device="cuda"`, optionally
+`compile=True`): see §8.2.
 
 ---
 
@@ -403,7 +404,7 @@ What matters:
 * **Run time** (measured, 2 CPU cores, `quality="fast"`): 2-D 48×48, 6 coils ≈ 1.5 min (300 PINN
   iterations); dynamic 48×48×16 frames, 8 coils ≈ 10 min; 3-D 32³, 12 coils with `axes="auto"` ≈ 7 min;
   3-D 48³ at evaluation settings ≈ 16 min (Laplace) or 42 min (Helmholtz) on one core. Cost scales with the calibration grid
-  (`calib`), not with the image matrix. Use `device="cuda"` if available.
+  (`calib`), not with the image matrix. Use `device="cuda"` if available (§8.2).
 * **Sanity check on synthetic data with known maps** (same calls, `quality="fast"`): subspace error
   3.75e-5 (2-D 96², 8 coils), 2.4e-4 (dynamic, moving anterior coils; the recovered temporal mode
   correlates 0.997 with the true motion), 3.9e-4 (3-D 32³; `quality="default"` at 48³ gives 5.8e-5,
@@ -510,8 +511,8 @@ python -m bspinn.cli fit new_volume.h5 ... --pretrained shared/trunk.pt    # sta
   ISMRMRD header and the B0 orientation from the `acquisition` attribute (`AX*`, `COR*`, `SAG*`).
   Maps are exported at full resolution from the continuous model (`maps.npy`, S×N×H×W).
 * Coil counts may differ between volumes in both modes.
-* `--device cuda` moves the calibration problem and models to the GPU; evaluation runs on CPU.
-  (Developed on a CPU-only machine: the GPU path is implemented but **untested**.)
+* `--device cuda` moves the calibration problem, models and full-resolution map evaluation to the GPU
+  (§8.2). (Developed on a CPU-only machine: run `scripts/bench_gpu.py` once to check your GPU.)
 * Cost on CPU (1 thread): ~0.1 s per wire iteration and ~0.3 s per PINN iteration for a
   3-slice minibatch at calib 32 → a few minutes per volume. A full fastMRI training set
   (thousands of volumes) is a GPU / multi-worker job; `--shard i/n` splits the file list.
@@ -858,12 +859,52 @@ effects relative to coils in air beside a body: relative Laplacian of the maps 4
   k², level 2), coils in air beside a body (a volume-integral or FDTD reference), and real 3 T or 7 T 3-D data.
 * Cost: about 42 min per 48³ volume on one CPU core (the Laplace PINN takes about 16 min).
 
+### 8.2 Performance and GPU
+
+```python
+C, img, info = estimate_maps(ksp, "2d", device="cuda", compile=True, return_image=True)   # tf32=True optional
+```
+```
+python -m bspinn.cli maps ksp.npy --out maps.npy --device cuda --compile [--tf32]
+python scripts/bench_gpu.py [--device cuda:0] [--quick]      # correctness (device vs CPU) + per-stage timings
+```
+
+What runs where with `device="cuda"`: every fitting stage (wires, PINN, Helmholtz, dynamic, joint
+image), the full-resolution map evaluation and the CG-SENSE image (`sense_image`, torch FFTs). Only
+the inputs and outputs cross the PCIe bus.
+
+What was changed for GPU throughput (all exact, covered by tests):
+
+| change | effect |
+|---|---|
+| **Taylor-mode MLP** (`models.trunk_taylor`): value, gradient and Laplacian of the tanh trunk propagated in one forward pass (t′ = 1−t², t″ = −2t t′) instead of nested autograd | no double backward; Laplace physics 1.3–1.7×, Helmholtz physics 7.9× faster (CPU); falls back to autograd for custom potentials |
+| no autograd graph where the field is closed form or Taylor mode (`sensitivity_batched`, `field_needs_autograd`) | map evaluation in large chunks (262k points on CUDA) under `no_grad` |
+| **fused segment kernel** for the wave wires (`physics.segment_static_and_log`): Biot–Savart and the k²/(2r) term share u, v, \|u\|, \|v\|, u×v | wave-wire field fwd+bwd 850 → 580 ms (3-D, 32³) |
+| **no host syncs in the loops**: device-side random generators, fixed-size `topk` sampling instead of boolean compaction / `multinomial`, no `.item()` per iteration, CG residual checked every 10 iterations | the GPU queue never drains during training |
+| **joint image stage**: `joint_maps="hybrid"` = exact wire field at full resolution + the smooth network correction from the calibration grid, upsampled by k-space zero padding; single pass when it fits in memory (`joint_chunk=0` sizes it from free GPU memory) | same accuracy as exact maps, 3.7–6× faster per iteration |
+| `compile=True`: `torch.compile` (dynamic shapes) of the Biot–Savart, fused wave and Taylor-mode kernels | fused Triton kernels on GPU; on CPU already 1.6–3× (wires 50 → 16 ms/it, PINN 277 → 176 ms/it, 3-D Helmholtz 0.77 → 0.40 s/it); first iterations pay ~1 min compile |
+| `tf32=True` | TF32 matmuls (Ampere+); ~1e-3 relative precision in the MLP, off by default |
+
+Measured on one CPU core (no GPU was available during development), before → after, per iteration:
+2-D PINN stage 342 → 277 ms (176 ms compiled); 3-D Helmholtz 32³ wave-wire stage 0.94 → 0.77 s
+(0.40 s compiled), Helmholtz PINN stage 1.74 → 0.78 s (0.49 s compiled). **GPU timings are not
+measured here**; `scripts/bench_gpu.py` prints them (eager / compile / compile+tf32, each in a fresh
+process) together with a device-vs-CPU check of every kernel (expected ≤ 1e-5 relative) and the
+end-to-end subspace error on CPU and on the device (equal accuracy; not bitwise equal maps, since
+CPU and CUDA random streams differ).
+
+Tips: the cost scales with the calibration grid and the number of coils, not with the image matrix
+(except `solve_image`). On a GPU, larger collocation batches (`n_colloc`) are nearly free and
+reduce gradient noise. `joint_maps="exact"` is the reference for the hybrid maps; `"interp"` is the
+cheapest and slightly biased.
+
 ## 9. Code map
 
 | file | content |
 |---|---|
 | `masks.py` | `cartesian_mask`: Cartesian undersampling patterns with a calibration block (2-D, 3-D, dynamic) |
 | `api.py` | `estimate_maps`, `sense_image`, `coil_combine`: the one-call interface of §4.0 (CLI `maps`) |
+| `accel.py` | `torch.compile` / TF32 switches (`compile=True`, `tf32=True`) |
 | `physics.py` | closed-form Biot–Savart for polylines, B→C mapping, autograd div/curl, Maxwell residual |
 | `models.py` | `WireLoopCoils` (hard), `HarmonicPINN` (soft / hybrid correction) |
 | `fit.py` | `FitConfig`, calibration `Problem` (VarPro / k-space / NUDFT), training stages, auto-handedness |

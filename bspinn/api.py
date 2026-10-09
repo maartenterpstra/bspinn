@@ -219,7 +219,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     if x_solved is not None:
         info["image_solved_jointly"] = True
         return C, x_solved, info
-    img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda)
+    img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda, device=device)
     return C, img, info
 
 
@@ -261,8 +261,9 @@ def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
     data = MultiCoilData(ksp[None], geom, mask=None if mask is None else mask[None, None], noise=noise)
     model, prob, hist, extra = fit(data, cfg, log=log)
     pts = geom.grid().reshape(-1, 3)
-    with torch.enable_grad():
-        C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
+    model.to(cfg.device)                                   # evaluate the full-resolution maps on the device
+    C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
+    model.cpu()
     return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob,
                "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores}
 
@@ -273,7 +274,11 @@ def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
     geom = VolumeGeometry(ksp.shape[1:], spacing, "zyx" if axes == "auto" else axes)
     data = VolumeData(ksp, geom, mask=mask, noise=noise)
     model, prob, hist, extra = fit3d(data, cfg, log=log, orientation=orient)
+    from .models import HelmholtzPINN, WaveWireLoopCoils
+    if not isinstance(model, (HelmholtzPINN, WaveWireLoopCoils)):
+        model.to(cfg.device)                               # wave models: evaluated as trained (CPU grids)
     C = volume_maps(model, prob).numpy()
+    model.cpu()
     info = {"handedness": extra["handedness"], "orientation": prob.data.geom.axes,
             "orientation_note": "physical axis (x,y,z; B0 = z) of array axes 1..3", "data_loss": _last(hist),
             "model": model, "problem": prob, "_m": extra["image_lowres"]}
@@ -306,8 +311,9 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     if rank == 0:
         from .fit import fit
         model, prob, hist, extra = fit(data, cfg, log=log)
-        with torch.enable_grad():
-            C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
+        model.to(cfg.device)
+        C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
+        model.cpu()
         return np.broadcast_to(C[None], (T, N, X, Y)).copy(), {
             "handedness": extra["handedness"], "data_loss": _last(hist), "rank": 0, "model": model, "problem": prob,
             "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores}
@@ -315,11 +321,13 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     dcfg = DynConfig(rank=rank, iters_dyn=iters_dynamic or max(300, cfg.iters_pinn // 2))
     dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log)
     out = []
-    with torch.enable_grad():
+    dyn.to(cfg.device); pts_d = pts.to(cfg.device)
+    with torch.no_grad():
         for i in range(0, T, 8):
             fr = list(range(i, min(T, i + 8)))
-            c = dyn.sensitivity_frames(pts, fr, create_graph=False).detach()  # (B,N_model,P)
+            c = dyn.sensitivity_frames(pts_d, fr, create_graph=False).detach().cpu()  # (B,N_model,P)
             out.append(prob.mixC(c, -2).numpy())
+    dyn.cpu()
     C = np.concatenate(out).reshape(T, N, X, Y)
     return C, {"handedness": extra["handedness"], "rank": rank, "temporal_modes": dyn.alpha.detach().numpy(),
                "data_loss": float(hist["dynamic"][-1]["data"]) if hist.get("dynamic") else None,
@@ -497,7 +505,36 @@ def acquired_extent(m):
     return box
 
 
-def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=60, coil_axis=0, extrapolate=False):
+def _sense_torch(ksp, C, m, box, lam, iters, device):
+    """CG-SENSE on ``device`` (torch FFTs), same system and stopping rule as the NumPy path (residual
+    checked every 10 iterations: one host sync each). Runs in complex64; the NumPy path in complex128
+    (np.fft upcasts); the two agree to ~1e-5."""
+    dev = torch.device(device)
+    y = torch.from_numpy(np.ascontiguousarray(ksp)).to(dev)
+    Ct = torch.from_numpy(np.ascontiguousarray(C)).to(dev)
+    M = torch.from_numpy(np.ascontiguousarray(m)).to(dev)
+    B = None if box.all() else torch.from_numpy(np.ascontiguousarray(box)).to(dev)
+    ax = tuple(range(1, y.ndim)); axi = tuple(range(y.ndim - 1))
+    F = lambda x, a: torch.fft.fftshift(torch.fft.fftn(torch.fft.ifftshift(x, dim=a), dim=a, norm="ortho"), dim=a)
+    Fi = lambda x, a: torch.fft.fftshift(torch.fft.ifftn(torch.fft.ifftshift(x, dim=a), dim=a, norm="ortho"), dim=a)
+    band = (lambda x: x) if B is None else (lambda x: Fi(F(x, axi) * B, axi))
+    def AhA(x):
+        return band((Ct.conj() * Fi(M * F(Ct * band(x)[None], ax), ax)).sum(0)) + lam * x
+    b = band((Ct.conj() * Fi(M * y, ax)).sum(0))
+    x = torch.zeros_like(b); r = b.clone(); p = r.clone(); rs = (r.conj() * r).real.sum(); b0 = rs
+    for it in range(iters):
+        Ap = AhA(p)
+        al = rs / (p.conj() * Ap).real.sum()
+        x = x + al * p; r = r - al * Ap
+        rn = (r.conj() * r).real.sum()
+        if it % 10 == 9 and float(rn) < 1e-10 * float(b0):
+            break
+        p = r + (rn / rs) * p; rs = rn
+    return band(x).cpu().numpy().astype(np.complex64)
+
+
+def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=60, coil_axis=0, extrapolate=False,
+                device="cpu"):
     """Full-resolution image from k-space and maps: argmin ||M F (C x) - y||^2 + lam' ||x||^2 with
     noise pre-whitening (if ``noise`` is given) applied to data and maps alike (``lam`` relative to the
     mean of sum_j |C_j|^2). Dynamic: frame by frame.
@@ -517,8 +554,8 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         C = np.einsum("ij,j...->i...", L, C)
     if layout == "dynamic":
         ms = [None if mask is None else mask[..., t] for t in range(ksp.shape[-1])]
-        return np.stack([sense_image(ksp[..., t], C[..., t], "2d", ms[t], None, lam, iters, extrapolate=extrapolate)
-                         for t in range(ksp.shape[-1])], -1)
+        return np.stack([sense_image(ksp[..., t], C[..., t], "2d", ms[t], None, lam, iters, extrapolate=extrapolate,
+                                     device=device) for t in range(ksp.shape[-1])], -1)
     m = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
     ax = tuple(range(1, ksp.ndim))
     den = (np.abs(C) ** 2).sum(0)
@@ -526,18 +563,20 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
     if (m | ~box).all():
         return ((C.conj() * _cfft(ksp * m[None], ax, True)).sum(0) / np.maximum(den, 1e-12)).astype(np.complex64)
     lam = lam * float(den.mean())
+    if str(device) != "cpu":
+        return _sense_torch(ksp, C, m, box, lam, iters, device)
     band = (lambda x: x) if box.all() else (lambda x: _cfft(_cfft(x, tuple(range(x.ndim))) * box, tuple(range(x.ndim)), True))
 
     def AhA(x):
         return band((C.conj() * _cfft(m[None] * _cfft(C * band(x)[None], ax), ax, True)).sum(0)) + lam * x
     b = band((C.conj() * _cfft(m[None] * ksp, ax, True)).sum(0))
     x = np.zeros_like(b); r = b.copy(); p = r.copy(); rs = np.vdot(r, r).real; b0 = rs
-    for _ in range(iters):
+    for it in range(iters):                               # same stopping rule as the device path
         Ap = AhA(p)
         al = rs / np.vdot(p, Ap).real
         x += al * p; r -= al * Ap
         rn = np.vdot(r, r).real
-        if rn < 1e-10 * b0:
+        if it % 10 == 9 and rn < 1e-10 * b0:
             break
         p = r + (rn / rs) * p; rs = rn
     return band(x).astype(np.complex64)
