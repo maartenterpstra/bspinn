@@ -18,9 +18,10 @@ Three phases (all on by default; each needs the previous one, results are cached
                regularis.  lambda_phys, lambda_norm, lambda_outside, lambda_curv
                model       network width/depth, latent size, vertices per loop
                budget      iters_auto (plane/handedness probes)
- 2. combine  greedy: the knob values that improved the pooled quality at 'fast' by more than --min-gain
-             (without worsening any other metric by more than --tol), added one by one in order of gain;
-             each addition is kept only if the combination still improves.
+ 2. combine  greedy: knob values that improved the score at every phase-1 budget by more than
+             --min-gain (score: ground-truth error ratio on the synthetic inputs; the residual if there are
+             none) with all guards met (residual, SENSE, worst synthetic input), or that save > --speed-gain
+             time at neutral quality; added in order of gain, each kept only if the combination improves.
  3. final    defaults vs the combined settings at every budget: which budget of the new settings matches
              the quality of the current 'default' preset, and how much faster it is.
 
@@ -53,7 +54,7 @@ KNOBS = {                      # knob -> alternative values (the default is the 
     "adam_beta2": [{"adam_beta2": 0.99}, {"adam_beta2": 0.9999}],
     "lr_schedule": [{"lr_schedule": "linear"}, {"lr_schedule": "constant"}, {"lr_warmup": 0.05}],
     "lr_wires": [{"lr_wires": 5e-3}, {"lr_wires": 2e-2}, {"lr_wires": 4e-2}],
-    "lr_pinn": [{"lr_pinn": 5e-4}, {"lr_pinn": 2e-3}, {"lr_pinn": 4e-3}],
+    "lr_pinn": [{"lr_pinn": 5e-4}, {"lr_pinn": 2e-3}, {"lr_pinn": 4e-3}, {"lr_pinn": 8e-3}, {"lr_pinn": 1.6e-2}],
     "lr_min_wires": [{"lr_min_wires": 0.01}, {"lr_min_wires": 0.2}],
     "lr_min_pinn": [{"lr_min_pinn": 0.01}, {"lr_min_pinn": 0.3}],
     "lr_image_wires": [{"lr_image_wires": 5e-3}, {"lr_image_wires": 5e-2}],
@@ -66,7 +67,7 @@ KNOBS = {                      # knob -> alternative values (the default is the 
     "lambda_curv": [{"lambda_curv": 1e-2}, {"lambda_curv": 1.0}],
     "network": [{"width": 32}, {"width": 128}, {"depth": 3}, {"depth": 5}],
     "latent": [{"latent": 8}, {"latent": 32}],
-    "verts_per_loop": [{"verts_per_loop": 8}, {"verts_per_loop": 16}],
+    "verts_per_loop": [{"verts_per_loop": 8}, {"verts_per_loop": 16}, {"verts_per_loop": 20}],
     "iters_auto": [{"iters_auto": 30}, {"iters_auto": 60}],
 }
 
@@ -150,17 +151,20 @@ class Runner:
 
 
 def score(p):
-    """Single number for ranking (lower = better): the primary residual ratio."""
-    return p["residual"]
+    """Single number for ranking (lower = better): the ground-truth error ratio on the synthetic inputs if
+    there are any (the real-data metrics move by < 0.5 % between settings: too flat to rank by, see the
+    first sweep), else the residual ratio."""
+    return p["gt_err"] if p.get("gt_err") is not None else p["residual"]
 
 
-def acceptable(p, tol):
-    """No metric worse than 1 + tol (median), ground-truth error not worse than 1 + 2 tol."""
+def acceptable(p, tol, res_tol=0.002):
+    """Guards: residual (median) not worse than 1 + res_tol, SENSE not worse than 1 + tol, ground-truth
+    error not worse than 1 + tol on ANY synthetic input."""
     if p["sense"] is not None and p["sense"] > 1 + tol:
         return False
-    if p["gt_err"] is not None and p["gt_err"] > 1 + 2 * tol:
+    if p.get("gt_err_worst") is not None and p["gt_err_worst"] > 1 + tol:
         return False
-    return p["residual"] <= 1 + tol
+    return p["residual"] <= 1 + res_tol
 
 
 def main():
@@ -173,7 +177,7 @@ def main():
     ap.add_argument("--indices", type=int, nargs="*", default=None)
     ap.add_argument("--random", type=int, default=0)
     ap.add_argument("--pick-seed", type=int, default=0)
-    ap.add_argument("--synthetic", type=int, default=2, help="synthetic inputs with ground truth")
+    ap.add_argument("--synthetic", type=int, default=4, help="synthetic inputs with ground truth")
     ap.add_argument("--calib", type=int, default=24)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
@@ -182,8 +186,12 @@ def main():
     ap.add_argument("--phases", nargs="+", default=["ofat", "combine", "final"])
     ap.add_argument("--knobs", nargs="*", default=None, help=f"subset of: {' '.join(KNOBS)}")
     ap.add_argument("--ofat-budgets", nargs="+", default=["fast", "mid"])
-    ap.add_argument("--min-gain", type=float, default=0.003, help="relative residual gain to count as better")
-    ap.add_argument("--tol", type=float, default=0.01, help="allowed relative loss in the other metrics")
+    ap.add_argument("--min-gain", type=float, default=0.02,
+                    help="relative gain in the score (ground-truth error; residual without synthetic inputs)")
+    ap.add_argument("--tol", type=float, default=0.01, help="allowed relative loss in SENSE / ground truth")
+    ap.add_argument("--speed-gain", type=float, default=0.05, help="time saving that counts for a quality-neutral knob")
+    ap.add_argument("--try", dest="try_", nargs="*", default=None, metavar="JSON",
+                    help='extra settings to compare at every budget, e.g. \'{"lr_pinn": 0.004}\'')
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--out", default="hyper_sweep.json")
     a = ap.parse_args()
@@ -226,48 +234,63 @@ def main():
                     R.save()
 
     if "combine" in a.phases:
-        fb = a.ofat_budgets[0]
+        bs = [b for b in a.ofat_budgets if b in res]
         cand = []
         for kn in knobs:
             best = None
             for over in KNOBS[kn]:
-                p = res.get(fb, {}).get(json.dumps(over))
-                if p is None:
+                ps = [res[b].get(json.dumps(over)) for b in bs]
+                if any(p is None for p in ps) or not all(acceptable(p, a.tol) for p in ps):
                     continue
-                if acceptable(p, a.tol) and p["residual"] < 1 - a.min_gain and (best is None or score(p) < score(best[1])):
-                    best = (over, p)
+                better = all(score(p) < 1 - a.min_gain for p in ps)          # consistent at every budget
+                faster = all(p["seconds"] < 1 - a.speed_gain and score(p) <= 1 + a.tol / 2 for p in ps)
+                if better or faster:
+                    g = max(score(p) for p in ps) - (a.speed_gain if faster and not better else 0)
+                    if best is None or g < best[2]:
+                        best = (over, ps, g)
             if best:
                 cand.append(best)
-        cand.sort(key=lambda c: score(c[1]))
-        print(f"phase 2: combining {len(cand)} improving knob values at '{fb}': {[c[0] for c in cand]}")
-        combo, cur = {}, {"residual": 1.0}
-        for over, _ in cand:
+        cand.sort(key=lambda c: c[2])
+        fb = bs[0]
+        print(f"phase 2: combining {len(cand)} knob values (better at {bs}, or faster and neutral): "
+              f"{[c[0] for c in cand]}")
+        combo, cur = {}, None
+        for over, _, _ in cand:
             trial = {**combo, **over}
-            p = R.pooled(trial, fb)
-            keep = acceptable(p, a.tol) and score(p) < score(cur) - a.min_gain
-            print(f"  + {json.dumps(over):32s} -> residual {p['residual']:.4f}  SENSE {p['sense']:.4f}  "
-                  f"GT {p['gt_err']}  {'kept' if keep else 'dropped'}", flush=True)
+            ps = [R.pooled(trial, b) for b in bs]
+            ok = all(acceptable(p, a.tol) for p in ps)
+            gain = cur is None or max(score(p) for p in ps) < max(score(p) for p in cur) - a.min_gain / 2 \
+                or (max(p["seconds"] for p in ps) < max(p["seconds"] for p in cur) - a.speed_gain / 2
+                    and max(score(p) for p in ps) <= max(score(p) for p in cur) + a.tol / 2)
+            keep = ok and gain
+            print(f"  + {json.dumps(over):32s} -> score {[round(score(p), 4) for p in ps]}  residual "
+                  f"{[round(p['residual'], 4) for p in ps]}  SENSE {[round(p['sense'], 4) for p in ps]}  time "
+                  f"{[round(p['seconds'], 2) for p in ps]}  {'kept' if keep else 'dropped'}", flush=True)
             if keep:
-                combo, cur = trial, p
-        report["combined"] = {"settings": combo, "pooled_at_" + fb: cur}
+                combo, cur = trial, ps
+        report["combined"] = {"settings": combo, "pooled": dict(zip(bs, cur or []))}
         R.save()
 
     if "final" in a.phases:
         combo = report.get("combined", {}).get("settings", {})
         print(f"phase 3: defaults vs {combo} at every budget, relative to the defaults at 'default'")
         fin = {}
+        extra = {f"try{i}": json.loads(t) for i, t in enumerate(a.try_ or [])}
+        sets = {"defaults": {}, "combined": combo, **extra}
         for b in BUDGETS:
-            fin[b] = {"defaults": R.pooled({}, b, {}, "default"), "combined": R.pooled(combo, b, {}, "default")}
-            for name in ("defaults", "combined"):
+            fin[b] = {name: R.pooled(over, b, {}, "default") for name, over in sets.items()}
+            for name in sets:
                 p = fin[b][name]
                 print(f"  {b:9s} {name:8s} residual {p['residual']:.4f}  SENSE {p['sense']:.4f}  GT {p['gt_err']}"
                       f"  time {p['seconds']:.2f} x", flush=True)
             R.save()
-        match = next((b for b in BUDGETS if acceptable(fin[b]["combined"], a.tol / 2)), None)
-        report["final"] = {"table": fin, "combined_settings": combo, "smallest_budget_matching_default": match,
-                           "time_vs_default": None if match is None else fin[match]["combined"]["seconds"]}
-        tm = "n/a" if match is None else "%.2fx the time" % fin[match]["combined"]["seconds"]
-        print(f"=> with {combo}: budget '{match}' matches the current 'default' quality ({tm})")
+        report["final"] = {"table": fin, "settings": sets, "matches": {}}
+        for name, over in sets.items():
+            match = next((b for b in BUDGETS if acceptable(fin[b][name], a.tol / 2) and score(fin[b][name]) <= 1.0), None)
+            tm = "n/a" if match is None else "%.2fx the time" % fin[match][name]["seconds"]
+            report["final"]["matches"][name] = {"budget": match, "time_vs_default":
+                                                None if match is None else fin[match][name]["seconds"]}
+            print(f"=> {name} {over}: smallest budget at the current 'default' quality: {match} ({tm})")
         R.save()
     print(f"wrote {a.out}")
 
