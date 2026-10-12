@@ -248,8 +248,11 @@ def sense_at_R(C, case: EvalCase, obj, R, ref_rss, lam=1e-3, iters=40, support=N
     miss = case.sampled & ~m
     er = float((np.abs(pred[:, miss] - y_full[:, miss]) ** 2).sum())
     ey = float((np.abs(y_full[:, miss]) ** 2).sum())
-    out["missing_kspace_nrmse"] = math.sqrt(er / ey)
-    out["missing_kspace_noise_floor_nrmse"] = math.sqrt(case.N * case.sigma ** 2 * miss.sum() / ey)
+    if miss.any() and ey > 0:
+        out["missing_kspace_nrmse"] = math.sqrt(er / ey)
+        out["missing_kspace_noise_floor_nrmse"] = math.sqrt(case.N * case.sigma ** 2 * miss.sum() / ey)
+    else:                                   # R = 1: nothing is missing
+        out["missing_kspace_nrmse"] = out["missing_kspace_noise_floor_nrmse"] = None
     # data consistency at the acquired samples
     er2 = float((np.abs(pred[:, m] - y_full[:, m]) ** 2).sum()); ey2 = float((np.abs(y_full[:, m]) ** 2).sum())
     out["acquired_kspace_nrmse"] = math.sqrt(er2 / ey2)

@@ -250,10 +250,10 @@ def flat_row(res, method):
         row["ce_outside_acs_over_floor"] = kc["outside_acs"]["residual_over_noise_floor"]
     row.update(r["reference_free"]["summary"])
     ss = r.get("sense_support", {})
-    if "4" in ss:
-        row["sense_R4_support_nrmse_vs_rss_or_truth"] = ss["4"]["vs_reference"]["nrmse"]
-        if ss["4"].get("gfactor"):
-            row["gfactor_R4_mean"] = ss["4"]["gfactor"]["mean"]
+    for R, v in ss.items():                 # every --Rs value
+        row[f"sense_R{R}_support_nrmse_vs_rss_or_truth"] = v["vs_reference"]["nrmse"]
+        if v.get("gfactor") and R != "1":
+            row[f"gfactor_R{R}_mean"] = v["gfactor"]["mean"]
     if "prospective" in r:
         row["heldout_nrmse"] = r["prospective"]["heldout_nrmse"]
     if "gt_subspace_err" in r["maps"]:
