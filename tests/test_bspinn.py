@@ -884,7 +884,7 @@ def test_reference_free_metrics_separate_true_perturbed_and_noise_fitted_maps():
     finally:
         del ESTIMATORS["_copy"]
     assert cp["lco_object_over_floor"] < 1e-6                     # fooled: it saw the noise...
-    assert cp["r2r_optimism"] > 0.5 > abs(good["r2r_optimism"])   # ...but not on an independent copy
+    assert cp["r2r_optimism"] > 20 * abs(good["r2r_optimism"])   # ...but not on an independent copy
     assert cp["sure_over_oracle"] > 4                             # exact: N = 6
     assert cp["projector_hf_fraction"] > 100 * good["projector_hf_fraction"]
 

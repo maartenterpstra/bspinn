@@ -33,14 +33,15 @@ The metrics below are built so that fitting noise does not pay off:
        y1 = y + a z,   y2 = y - z / a,    z ~ CN(0, sigma^2)   (Cov(n1, n2) = 0),
    estimate maps from y1, evaluate the combine -> expand and leave-coil-out residuals on y2. The
    "optimism" (residual on the estimation copy y1 vs on the independent copy y2, both over their own
-   floors) directly measures how much a method fits noise.
+   floors) directly measures how much a method fits noise. Optimism = unexplained signal fraction
+   (residual - noise floor) / signal on y2 minus on y1 (>= 0; 0 = no noise fitting).
 5. ``sure`` (expensive: 2 x probes re-estimations per method; Stein's unbiased risk estimate of the
    combine -> expand prediction f(y) = M F P_C(y_calib) F^H M y):
        SURE = ||y - f(y)||^2 - M sigma^2 + 2 sigma^2 (tr(M F P F^H M) + d_maps),
    tr(...) = #sampled x fraction of pixels with non-zero maps (exact), and d_maps, the extra degrees of
    freedom the maps spend on the calibration noise, by a Monte-Carlo (antithetic finite difference)
    divergence over the calibration samples. Reported over the risk of perfect fixed maps
-   (sigma^2 tr(...)): 1 = as good as the true maps, and d_maps itself (0 for data-independent maps).
+   (sigma^2 x #sampled; the true maps are non-zero everywhere): 1 = as good as the true maps, and d_maps itself (0 for data-independent maps).
    eps (x sigma, default 0.1) trades bias for variance: a data-copying estimator gives 5.98 at 0.1
    (exact 6) but 3.2 at 1.0. Stochastic estimators (NN training on GPU) add jitter / (2 eps sigma) to
    d_maps: use a fixed seed and deterministic kernels, or a larger eps and more probes.
@@ -275,8 +276,12 @@ def recorrupted(case: EvalCase, obj, name, est_kw=None, alpha=0.7, seed=0, C1=No
         for reg in ("all", "acs", "outside_acs"):
             out[reg] = {"self_over_floor": own[reg]["residual_over_noise_floor"],
                         "independent_over_floor": ind[reg]["residual_over_noise_floor"],
+                        "self_excess_rel": own[reg]["excess_rel"],
                         "independent_excess_rel": ind[reg]["excess_rel"]}
-            out[reg]["optimism"] = out[reg]["independent_over_floor"] - out[reg]["self_over_floor"]
+            # unexplained signal (residual minus its noise floor, / signal energy) on the independent copy
+            # minus on the estimation copy. Not the difference of the over-floor ratios: the two copies have
+            # different noise levels, so the same bias gives different ratios (v29 did that: negative values).
+            out[reg]["optimism"] = out[reg]["independent_excess_rel"] - out[reg]["self_excess_rel"]
         l1, l2 = leave_coil_out(C1, c1, obj), leave_coil_out(C1, c2, obj)
         out["leave_coil_out"] = {"self_over_floor": l1["all"]["residual_over_noise_floor"],
                                  "independent_over_floor": l2["all"]["residual_over_noise_floor"],
@@ -312,9 +317,11 @@ def sure(C, case: EvalCase, name, est_kw=None, eps=0.1, probes=1, seed=0):
         d.append(float(np.vdot(b, _ce_kspace(Cp, y, s) - _ce_kspace(Cm, y, s)).real / (2 * h)))
     dm = float(np.mean(d))
     risk = res - M * sig2 + 2 * sig2 * (tr + dm)
-    oracle = sig2 * tr
+    # perfect maps are non-zero everywhere: their risk is sigma^2 x #sampled. (v29 divided by the
+    # method's own trace, which inflated the ratio for maps that are zero outside a support, e.g. ESPIRiT.)
+    oracle = sig2 * float(case.sampled.sum())
     return {"sure_over_oracle": risk / oracle, "naive_over_oracle": (res - M * sig2 + 2 * sig2 * tr) / oracle,
-            "map_dof": dm, "map_dof_probes": d, "projection_dof": tr, "eps_sigma": eps, "probes": probes}
+            "map_dof": dm, "map_dof_probes": d, "projection_dof": tr, "nonzero_fraction": float(nz.mean()), "eps_sigma": eps, "probes": probes}
 
 
 # ----------------------------------------------------------------------------------- run / summary
