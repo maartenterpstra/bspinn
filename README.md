@@ -946,6 +946,17 @@ which the combination matches the current `default` preset. New FitConfig fields
 `adam_beta2`, `lr_schedule` (cosine | linear | constant), `lr_warmup`, `lr_min_wires`, `lr_min_pinn`,
 `lr_image_wires`, `lr_image_pinn` (defaults reproduce the previous behaviour).
 
+**Tuned 2-D settings** (`hyper_sweep.py`, Oct 2026: 6 real slices — fastMRI knee and brain,
+Calgary-Campinas — plus 4 synthetic slices with known maps, 45 single-setting changes at two budgets):
+the PINN step size was the only knob with a consistent gain. `estimate_maps` therefore uses
+`lr_pinn=4e-3` (was 1e-3) and `n_colloc=256` (was 768) for 2-D data. Relative to the old settings at the
+`default` budget: ground-truth map error −6.5 % (worst synthetic slice −2.6 %), real-data residual −0.1 %,
+SENSE error −0.2 %, 8 % less time; at the `mid` budget the ground-truth error is 15 % below the old
+`default`. Running longer than `default` makes the ground-truth error worse (+6 to +8 %: noise fitting).
+Everything else (Adam betas, schedules, warm-up, image step sizes, loss weights, network size) was neutral
+or worse; `lambda_curv=1`, 8 vertices per loop and `lr_pinn=5e-4` were clearly worse. 3-D and dynamic
+data keep the previous defaults (not swept).
+
 Tips: the cost scales with the calibration grid and the number of coils, not with the image matrix
 (except `solve_image`). Being launch-bound, a GPU iteration costs about the same for many more
 collocation points (`n_colloc`) or a larger calibration grid: use them. `joint_maps="exact"` is the

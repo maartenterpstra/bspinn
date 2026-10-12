@@ -141,6 +141,12 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         cfg.calib = int(max(_calib(calib, 24, 1)))
     if layout == "dynamic":
         cfg.slice_batch = min(4, ksp.shape[-1])        # frames per optimisation step (cost ~ frames)
+    if layout == "2d":
+        # tuned on fastMRI knee/brain + Calgary-Campinas slices and synthetic ground truth (scripts/hyper_sweep.py):
+        # 4x the PINN step size: 6-15 % lower ground-truth map error at every budget, real-data residual and
+        # SENSE error unchanged; 256 collocation points per step: same quality, ~8 % faster. The joint image
+        # stage keeps its old step size. 3-D and dynamic data keep the FitConfig defaults (not swept).
+        cfg.lr_pinn, cfg.n_colloc, cfg.lr_joint = 4e-3, 256, 1e-3
     for k, v in cfg_overrides.items():
         if not hasattr(cfg, k):
             raise TypeError(f"unknown option {k!r} (not a FitConfig field)")
