@@ -852,3 +852,58 @@ def test_fold_over_detected_and_corrected():
         if fold == "auto":
             assert info["fold"]["corrected"] and all(r.startswith("axis1") for r in info["fold"]["regions"])
     assert err["auto"] < 0.8 * err[False], err
+
+
+def _rf_case(joint=False):
+    from bspinn.data import make_synthetic
+    from bspinn.methods import EvalCase
+    d, C, obj = make_synthetic(6, (64, 64), noise=0.01, seed=0)
+    return EvalCase("t", d.kspace[0], np.ones((64, 64), bool), (16, 16), sigma=0.01, gt_maps=C[0],
+                    gt_object=obj[0], joint=joint), C[0]
+
+
+def test_reference_free_metrics_separate_true_perturbed_and_noise_fitted_maps():
+    from bspinn import evaluation as ev
+    from bspinn import refree
+    from bspinn.methods import ESTIMATORS, ifft2c
+    case, C = _rf_case()
+    obj = ev.object_mask(case)
+    yy, xx = np.mgrid[:64, :64] / 64
+    bad = C * (1 + 0.3 * np.cos(2 * np.pi * (xx[None] + yy[None] + np.arange(6)[:, None, None] / 6)))   # per coil
+    good = refree.evaluate(C, case, obj, name="oracle", resample=("r2r", "sure"))["summary"]
+    worse = refree.evaluate(bad, case, obj)["summary"]
+    assert 0.9 < good["lco_outside_acs_over_floor"] < 1.1 and 0.9 < good["lco_object_over_floor"] < 1.1
+    assert abs(good["residual_signal_slope"]) < 0.05 and 0.8 < good["residual_whiteness"] < 1.2
+    assert good["sure_map_dof"] == 0.0 and 0.85 < good["sure_over_oracle"] < 1.15
+    assert worse["lco_object_over_floor"] > 2 and worse["residual_whiteness"] > 2 and worse["residual_signal_slope"] > 0.2
+    # an estimator that copies the data: zero residual on its own data, caught by r2r / SURE / bandwidth
+    ESTIMATORS["_copy"] = lambda c, **k: ev.normalise(ifft2c(c.ksp * c.sampled[None]))
+    try:
+        cj, _ = _rf_case(joint=True)
+        cp = refree.evaluate(ESTIMATORS["_copy"](cj), cj, obj, name="_copy", resample=("r2r", "sure"), sure_probes=2)["summary"]
+    finally:
+        del ESTIMATORS["_copy"]
+    assert cp["lco_object_over_floor"] < 1e-6                     # fooled: it saw the noise...
+    assert cp["r2r_optimism"] > 0.5 > abs(good["r2r_optimism"])   # ...but not on an independent copy
+    assert cp["sure_over_oracle"] > 4                             # exact: N = 6
+    assert cp["projector_hf_fraction"] > 100 * good["projector_hf_fraction"]
+
+
+def test_reference_free_prospective_and_benchmark_plumbing(tmp_path):
+    import importlib.util
+    import os
+    from bspinn import evaluation as ev
+    from bspinn import refree
+    case, C = _rf_case()
+    m = np.zeros((64, 64), bool); m[:, ::2] = True; m[:, 24:40] = True
+    case.ksp = case.ksp * m[None]; case.sampled = m; case.fully_sampled = False
+    out = refree.evaluate(C, case, ev.object_mask(case), lco_coils=[0, 1])
+    assert 0.85 < out["summary"]["lco_outside_calib_over_floor"] < 1.15
+    assert out["summary"]["lco_outside_calib_over_sample_noise"] > 1
+    spec = importlib.util.spec_from_file_location("evm", os.path.join(os.path.dirname(__file__), "..", "scripts", "evaluate_methods.py"))
+    evm = importlib.util.module_from_spec(spec); spec.loader.exec_module(evm)
+    case2, _ = _rf_case()
+    res = evm.run_case(case2, ["lowres", "oracle"], str(tmp_path), Rs=(2,), log=lambda *a: None, resample=("r2r",))
+    assert set(res["methods"]) == {"lowres", "oracle"}
+    tsv = open(tmp_path / "t" / "reference_free.tsv").read()
+    assert "r2r_optimism" in tsv and "lco_outside_acs_over_floor" in tsv

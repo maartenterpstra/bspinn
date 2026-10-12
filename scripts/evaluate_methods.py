@@ -13,6 +13,12 @@ Cases (all single 2-D slices, pre-whitened):
 Every estimator sees the same ACS box (calibration-only protocol) except in ``brain8``, where
 NLINV and the Biot–Savart fit may use all acquired samples (their natural mode).
 Writes <out>/<case>/results.json, maps/*.npy (cache) and figures.npz (images for the report).
+
+Every method also gets a ``reference_free`` block (bspinn/refree.py): metrics from the measured k-space
+only, built so that fitting noise does not pay off (leave-coil-out prediction, residual structure,
+projector bandwidth; with --resample r2r / sure also recorrupted-to-recorrupted and Monte-Carlo SURE,
+which re-run each estimator on perturbed data). A table of the headline numbers is printed per case and
+written to <out>/<case>/reference_free.tsv.
 """
 import argparse
 import json
@@ -24,6 +30,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bspinn import evaluation as ev  # noqa: E402
+from bspinn import refree  # noqa: E402
 from bspinn.data import make_synthetic  # noqa: E402
 from bspinn.methods import ALL_METHODS, EvalCase, estimate, ifft2c  # noqa: E402
 
@@ -69,7 +76,8 @@ def _json(o):
     return o
 
 
-def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=print):
+def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=print, resample=(), r2r_alpha=0.7,
+             sure_eps=0.1, sure_probes=1):
     cdir = os.path.join(out, case.name)
     os.makedirs(cdir, exist_ok=True)
     over = {}
@@ -109,6 +117,11 @@ def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=pr
         else:
             r["prospective"], x = ev.heldout_prospective(C, case, obj)
             figs[f"{name}/sense_all"] = x
+        t1 = time.time()
+        r["reference_free"] = refree.evaluate(C, case, obj, name=name, est_kw={"threads": threads, "cfg_overrides": over},
+                                              resample=resample, r2r_alpha=r2r_alpha, sure_eps=sure_eps,
+                                              sure_probes=sure_probes)
+        log(f"  [{case.name}] reference-free {name:9s} ({time.time() - t1:.0f}s)")
         Cn = ev.normalise(C)
         figs[f"{name}/maps"] = Cn[: min(case.N, 8)].astype(np.complex64)
         res["methods"][name] = r
@@ -116,7 +129,20 @@ def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=pr
     with open(os.path.join(cdir, "results.json"), "w") as f:
         json.dump(_json(res), f, indent=1)
     np.savez_compressed(os.path.join(cdir, "figures.npz"), **{k: np.asarray(v) for k, v in figs.items()})
+    table = refree_table(res)
+    open(os.path.join(cdir, "reference_free.tsv"), "w").write(table)
+    log(table.replace("\t", "  "))
     return res
+
+
+def refree_table(res):
+    """Headline reference-free numbers, one row per method (tab separated)."""
+    rows = {m: r["reference_free"]["summary"] for m, r in res["methods"].items()}
+    keys = list(dict.fromkeys(k for s in rows.values() for k in s))
+    lines = ["method\t" + "\t".join(keys)]
+    for m, s in rows.items():
+        lines.append(m + "\t" + "\t".join(f"{s[k]:.4g}" if k in s else "-" for k in keys))
+    return "\n".join(lines) + "\n"
 
 
 def main():
@@ -126,13 +152,19 @@ def main():
     ap.add_argument("--out", default="runs/eval")
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--resample", nargs="*", default=[], choices=["r2r", "sure"],
+                    help="reference-free metrics that re-run every estimator on perturbed data (r2r: 1 extra run, sure: 2 x probes)")
+    ap.add_argument("--r2r-alpha", type=float, default=0.7)
+    ap.add_argument("--sure-eps", type=float, default=0.1, help="SURE finite-difference step, x sigma (raise to ~1 for stochastic estimators)")
+    ap.add_argument("--sure-probes", type=int, default=1)
     a = ap.parse_args()
     if a.list:
         print("\n".join(CASES)); return
     for c in a.cases:
         case = CASES[c]()
         print(f"== {c}: {case.N} coils, {case.shape}, ACS {case.acs}", flush=True)
-        run_case(case, a.methods, a.out, threads=a.threads, log=lambda *x: print(*x, flush=True))
+        run_case(case, a.methods, a.out, threads=a.threads, log=lambda *x: print(*x, flush=True),
+                 resample=a.resample, r2r_alpha=a.r2r_alpha, sure_eps=a.sure_eps, sure_probes=a.sure_probes)
 
 
 if __name__ == "__main__":

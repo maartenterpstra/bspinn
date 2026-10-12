@@ -648,6 +648,26 @@ method's natural input.
 | parallel imaging | CG-SENSE at R = 2–6 (uniform + ACS), as delivered and with a common support; image NRMSE/SSIM/PSNR; missing-k-space NRMSE; acquired-sample NRMSE; analytic g-factor | unfolding quality and noise amplification |
 | prospective | held-out k-space NRMSE (2 folds × 20 %), noise floor | brain, where no reference exists |
 | maps | subspace, relative-phase, magnitude and absolute error vs truth; vortices; projector roughness; coverage; runtime | |
+| reference-free (`bspinn/refree.py`) | see below | k-space only, no ground truth; noise fitting does not pay off |
+
+**Reference-free metrics** (block `reference_free` per method in `results.json`; headline numbers in
+`<out>/<case>/reference_free.tsv`). Lower is better for every headline number; the true maps give
+the "ideal" column.
+
+| headline | ideal | what it measures |
+|---|---|---|
+| `lco_outside_acs_over_floor` | 1 | leave-coil-out: coil j predicted from the other N−1 coils with the maps (x₋ⱼ = Σᵢ≠ⱼ Cᵢ* Iᵢ / Σᵢ≠ⱼ\|Cᵢ\|², rⱼ = Iⱼ − Cⱼx₋ⱼ), k-space residual outside the ACS over its Monte-Carlo noise floor. Coil j's noise is independent of its prediction. Tests relative magnitude and phase between coils, which is what SENSE uses. Also: worst coil, image-domain residual in the object. Prospective data: CG-SENSE from the other coils, over the noise propagated by the same (converged) reconstruction, and over σ² |
+| `residual_signal_slope` | 0 | combine → expand residual / floor in 5 signal-level bins in the object: log-log slope vs signal power. Noise is signal-independent; map error scales with the signal |
+| `residual_whiteness` | 1 | low-pass (Gaussian 2 px) energy fraction of the residual, relative to that of pure noise through the same operator; > 1 = spatially coherent residual = map error |
+| `projector_hf_fraction` | ≈ 0 | spectrum of the per-pixel projector ccᴴ (gauge-invariant) on a tapered object mask: energy fraction outside the calibration band |
+| `r2r_optimism` (`--resample r2r`) | ≈ 0 | recorrupted-to-recorrupted: y₁ = y + αz, y₂ = y − z/α have independent noise. Maps re-estimated from y₁; residual/floor on y₂ minus on y₁. Also `r2r_independent_excess_rel` (unexplained signal fraction on y₂) and leave-coil-out on y₂ |
+| `sure_over_oracle`, `sure_map_dof` (`--resample sure`) | 1, 0 | Stein's unbiased risk of the combine → expand prediction, with the divergence of the maps w.r.t. the calibration data by antithetic finite differences (2 × probes re-estimations); over the risk of perfect fixed maps. `sure_map_dof` = degrees of freedom the maps spend on calibration noise |
+
+Only R2R and SURE are noise-proof when an estimator sees every sample (joint calibration, `brain8`);
+the leave-coil-out and residual metrics are noise-proof outside the data the maps were fitted to.
+SURE needs a deterministic estimator (fixed seed; GPU training jitter is divided by 2εσ):
+`--sure-eps` (×σ, default 0.1) and `--sure-probes` trade bias for variance. The resample metrics
+re-run every estimator 1 (r2r) or 2 × probes (sure) times per case.
 
 **Results** (v8, single slice, one run per method; full tables and figures in the report; v7 → v8
 changes in `runs/compare_v8.json`):
@@ -982,6 +1002,7 @@ reference for the hybrid maps; `"interp"` is the cheapest and slightly biased.
 | `volume.py` | 3-D encoded data: geometry, `Problem3D`, coarse-grid PINN correction, orientation selection, `fit3d`, synthetic volumes |
 | `methods.py` | estimator registry for the comparison (low-res, Walsh, Inati, ESPIRiT, NLINV, Biot–Savart variants) |
 | `evaluation.py` | comparison metrics: combine→expand k-space residual vs noise floor, reference image, SENSE at R, g-factor, map errors |
+| `refree.py` | reference-free metrics from k-space only: leave-coil-out prediction, residual structure, projector bandwidth, recorrupted-to-recorrupted, Monte-Carlo SURE |
 | `recon.py` | CG-SENSE, low-res division baseline, projection residual, ground-truth metrics; phase-vortex counter |
 | `report.py` | full-resolution evaluation, held-out k-space test, figures |
 | `data.py` | loaders, pre-whitening, synthetic Biot–Savart phantom |
