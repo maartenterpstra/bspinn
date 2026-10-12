@@ -993,6 +993,15 @@ fastMRI knee slice with the thigh wrapping into the opposite edge (vd mask, R = 
 stripes (column-stripe index 0.43 → 0.09, as low as with low-resolution maps); synthetic wrap test:
 SENSE NRMSE 0.46 → 0.27.
 
+Two guards (v31). The readout axis is never searched: `estimate_maps` infers it from `mask` (the axis
+along which every acquired line is fully sampled) or takes `readout_axis=`; a mask that is only a
+calibration box cannot show it, which is what the benchmark passed, so `pinn_api` now hands it over.
+And the shifted maps are evaluated one FOV away, where conductors may legitimately sit (outside the
+object): pixels where they are rougher than 3x the 99th percentile of the maps' own gauge-free
+roughness (a conductor's near field) are never used. On item 19870 of the dataloader run (15-channel
+knee cut by the FOV along the readout) the PINN maps carried exactly such a near field inside the leg:
+leave-coil-out 1.85x the floor, SENSE R4 error 0.194 vs 0.075 for NLINV.
+
 **Noise amplification of different maps:** `scripts/gfactor_compare.py` reconstructs the same
 retrospectively undersampled data with each set of maps (identical CG-SENSE, λ, iterations) and reports
 the pseudo-replica g-factor (mean / median / 95th percentile in the object) and the error against the fully

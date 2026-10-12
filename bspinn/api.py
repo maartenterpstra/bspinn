@@ -32,7 +32,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-2, sense_iters=60, mask_maps=False, support_threshold=0.1,
-                  support_dilate=2, undersample=None, solve_image=False, fold="auto", **cfg_overrides):
+                  support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
     Parameters
@@ -95,6 +95,12 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         on the calibration images, the maps with the maps shifted by one FOV along each image axis; where
         the shifted maps explain the coil images much better, the returned maps are the effective
         (folded) sensitivities there. ``info['fold']`` reports the affected fraction per axis/direction.
+        The readout axis is never corrected (oversampled by the scanner; an object cut there is truncated,
+        not folded). Shifted maps that pass close to a conductor (its near field: much rougher than the
+        maps themselves) are never used.
+    readout_axis : 2-D: image axis (0 or 1) of the readout, excluded from the fold-over search. 'auto'
+        (default): the axis along which every acquired line is fully sampled, from ``mask``. Pass it
+        when the mask cannot tell (e.g. only a fully sampled calibration box is given).
     undersample : retrospective Cartesian undersampling of (fully sampled) ``ksp`` before the fit: an
         acceleration R (float, or (R1, R2) in 3-D), a dict of ``bspinn.masks.cartesian_mask`` options
         (e.g. ``dict(R=4, pattern='vd', partial_fourier=0.75, seed=1)``) or a ready bool mask. The
@@ -195,7 +201,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         fold_maps = {kk: np.einsum("ij,j...->i...", Minv, v) for kk, v in fold_maps.items()}
     C_raw = C
     if fold_maps and layout == "2d":
-        C, info["fold"] = _fold_correct(C, fold_maps, ksp, mask, cfg.calib, log)
+        C, info["fold"] = _fold_correct(C, fold_maps, ksp, mask, cfg.calib, log, readout_axis=readout_axis)
         if info["fold"]["corrected"] and solve_image:
             log("fold-over corrected maps: the full-resolution image is recomputed by SENSE with them "
                 "(the joint solution used the uncorrected maps)")
@@ -474,7 +480,21 @@ def _support(ksp, mask, layout, calib, thresh=0.1, dilate=2):
     return binary_dilation(s, iterations=dilate) if dilate > 0 else s
 
 
-def _fold_correct(C, fold_maps, ksp, mask, calib, log, ridge=1e-3, min_gain=0.3, min_frac=0.25, min_misfit=0.2):
+def _proj_rough(C):
+    """Per-pixel gauge-free roughness: max over the image axes of ||P(r) - P(r+1)|| for the projector
+    P = c c^H of the RSS-normalised maps (sqrt(2 - 2 |c(r)^H c(r+1)|^2))."""
+    Cn = C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)), 1e-20)
+    out = np.zeros(C.shape[1:])
+    for ax in (1, 2):
+        ov = np.abs((Cn.conj() * np.roll(Cn, -1, axis=ax)).sum(0)) ** 2
+        r = np.sqrt(np.clip(2 - 2 * ov, 0, None))
+        sl = [slice(None)] * 2; sl[ax - 1] = slice(-1, None); r[tuple(sl)] = 0     # no wrap-around step
+        out = np.maximum(out, np.maximum(r, np.roll(r, 1, axis=ax - 1)))
+    return out
+
+
+def _fold_correct(C, fold_maps, ksp, mask, calib, log, ridge=1e-3, min_gain=0.3, min_frac=0.25, min_misfit=0.2,
+                  readout_axis="auto", rough_factor=3.0):
     """Effective maps where the object folds over the FOV edge (see estimate_maps(fold=...)).
 
     On the calibration coil images I (central calib x calib block, Hann window), per pixel: residual of the
@@ -484,7 +504,7 @@ def _fold_correct(C, fold_maps, ksp, mask, calib, log, ridge=1e-3, min_gain=0.3,
     residual > min_misfit) and the pixel has signal; only regions connected to the FOV edge where folded
     tissue appears are kept (fold-over is a band at the edge), then smoothed. There the effective sensitivity is m1 C + m2 C_shift (divided by the larger of m1,
     m2: no object phase), which is what the coils really see. Returns (maps, report)."""
-    from scipy.ndimage import gaussian_filter
+    from scipy.ndimage import binary_dilation, gaussian_filter
     N, X, Y = C.shape
     m = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
     win = np.zeros((X, Y))
@@ -505,18 +525,30 @@ def _fold_correct(C, fold_maps, ksp, mask, calib, log, ridge=1e-3, min_gain=0.3,
         r = I - np.einsum("nkxy,xyk->nxy", S, mm)
         return mm, (np.abs(r) ** 2).sum(0)
     # the readout axis (every acquired line fully sampled along it) is oversampled by the scanner: no fold
-    ro = [a for a in (0, 1) if mask is not None and m.any() and bool((m == m.any(axis=a, keepdims=True)).all())
-          and not m.all()]
+    if readout_axis in (0, 1):
+        ro = [int(readout_axis)]
+    else:
+        ro = [a for a in (0, 1) if mask is not None and m.any() and bool((m == m.any(axis=a, keepdims=True)).all())
+              and not m.all()]
+        if not ro and not m.all():
+            log("fold-over search on both image axes: the mask does not show the readout axis "
+                "(pass readout_axis= to exclude it)")
     fold_maps = {kk: v for kk, v in fold_maps.items() if kk[0] not in ro}
+    # maps one FOV away can pass right next to a conductor (allowed there: outside the object). Its near
+    # field is far rougher than any physical map inside the object: never use those pixels.
+    rough0 = _proj_rough(C)
+    rough_lim = rough_factor * max(float(np.percentile(rough0[sig], 99)) if sig.any() else 0.0, 1e-3)
     _, r1 = fit([C])
     misfit = r1 / np.maximum(rssI ** 2, 1e-30) > min_misfit
-    out, rep = C.copy(), {"corrected": False, "regions": {}}
+    out, rep = C.copy(), {"corrected": False, "regions": {}, "readout_axis_excluded": ro}
     best_gain = np.ones((X, Y)); choice, coef = {}, {}
     for key, Cs in fold_maps.items():
         mm, r2 = fit([C, Cs])
         frac = np.abs(mm[..., 1]) ** 2 / np.maximum((np.abs(mm) ** 2).sum(-1), 1e-30)
         gain = r2 / np.maximum(r1, 1e-30)
-        acc = sig & misfit & (gain < min_gain) & (frac > min_frac)
+        smooth_ok = _proj_rough(Cs) <= rough_lim
+        smooth_ok = ~binary_dilation(~smooth_ok, iterations=3)
+        acc = sig & misfit & (gain < min_gain) & (frac > min_frac) & smooth_ok
         # tissue from beyond one edge appears at the opposite edge: C(r - FOV) shows up near the + edge
         from scipy.ndimage import label
         lab, n = label(acc)

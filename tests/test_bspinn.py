@@ -945,3 +945,41 @@ def test_evaluate_methods_dataset_items(tmp_path, monkeypatch):
     rows = open(tmp_path / "ev" / "summary.tsv").read().splitlines()
     assert len(rows) == 5 and "ssim_leave_coil_out" in rows[0] and "ce_acs_over_floor" in rows[0]
     assert "real\twalsh\t2" in open(tmp_path / "ev" / "ranks.tsv").read()
+
+
+def _fold_problem(X=64, Y=64, N=6, band=12, seed=0):
+    """Smooth maps T on an extended grid; tissue beyond the left edge folds into the right `band` columns."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.meshgrid(np.linspace(-1, 1, X), np.linspace(-1, 1 + 2 * Y / Y, 2 * Y), indexing="ij")
+    T = np.zeros((N, X, 2 * Y), complex)
+    for j in range(N):
+        cx, cy = 2.5 * np.cos(2 * np.pi * j / N) + 1, 2.5 * np.sin(2 * np.pi * j / N)
+        T[j] = 1 / ((xx - cx) ** 2 + (yy - cy) ** 2 + 0.5) * np.exp(1j * (0.7 * xx * np.cos(j) + 0.5 * yy * np.sin(j)))
+    C, Cs = T[:, :, :Y], T[:, :, Y:]                       # Cs = maps one FOV to the right (+ direction)
+    img = np.ones((X, Y))
+    fold = np.zeros((X, Y)); fold[:, :band] = 1            # tissue one FOV away appears in the first columns
+    I = C * img + Cs * fold
+    ax = (1, 2)
+    k = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(I, axes=ax), axes=ax, norm="ortho"), axes=ax)
+    return C.astype(np.complex64), Cs.astype(np.complex64), k.astype(np.complex64)
+
+
+def test_fold_correct_readout_axis_and_near_field_guard():
+    from bspinn.api import _fold_correct, _proj_rough
+    C, Cs, k = _fold_problem()
+    log = lambda *a: None
+    out, rep = _fold_correct(C, {(1, 1): Cs}, k, None, 24, log)
+    assert rep["corrected"] and "axis1+FOV" in rep["regions"]
+    _, rep_ro = _fold_correct(C, {(1, 1): Cs}, k, None, 24, log, readout_axis=1)
+    assert not rep_ro["corrected"] and rep_ro["readout_axis_excluded"] == [1]
+    # a conductor next to the shifted points: a near-field blob in the shifted maps inside the fold band
+    X, Y = C.shape[1:]
+    yy, xx = np.mgrid[:X, :Y]
+    r2 = (yy - 32.0) ** 2 + (xx - 5.0) ** 2
+    blob = (np.exp(1j * 0.9 * (yy + 2 * xx)) * np.exp(-r2 / 18))[None] * np.abs(Cs).max() * np.linspace(1, -1, C.shape[0])[:, None, None]
+    Csb = (Cs + blob).astype(np.complex64)
+    assert _proj_rough(Csb)[32, 5] > 3 * np.percentile(_proj_rough(C), 99)
+    out_b, rep_b = _fold_correct(C, {(1, 1): Csb}, k, None, 24, log)
+    assert rep_b["corrected"]                                           # the rest of the band is still corrected
+    assert np.allclose(out_b[:, 32, 5], C[:, 32, 5])                     # ...but not next to the conductor
+    assert not np.allclose(out_b[:, 10, 5], C[:, 10, 5])
