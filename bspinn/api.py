@@ -32,7 +32,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-2, sense_iters=60, mask_maps=False, support_threshold=0.1,
-                  support_dilate=2, undersample=None, solve_image=False, **cfg_overrides):
+                  support_dilate=2, undersample=None, solve_image=False, fold="auto", **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
     Parameters
@@ -89,6 +89,12 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         step). Implies ``return_image``; the returned image is that joint solution. 2-D (and dynamic
         with rank=0) only. Iterations: ``iters_joint`` (default 300), image regularisation
         ``lambda_joint_img`` (relative, default 1e-2).
+    fold : 'auto' (default) | False. Objects larger than the field of view fold over: tissue beyond one
+        edge appears at the opposite edge, seen by the coils on the far side. Physical maps are not periodic,
+        so they would give that band the wrong coils (stripes in undersampled SENSE). 'auto' (2-D) compares,
+        on the calibration images, the maps with the maps shifted by one FOV along each image axis; where
+        the shifted maps explain the coil images much better, the returned maps are the effective
+        (folded) sensitivities there. ``info['fold']`` reports the affected fraction per axis/direction.
     undersample : retrospective Cartesian undersampling of (fully sampled) ``ksp`` before the fit: an
         acceleration R (float, or (R1, R2) in 3-D), a dict of ``bspinn.masks.cartesian_mask`` options
         (e.g. ``dict(R=4, pattern='vd', partial_fourier=0.75, seed=1)``) or a ready bool mask. The
@@ -151,6 +157,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         setattr(cfg, k, v)
     if cfg.compress:
         raise ValueError("compress is not supported by estimate_maps (maps are returned for the input channels)")
+    cfg._fold = fold if layout == "2d" else False
     if solve_image:
         if layout == "3d":
             raise ValueError("solve_image is implemented for 2-D (and dynamic with rank=0) data")
@@ -180,11 +187,19 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     # channels M @ (original channels): map back to the original channels.
     prob = info["problem"]
     M = prob.data.meta.get("mix")
+    fold_maps = info.pop("_fold_maps", None) or {}
     if M is not None:
         Minv = np.linalg.inv(np.asarray(M))
         C = (np.einsum("ij,tj...->ti...", Minv, C) if layout == "dynamic"
              else np.einsum("ij,j...->i...", Minv, C))
+        fold_maps = {kk: np.einsum("ij,j...->i...", Minv, v) for kk, v in fold_maps.items()}
     C_raw = C
+    if fold_maps and layout == "2d":
+        C, info["fold"] = _fold_correct(C, fold_maps, ksp, mask, cfg.calib, log)
+        if info["fold"]["corrected"] and solve_image:
+            log("fold-over corrected maps: the full-resolution image is recomputed by SENSE with them "
+                "(the joint solution used the uncorrected maps)")
+            info.pop("_xfull", None)
     # common phase + normalisation (per-pixel complex scalars, identical for all coils)
     if isinstance(mask_maps, (bool, np.bool_)) or mask_maps is None:
         sup = _support(ksp, mask, layout, cfg.calib, support_threshold, support_dilate)
@@ -291,9 +306,18 @@ def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
         pts = geom.grid().reshape(-1, 3)
         model.to(cfg.device)                                   # evaluate the full-resolution maps on the device
         C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
+        fold_maps = {}
+        if getattr(cfg, "_fold", "auto"):
+            g = geom.grid().reshape(X, Y, 3)
+            fov = {0: (g[1, 0] - g[0, 0]) * X, 1: (g[0, 1] - g[0, 0]) * Y}     # one FOV along each image axis
+            for a in (0, 1):
+                for sgn in (1, -1):
+                    ps = pts + sgn * fov[a]
+                    fold_maps[(a, sgn)] = prob.mixC(model.sensitivity_batched(ps), -2).detach().numpy().reshape(N, X, Y)
         model.cpu()
     return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob,
-               "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores}
+               "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores,
+               "_fold_maps": fold_maps}
 
 
 def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
@@ -448,6 +472,82 @@ def _support(ksp, mask, layout, calib, thresh=0.1, dilate=2):
     from .keepout import clean_support
     s = clean_support(s[None], True)[0] if s.ndim == 2 else clean_support(s, False)
     return binary_dilation(s, iterations=dilate) if dilate > 0 else s
+
+
+def _fold_correct(C, fold_maps, ksp, mask, calib, log, ridge=1e-3, min_gain=0.3, min_frac=0.25, min_misfit=0.2):
+    """Effective maps where the object folds over the FOV edge (see estimate_maps(fold=...)).
+
+    On the calibration coil images I (central calib x calib block, Hann window), per pixel: residual of the
+    single map set C, and of [C, C_shift] (C_shift = maps one FOV away along an image axis) with fitted
+    coefficients (m1, m2). A shift is accepted where it explains I clearly better (residual < min_gain x
+    single-set residual), carries > min_frac of the fitted energy, the single set misfits there (relative
+    residual > min_misfit) and the pixel has signal; only regions connected to the FOV edge where folded
+    tissue appears are kept (fold-over is a band at the edge), then smoothed. There the effective sensitivity is m1 C + m2 C_shift (divided by the larger of m1,
+    m2: no object phase), which is what the coils really see. Returns (maps, report)."""
+    from scipy.ndimage import gaussian_filter
+    N, X, Y = C.shape
+    m = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
+    win = np.zeros((X, Y))
+    c = int(calib)
+    r0, c0 = X // 2 - c // 2, Y // 2 - c // 2
+    win[r0:r0 + c, c0:c0 + c] = np.outer(np.hanning(c + 2)[1:-1], np.hanning(c + 2)[1:-1])
+    I = _cfft(ksp * (m * win)[None], (1, 2), True)                       # low-resolution coil images
+    rssI = np.sqrt((np.abs(I) ** 2).sum(0))
+    sig = rssI > 0.05 * np.percentile(rssI, 99)
+
+    def fit(sets):                                                        # per-pixel LS: I ~ sum_k m_k S_k
+        S = np.stack(sets, 1)                                             # (N,K,X,Y)
+        G = np.einsum("nkxy,nlxy->xykl", S.conj(), S)
+        b = np.einsum("nkxy,nxy->xyk", S.conj(), I)
+        K = len(sets)
+        G = G + ridge * np.trace(G, axis1=2, axis2=3).real[..., None, None] / K * np.eye(K)
+        mm = np.linalg.solve(G, b[..., None])[..., 0]                     # (X,Y,K)
+        r = I - np.einsum("nkxy,xyk->nxy", S, mm)
+        return mm, (np.abs(r) ** 2).sum(0)
+    # the readout axis (every acquired line fully sampled along it) is oversampled by the scanner: no fold
+    ro = [a for a in (0, 1) if mask is not None and m.any() and bool((m == m.any(axis=a, keepdims=True)).all())
+          and not m.all()]
+    fold_maps = {kk: v for kk, v in fold_maps.items() if kk[0] not in ro}
+    _, r1 = fit([C])
+    misfit = r1 / np.maximum(rssI ** 2, 1e-30) > min_misfit
+    out, rep = C.copy(), {"corrected": False, "regions": {}}
+    best_gain = np.ones((X, Y)); choice, coef = {}, {}
+    for key, Cs in fold_maps.items():
+        mm, r2 = fit([C, Cs])
+        frac = np.abs(mm[..., 1]) ** 2 / np.maximum((np.abs(mm) ** 2).sum(-1), 1e-30)
+        gain = r2 / np.maximum(r1, 1e-30)
+        acc = sig & misfit & (gain < min_gain) & (frac > min_frac)
+        # tissue from beyond one edge appears at the opposite edge: C(r - FOV) shows up near the + edge
+        from scipy.ndimage import label
+        lab, n = label(acc)
+        a, sgn = key
+        edge = (lab[-3:, :] if sgn < 0 else lab[:3, :]) if a == 0 else (lab[:, -3:] if sgn < 0 else lab[:, :3])
+        keep = np.setdiff1d(np.unique(edge), [0])
+        acc = np.isin(lab, keep)
+        upd = acc & (gain < best_gain)
+        best_gain = np.where(upd, gain, best_gain)
+        for kk in list(choice):
+            choice[kk] = choice[kk] & ~upd
+        choice[key], coef[key] = upd, mm
+    for key in fold_maps:
+        sel = choice[key]
+        frac_px = float(sel.mean())
+        if frac_px < 5e-3:                                               # a few stray pixels: not a fold
+            continue
+        w = np.clip(gaussian_filter(sel.astype(float), 2.0) * 1.5, 0, 1) * sig
+        mm = coef[key]
+        m1, m2 = mm[..., 0], mm[..., 1]
+        big1 = np.abs(m1) >= np.abs(m2)
+        den = np.where(big1, m1, m2)
+        den = np.where(np.abs(den) > 0, den, 1)
+        Ceff = (m1[None] * C + m2[None] * fold_maps[key]) / den[None]
+        out = np.where(w[None] > 0, (1 - w)[None] * out + w[None] * Ceff, out)
+        rep["regions"][f"axis{key[0]}{'+' if key[1] > 0 else '-'}FOV"] = frac_px
+        rep["corrected"] = True
+    if rep["corrected"]:
+        log("fold-over detected (object larger than the FOV): effective maps in " +
+            ", ".join(f"{k} {100 * v:.1f}% of the pixels" for k, v in rep["regions"].items()))
+    return out.astype(np.complex64), rep
 
 
 def _finish(C, sup, layout, phase_ref, normalise, device=None):

@@ -825,3 +825,30 @@ def test_fused_trunk_paths_match():
         g1 = torch.autograd.grad((C1.abs() ** 2).sum() + ph1, ps, allow_unused=True)
         g2 = torch.autograd.grad((C2.abs() ** 2).sum() + ph2, ps, allow_unused=True)
         assert all((u is None and v is None) or torch.allclose(u, v, rtol=1e-4, atol=1e-5) for u, v in zip(g1, g2))
+
+
+def test_fold_over_detected_and_corrected():
+    """An object wider than the FOV folds over: tissue beyond one edge appears at the other, seen by the
+    far coils. fold='auto' must detect it along the phase-encode axis and give lower SENSE error than
+    the plain (non-periodic) physical maps."""
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    ax = (1, 2)
+    F = lambda x: np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(x, axes=ax), axes=ax, norm="ortho"), axes=ax)
+    Fi = lambda x: np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(x, axes=ax), axes=ax, norm="ortho"), axes=ax)
+    d, _, _ = make_synthetic(8, (64, 96), noise=0.003, seed=3)
+    I = Fi(d.kspace[0])
+    Iw = I[:, :, 16:80].copy(); Iw[:, :, :16] += I[:, :, 80:]; Iw[:, :, -16:] += I[:, :, :16]   # FOV 64: wrap
+    k = F(Iw).astype(np.complex64)
+    m = cartesian_mask((64, 64), R=3, acs=16, pattern="vd", seed=1)
+    ref = np.sqrt((np.abs(Iw) ** 2).sum(0))
+    err = {}
+    for fold in ("auto", False):
+        C, img, info = estimate_maps(k * m[None], "2d", calib=16, mask=m, verbose=False, return_image=True,
+                                     fold=fold, iters_auto=40, iters_wires=150, iters_pinn=150)
+        a = np.abs(img); s = (a * ref).sum() / (a ** 2).sum()
+        err[fold] = np.linalg.norm(s * a - ref) / np.linalg.norm(ref)
+        if fold == "auto":
+            assert info["fold"]["corrected"] and all(r.startswith("axis1") for r in info["fold"]["regions"])
+    assert err["auto"] < 0.8 * err[False], err

@@ -946,6 +946,17 @@ which the combination matches the current `default` preset. New FitConfig fields
 `adam_beta2`, `lr_schedule` (cosine | linear | constant), `lr_warmup`, `lr_min_wires`, `lr_min_pinn`,
 `lr_image_wires`, `lr_image_pinn` (defaults reproduce the previous behaviour).
 
+**Fold-over (object wider than the FOV).** Tissue beyond one phase-encode edge appears at the opposite
+edge and is seen there by the coils on the far side. Physical maps are not periodic (ESPIRiT/NLINV maps are,
+by construction), so without correction that band gets the wrong coils and undersampled SENSE shows
+stripes. `estimate_maps(fold="auto")` (default, 2-D) compares the calibration coil images with the maps and
+with the maps shifted by one FOV along each phase-encode axis (the readout axis is skipped when a mask shows
+it); in edge-connected regions where the shifted set explains the coils much better, the returned maps
+are the effective sensitivity m1·C + m2·C(r ± FOV). `info["fold"]` lists the corrected regions. On a
+fastMRI knee slice with the thigh wrapping into the opposite edge (vd mask, R = 4) this removed the
+stripes (column-stripe index 0.43 → 0.09, as low as with low-resolution maps); synthetic wrap test:
+SENSE NRMSE 0.46 → 0.27.
+
 **Noise amplification of different maps:** `scripts/gfactor_compare.py` reconstructs the same
 retrospectively undersampled data with each set of maps (identical CG-SENSE, λ, iterations) and reports
 the pseudo-replica g-factor (mean / median / 95th percentile in the object) and the error against the fully
