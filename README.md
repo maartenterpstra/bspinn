@@ -1002,6 +1002,18 @@ roughness (a conductor's near field) are never used. On item 19870 of the datalo
 knee cut by the FOV along the readout) the PINN maps carried exactly such a near field inside the leg:
 leave-coil-out 1.85x the floor, SENSE R4 error 0.194 vs 0.075 for NLINV.
 
+**In-plane B0 orientation (v32).** That diagnosis was wrong: item 19870 failed because the plane search
+picked `coronal_t` (B0 along the columns) for a coronal knee (B0 along the rows). The probe losses were
+within 15 % (0.133 vs 0.150), and the wrong orientation fits the calibration data *better* in full
+fits (data loss 0.0114 vs 0.0140) while extrapolating much worse (SENSE R4 0.143 vs 0.083,
+leave-coil-out worst coil 3.6 vs 1.5 x floor; the benchmark's own maps match the `coronal_t` fit
+4x more closely than the `coronal` one). Held-out prediction of acquired samples outside the calibration
+box separates them (0.47 vs 0.37 relative error). So, when the in-plane orientation is ambiguous and
+such samples exist, `estimate_maps` now fits both orientations and keeps the one with the lower held-out
+error (`plane_select='heldout'`, default; `'probe'` = old behaviour; costs a second fit only in that
+case). With only a calibration box (the benchmark protocol) there is nothing to hold out: pass
+`plane=` (benchmark: `--pinn-plane coronal` for coronal knees).
+
 **Noise amplification of different maps:** `scripts/gfactor_compare.py` reconstructs the same
 retrospectively undersampled data with each set of maps (identical CG-SENSE, λ, iterations) and reports
 the pseudo-replica g-factor (mean / median / 95th percentile in the object) and the error against the fully

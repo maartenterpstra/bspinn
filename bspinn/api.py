@@ -32,7 +32,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-2, sense_iters=60, mask_maps=False, support_threshold=0.1,
-                  support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", **cfg_overrides):
+                  support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout", **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
     Parameters
@@ -98,6 +98,11 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         The readout axis is never corrected (oversampled by the scanner; an object cut there is truncated,
         not folded). Shifted maps that pass close to a conductor (its near field: much rougher than the
         maps themselves) are never used.
+    plane_select : 2-D, plane='auto': 'heldout' (default) | 'probe'. When B0 is in-plane but rows vs
+        columns is ambiguous (probe losses within 15 %), 'heldout' fits both orientations and keeps the one
+        that better predicts acquired samples outside the calibration box (needs such samples, i.e. a
+        mask with data outside the calibration region; doubles the fit time in that case only). The
+        calibration loss cannot decide this: the wrong orientation can fit the calibration data as well.
     readout_axis : 2-D: image axis (0 or 1) of the readout, excluded from the fold-over search. 'auto'
         (default): the axis along which every acquired line is fully sampled, from ``mask``. Pass it
         when the mask cannot tell (e.g. only a fully sampled calibration box is given).
@@ -164,6 +169,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     if cfg.compress:
         raise ValueError("compress is not supported by estimate_maps (maps are returned for the input channels)")
     cfg._fold = fold if layout == "2d" else False
+    cfg._plane_select = plane_select
     if solve_image:
         if layout == "3d":
             raise ValueError("solve_image is implemented for 2-D (and dynamic with rank=0) data")
@@ -278,9 +284,14 @@ def _select_plane(kst, mst, spacing, noise, cfg, log, meta=None):
         hscores[pl] = {1: res[2 * i][3], -1: res[2 * i + 1][3]}
         scores[pl] = min(hscores[pl].values())
     best = min(scores, key=scores.get)
-    meta_out = {"handedness_scores": hscores[best]}
+    meta_out = {"handedness_scores": hscores[best], "all_handedness": hscores, "ambiguous": False}
     log("B0 orientation (plane) scores: " + ", ".join(f"{k} {v:.3e}" for k, v in scores.items()) + f" -> {best}")
     if best != "axial" and min(scores["coronal"], scores["coronal_t"]) > 0.85 * max(scores["coronal"], scores["coronal_t"]):
+        meta_out["ambiguous"] = True
+        if (meta or {}).get("resolvable"):
+            log(f"B0 in-plane orientation ambiguous ({scores['coronal']:.3e} vs {scores['coronal_t']:.3e}): "
+                "fitting both, deciding by held-out k-space prediction")
+            return best, scores, meta_out
         import warnings
         msg = ("B0 lies in the image plane, but whether it runs along the rows ('coronal'/'sagittal') or the "
                f"columns ('coronal_t') is hardly identifiable from these data ({scores['coronal']:.3e} vs "
@@ -290,21 +301,62 @@ def _select_plane(kst, mst, spacing, noise, cfg, log, meta=None):
     return best, scores, meta_out
 
 
-def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
+def _calib_box_outside(k, mask, calib):
+    N, X, Y = k.shape
+    m = (np.abs(k).sum(0) > 0) if mask is None else np.asarray(mask, bool)
+    cal = calib if isinstance(calib, (tuple, list)) else (calib, calib)
+    box = np.zeros((X, Y), bool)
+    box[X // 2 - cal[0] // 2: X // 2 - cal[0] // 2 + cal[0], Y // 2 - cal[1] // 2: Y // 2 - cal[1] // 2 + cal[1]] = True
+    return m, m & ~box
+
+
+def _n_heldout(k, mask, calib):
+    """Acquired samples outside the calibration box (0 if they are fewer than 1 % of the acquired ones)."""
+    m, out = _calib_box_outside(k, mask, calib)
+    n = int(out.sum())
+    return n if n >= 0.01 * m.sum() else 0
+
+
+def _heldout_score(C, k, mask, calib, device, frac=0.2, folds=2, iters=30, lam=1e-3, seed=0):
+    """Relative error of predicting acquired k-space samples outside the calibration box that the
+    reconstruction did not use: CG-SENSE (RSS-normalised maps C) from the other acquired samples, then
+    C x at the held-out samples; mean over ``folds`` disjoint random folds. None if fewer than 1 % of
+    the samples lie outside the box."""
+    N, X, Y = k.shape
+    m, out = _calib_box_outside(k, mask, calib)
+    idx = np.flatnonzero(out)
+    if idx.size < 0.01 * m.sum():
+        return None
+    dev = torch.device(device)
+    Cn = C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)), 1e-12)
+    Ct = torch.from_numpy(Cn.astype(np.complex64)).to(dev)
+    kt = torch.from_numpy(np.ascontiguousarray(k).astype(np.complex64)).to(dev)
+    F = lambda x: torch.fft.fftshift(torch.fft.fft2(torch.fft.ifftshift(x, dim=(-2, -1)), norm="ortho"), dim=(-2, -1))
+    Fi = lambda x: torch.fft.fftshift(torch.fft.ifft2(torch.fft.ifftshift(x, dim=(-2, -1)), norm="ortho"), dim=(-2, -1))
+    rng = np.random.default_rng(seed); rng.shuffle(idx)
+    errs = []
+    for f in range(folds):
+        ho = np.zeros(X * Y, bool); ho[idx[int(f * frac * idx.size): int((f + 1) * frac * idx.size)]] = True
+        ho = ho.reshape(X, Y)
+        tr = torch.from_numpy((m & ~ho).astype(np.float32)).to(dev)
+        hot = torch.from_numpy(ho).to(dev)
+        A = lambda x: (Ct.conj() * Fi(tr * F(Ct * x))).sum(0) + lam * x
+        b = (Ct.conj() * Fi(tr * kt)).sum(0)
+        x = torch.zeros_like(b); r = b.clone(); p = r.clone(); rs = (r.conj() * r).real.sum()
+        for _ in range(iters):
+            Ap = A(p); al = rs / (p.conj() * Ap).real.sum().clamp_min(1e-30)
+            x = x + al * p; r = r - al * Ap; rn = (r.conj() * r).real.sum()
+            p = r + rn / rs.clamp_min(1e-30) * p; rs = rn
+        pred = F(Ct * x)
+        errs.append(float((pred[:, hot] - kt[:, hot]).abs().pow(2).sum() / kt[:, hot].abs().pow(2).sum().clamp_min(1e-30)))
+    return float(np.sqrt(np.mean(errs)))
+
+
+def _fit_2d_plane(ksp, mask, spacing, plane, noise, cfg, log):
     from .data import MultiCoilData
     from .fit import fit
     from .geometry import SliceGeometry
     N, X, Y = ksp.shape
-    scores = None
-    if plane == "auto":
-        with accel.phase("plane_search", cfg.device):
-            plane, scores, ps = _select_plane(ksp[None], None if mask is None else mask[None, None], spacing, noise,
-                                              cfg, log)
-        if cfg.handedness == 0:     # the plane search fitted both handednesses on exactly this problem: reuse
-            hs = ps["handedness_scores"]
-            cfg = copy.copy(cfg)
-            cfg.handedness = min(hs, key=hs.get)
-            log(f"handedness from the plane search: {cfg.handedness:+d} (data loss +1: {hs[1]:.3e}, -1: {hs[-1]:.3e})")
     geom = SliceGeometry((X, Y), spacing, np.zeros(1), plane)
     data = MultiCoilData(ksp[None], geom, mask=None if mask is None else mask[None, None], noise=noise)
     model, prob, hist, extra = fit(data, cfg, log=log)
@@ -322,8 +374,50 @@ def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
                     fold_maps[(a, sgn)] = prob.mixC(model.sensitivity_batched(ps), -2).detach().numpy().reshape(N, X, Y)
         model.cpu()
     return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob,
-               "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores,
+               "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane,
                "_fold_maps": fold_maps}
+
+
+def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):
+    """Fit one 2-D slice. plane='auto': short wire probes for every orientation. When B0 is in-plane
+    but rows vs columns is ambiguous (within 15 %) and there are acquired samples outside the
+    calibration box, both in-plane orientations are fitted in full and the one that predicts held-out
+    acquired k-space better wins: on real knees the wrong orientation fits the calibration data as well
+    or better (the calibration loss cannot tell) but extrapolates much worse."""
+    scores, cands = None, None
+    if plane == "auto":
+        resolvable = getattr(cfg, "_plane_select", "heldout") == "heldout" and _n_heldout(ksp, mask, cfg.calib) > 0
+        with accel.phase("plane_search", cfg.device):
+            plane, scores, ps = _select_plane(ksp[None], None if mask is None else mask[None, None], spacing, noise,
+                                              cfg, log, meta={"resolvable": resolvable})
+        if ps.get("ambiguous") and resolvable:
+            cands = [("coronal", ps["all_handedness"]["coronal"]), ("coronal_t", ps["all_handedness"]["coronal_t"])]
+        else:
+            cands = [(plane, ps["handedness_scores"])]
+    else:
+        cands = [(plane, None)]
+    results = []
+    for pl, hs in cands:
+        c = cfg
+        if hs is not None and cfg.handedness == 0:   # the plane search fitted both handednesses on this problem
+            c = copy.copy(cfg)
+            c.handedness = min(hs, key=hs.get)
+            log(f"[{pl}] handedness from the plane search: {c.handedness:+d} (data loss +1: {hs[1]:.3e}, -1: {hs[-1]:.3e})")
+        C, info = _fit_2d_plane(ksp, mask, spacing, pl, noise, c, log)
+        results.append((C, info))
+    if len(results) > 1:
+        M = results[0][1]["problem"].data.meta.get("mix")
+        kw = ksp if M is None else np.einsum("ij,j...->i...", np.asarray(M), ksp)   # the data channels of C
+        ho = {info["plane"]: _heldout_score(C, kw, mask, cfg.calib, cfg.device) for C, info in results}
+        pick = min(range(len(results)), key=lambda i: ho[results[i][1]["plane"]])
+        log("in-plane B0 orientation by held-out k-space prediction: " +
+            ", ".join(f"{k} {v:.4f}" for k, v in ho.items()) + f" -> {results[pick][1]['plane']}")
+        C, info = results[pick]
+        info["plane_heldout"] = ho
+    else:
+        C, info = results[0]
+    info["plane_scores"] = scores
+    return C, info
 
 
 def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):

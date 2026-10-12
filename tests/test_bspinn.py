@@ -983,3 +983,17 @@ def test_fold_correct_readout_axis_and_near_field_guard():
     assert rep_b["corrected"]                                           # the rest of the band is still corrected
     assert np.allclose(out_b[:, 32, 5], C[:, 32, 5])                     # ...but not next to the conductor
     assert not np.allclose(out_b[:, 10, 5], C[:, 10, 5])
+
+
+def test_heldout_score_prefers_true_maps():
+    from bspinn.api import _heldout_score, _n_heldout
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    d, C, _ = make_synthetic(6, (64, 64), noise=0.003, seed=2)
+    k = d.kspace[0]
+    m = cartesian_mask((64, 64), R=3, acs=16, pattern="vd", seed=1)
+    yy, xx = np.mgrid[:64, :64] / 64
+    bad = C[0] * (1 + 0.3 * np.cos(2 * np.pi * (xx[None] + np.arange(6)[:, None, None] / 6)))
+    assert _n_heldout(k * m, m, 16) > 0 and _n_heldout(k * m, np.pad(np.ones((16, 16), bool), 24), 16) == 0
+    good_s, bad_s = _heldout_score(C[0], k * m, m, 16, "cpu"), _heldout_score(bad, k * m, m, 16, "cpu")
+    assert good_s < 0.8 * bad_s, (good_s, bad_s)

@@ -326,6 +326,9 @@ def main():
     g.add_argument("--coil-axis", type=int, default=0)
     g.add_argument("--acs", type=int, default=24)
     g.add_argument("--pe-axis", type=int, default=None, choices=[0, 1], help="default: from partial-Fourier zeros, else 1")
+    g.add_argument("--pinn-plane", default="auto", choices=["auto", "axial", "coronal", "coronal_t", "sagittal"],
+                   help="B0 orientation handed to pinn_api for dataset items (e.g. coronal for fastMRI coronal knees: "
+                        "with only the calibration box the rows-vs-columns choice can be ambiguous)")
     g.add_argument("--noise-npy", default=None, help="noise-only samples (n, coils) for whitening")
     a = ap.parse_args()
     if a.list:
@@ -348,6 +351,8 @@ def main():
     results = []
     for make, methods in jobs:
         case = make()
+        if case.meta.get("api_plane") == "auto" and a.pinn_plane != "auto":
+            case.meta["api_plane"] = a.pinn_plane
         print(f"== {case.name}: {case.N} coils, {case.shape}, ACS {case.acs}, PE axis {case.pe_axis}", flush=True)
         results.append(run_case(case, methods, a.out, Rs=tuple(a.Rs), threads=a.threads, log=log, resample=a.resample,
                                 r2r_alpha=a.r2r_alpha, sure_eps=a.sure_eps, sure_probes=a.sure_probes, device=a.device,
