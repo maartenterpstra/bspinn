@@ -946,6 +946,12 @@ which the combination matches the current `default` preset. New FitConfig fields
 `adam_beta2`, `lr_schedule` (cosine | linear | constant), `lr_warmup`, `lr_min_wires`, `lr_min_pinn`,
 `lr_image_wires`, `lr_image_pinn` (defaults reproduce the previous behaviour).
 
+**Noise amplification of different maps:** `scripts/gfactor_compare.py` reconstructs the same
+retrospectively undersampled data with each set of maps (identical CG-SENSE, λ, iterations) and reports
+the pseudo-replica g-factor (mean / median / 95th percentile in the object) and the error against the fully
+sampled combination. Knee slice of §7, R = 4, 24 ACS lines: mean g 1.70 (ESPIRiT), 1.87 (NLINV),
+1.91 (Biot–Savart PINN), 1.86 (wires); NRMSE 0.112 / 0.122 / 0.130 / 0.120.
+
 Tips: the cost scales with the calibration grid and the number of coils, not with the image matrix
 (except `solve_image`). Being launch-bound, a GPU iteration costs about the same for many more
 collocation points (`n_colloc`) or a larger calibration grid: use them. `joint_maps="exact"` is the
