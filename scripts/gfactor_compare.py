@@ -99,6 +99,8 @@ def main():
     L = np.linalg.cholesky(psi + 1e-9 * np.trace(psi).real / N * np.eye(N))
     rss = np.sqrt((np.abs(acc.ifft(k, (1, 2))) ** 2).sum(0))
     obj = rss > max(0.1 * np.percentile(rss, 99), 4 * np.sqrt(np.trace(psi).real))
+    if obj.mean() < 0.02:                    # noise level over-estimated (e.g. signal at the k-space edge)
+        obj = rss > 0.1 * np.percentile(rss, 99)
     from scipy.ndimage import binary_dilation, binary_fill_holes
     support = binary_dilation(binary_fill_holes(rss > a.mask_thresh * np.percentile(rss, 99)), iterations=a.mask_dilate)
     res_support = float(support.mean())
@@ -114,7 +116,7 @@ def main():
     g_ = torch.Generator(device=dev).manual_seed(0)
     Lt = torch.from_numpy(L.astype(np.complex64)).to(dev)
     res, gmaps = {"R_eff": float(R_eff), "lam": a.lam, "iters": a.iters, "replicas": a.replicas,
-                  "object_fraction": float(obj.mean()),
+                  "object_fraction": float(obj.mean()), "object_pixels": int(obj.sum()),
                   "mask_maps": a.mask_maps, "support_fraction": res_support, "maps": {}}, {}
     for name, C in maps.items():
         C = C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)), 1e-12)

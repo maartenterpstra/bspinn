@@ -31,7 +31,7 @@ PRESETS = {      # iterations: (handedness/orientation probe, wire stage, PINN s
 def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, plane="auto", axes="auto",
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
-                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-2, mask_maps=False, support_threshold=0.1,
+                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-2, sense_iters=60, mask_maps=False, support_threshold=0.1,
                   support_dilate=2, undersample=None, solve_image=False, **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
@@ -70,7 +70,11 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     return_image : also return the full-resolution image reconstructed with the estimated maps
         (SENSE: closed form when everything inside the acquired k-space extent is sampled, CG-SENSE with
         Tikhonov ``sense_lambda`` (relative to the mean of sum |C|^2; default 1e-2) otherwise; zero-padded or partial-Fourier k-space edges are not
-        extrapolated; per frame for dynamic data). Returns (maps, image, info).
+        extrapolated; per frame for dynamic data). Returns (maps, image, info). ``sense_lambda`` is the
+        main noise / aliasing trade-off (1e-2: close to least squares, the most residual noise; 3e-2 to 1e-1:
+        smoother, NLINV-like); ``sense_iters`` caps the CG iterations (fewer = stronger implicit
+        regularisation, as in NLINV). With ``solve_image`` the same ``sense_lambda`` weights the image of the
+        joint fit.
     mask_maps : False (default; maps cover the whole FOV) | True (zero the maps, and the images, outside
         the estimated object support ``info['support']``, as ESPIRiT's cropped maps; CG-SENSE is then
         support-constrained) | a bool array of the spatial shape (your own support; also used for the
@@ -154,6 +158,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
             raise ValueError("solve_image with dynamic data needs rank=0 (one static map set)")
         cfg.joint_full = True
         return_image = True
+        if "lambda_joint_img" not in cfg_overrides:      # one image-regularisation knob for both image paths
+            cfg.lambda_joint_img = sense_lambda
     under_info = {}
     if undersample is not None:
         ksp, mask, under_info = _apply_undersampling(ksp, mask, undersample, layout, cfg.calib)
@@ -225,7 +231,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         info["image_solved_jointly"] = True
         return C, x_solved, info
     with accel.phase("sense_image", device):
-        img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda, device=device)
+        img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda, iters=sense_iters, device=device)
     info["timings"] = dict(accel.TIMES)
     info["seconds"] = time.time() - t0
     return C, img, info
