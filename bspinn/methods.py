@@ -222,6 +222,10 @@ def _bs(case: EvalCase, model="pinn", cfg_overrides=None, return_wires=False, lo
     from .geometry import SliceGeometry
     cfg = FitConfig(model=model, calib=int(max(case.acs)), iters_wires=1000, iters_pinn=1500, lambda_phys=0.1,
                     log_every=500, threads=kw.get("threads", 1), phase_ref="model")
+    if kw.get("device"):
+        cfg.device = kw["device"]
+    if kw.get("seed") is not None:
+        cfg.seed = kw["seed"]
     for k, v in (cfg_overrides or {}).items():
         setattr(cfg, k, v)
     if case.joint:
@@ -255,8 +259,24 @@ def _bs(case: EvalCase, model="pinn", cfg_overrides=None, return_wires=False, lo
     return out
 
 
-ESTIMATORS = {"lowres": lowres, "walsh": walsh, "inati": inati, "espirit": espirit, "nlinv": nlinv}
+def pinn_api(case: EvalCase, device="cpu", seed=0, quality="default", **kw):
+    """``bspinn.estimate_maps`` exactly as a user calls it (presets, plane search, fold-over
+    handling), on the calibration data the other methods see."""
+    from .api import estimate_maps
+    seen = case.sampled if case.joint else case.acs_mask()
+    plane = case.meta.get("api_plane", case.plane)
+    C, _ = estimate_maps(case.calib_kspace(), "2d" if case.ndim == 2 else "3d", mask=seen,
+                         calib=int(max(case.acs)) if case.ndim == 2 else tuple(int(a) for a in case.acs),
+                         spacing=tuple(case.pixel_spacing) if case.ndim == 2 else tuple(case.voxel),
+                         plane=plane if case.ndim == 2 else "auto", device=device, seed=seed,
+                         quality=quality, verbose=False)
+    return np.asarray(C)
+
+
+ESTIMATORS = {"pinn_api": pinn_api, "lowres": lowres, "walsh": walsh, "inati": inati, "espirit": espirit, "nlinv": nlinv}
 ALL_METHODS = ["lowres", "walsh", "inati", "espirit", "nlinv", "bs_pinn", "bs_wires", "free", "oracle"]
+# lowres/walsh/inati/espirit/nlinv/pinn_api take these keyword arguments; others ignore them
+_PASS = {"pinn_api": ("device", "seed", "quality")}
 
 
 def estimate(case: EvalCase, methods, cache_dir=None, log=print, **kw):
@@ -288,7 +308,8 @@ def estimate(case: EvalCase, methods, cache_dir=None, log=print, **kw):
                 continue
             store(name, case.gt_maps, 0.0)
         elif name in ESTIMATORS:
-            store(name, ESTIMATORS[name](case, **kw), time.time() - t0)
+            kk = {k: v for k, v in kw.items() if k in _PASS.get(name, ()) or k not in ("device", "seed", "quality")}
+            store(name, ESTIMATORS[name](case, **kk), time.time() - t0)
         elif name == "bs_pinn":
             out = _bs(case, "pinn", **kw); store("bs_pinn", out["pinn"], time.time() - t0)
             if "wires" in out and "bs_wires" in methods and not cached("bs_wires"):

@@ -907,3 +907,41 @@ def test_reference_free_prospective_and_benchmark_plumbing(tmp_path):
     assert set(res["methods"]) == {"lowres", "oracle"}
     tsv = open(tmp_path / "t" / "reference_free.tsv").read()
     assert "r2r_optimism" in tsv and "lco_outside_acs_over_floor" in tsv
+
+
+def test_evaluate_methods_dataset_items(tmp_path, monkeypatch):
+    import importlib.util
+    import os
+    import sys
+    from bspinn.data import make_synthetic
+    mod = tmp_path / "fake_ds_mod.py"
+    mod.write_text(
+        "import numpy as np\n"
+        "from bspinn.data import make_synthetic\n"
+        "class DS:\n"
+        "    def __len__(self): return 3\n"
+        "    def __getitem__(self, i):\n"
+        "        d, C, o = make_synthetic(6, (80, 72), noise=0.0, seed=i)\n"
+        "        k = d.kspace[0]; r = np.random.default_rng(i); A = np.eye(6) + 0.3 * r.normal(size=(6, 6))\n"
+        "        n = (r.normal(size=k.shape) + 1j * r.normal(size=k.shape)) * 0.01\n"
+        "        k = k + np.einsum('ij,jxy->ixy', A, n); k[:, :, :6] = 0\n"
+        "        return {'kspace': k, 'fname': f'fake{i}'}\n"
+        "def get(base=None): return DS()\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    spec = importlib.util.spec_from_file_location("evm2", os.path.join(os.path.dirname(__file__), "..", "scripts", "evaluate_methods.py"))
+    evm = importlib.util.module_from_spec(spec); spec.loader.exec_module(evm)
+    # noise estimate (correlated channels, signal up to the k-space edge) and whitening
+    import fake_ds_mod
+    k = fake_ds_mod.DS()[1]["kspace"]
+    r = np.random.default_rng(1); A = np.eye(6) + 0.3 * r.normal(size=(6, 6))
+    psi, info = evm.estimate_noise(k, np.abs(k).sum(0) > 0)
+    assert abs(np.trace(psi).real / np.trace(2e-4 * A @ A.T) - 1) < 0.15
+    cases = list(evm.loader_cases("fake_ds_mod:get", None, [0, 2], 0, 0, "kspace", 0, 24, None, None))
+    c = cases[0]()
+    assert c.pe_axis == 1 and c.sigma == 1.0 and not c.sampled[:, :6].any()
+    monkeypatch.setattr(sys, "argv", ["x", "--loader", "fake_ds_mod:get", "--indices", "0", "2", "--methods", "lowres", "walsh",
+                                      "--Rs", "4", "--out", str(tmp_path / "ev")])
+    evm.main()
+    rows = open(tmp_path / "ev" / "summary.tsv").read().splitlines()
+    assert len(rows) == 5 and "ssim_leave_coil_out" in rows[0] and "ce_acs_over_floor" in rows[0]
+    assert "real\twalsh\t2" in open(tmp_path / "ev" / "ranks.tsv").read()

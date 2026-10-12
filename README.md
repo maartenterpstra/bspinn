@@ -661,7 +661,23 @@ the "ideal" column.
 | `residual_whiteness` | 1 | low-pass (Gaussian 2 px) energy fraction of the residual, relative to that of pure noise through the same operator; > 1 = spatially coherent residual = map error |
 | `projector_hf_fraction` | ≈ 0 | spectrum of the per-pixel projector ccᴴ (gauge-invariant) on a tapered object mask: energy fraction outside the calibration band |
 | `r2r_optimism` (`--resample r2r`) | ≈ 0 | recorrupted-to-recorrupted: y₁ = y + αz, y₂ = y − z/α have independent noise. Maps re-estimated from y₁; residual/floor on y₂ minus on y₁. Also `r2r_independent_excess_rel` (unexplained signal fraction on y₂) and leave-coil-out on y₂ |
+| `ssim_expand`, `ssim_expand_outside_acs`, `ssim_leave_coil_out` (+ worst coil) | higher, < 1 | SSIM of the magnitude coil images after expansion (C_j m; the same high-passed to k-space outside the ACS; the leave-coil-out prediction C_j x₋ⱼ) vs the measured coil images, in the object, weighted by coil energy. The reference is noisy, so the true maps stay below 1 and the ceiling depends on SNR: compare methods within a case. SSIM against noisy data mildly rewards smooth maps (on synthetic data low-res maps can edge out the true maps on the high-passed variant) |
 | `sure_over_oracle`, `sure_map_dof` (`--resample sure`) | 1, 0 | Stein's unbiased risk of the combine → expand prediction, with the divergence of the maps w.r.t. the calibration data by antithetic finite differences (2 × probes re-estimations); over the risk of perfect fixed maps. `sure_map_dof` = degrees of freedom the maps spend on calibration noise |
+
+**Your own data.** `--loader MODULE:FUNCTION --base-folder ... --n N` (or `--indices`) adds N dataset
+items as fully sampled 2-D cases: middle slice of a volume, whitened with a noise covariance estimated
+from the k-space periphery and from the image background (the smaller is used, both are biased up by
+signal; a warning is printed when they disagree by > 1.5x; `--noise-npy` overrides), central `--acs`
+box, PE axis from partial-Fourier zeros. Default methods there: lowres, walsh, inati, espirit,
+nlinv (BART; skipped if `$BART` is unset) and `pinn_api` (= `estimate_maps` as a user calls it, with
+plane search and fold-over handling; `--device cuda`, `--pinn-quality`). `--cases synth` = every
+synthetic case. `<out>/summary.tsv` has one row per case x method, `<out>/ranks.tsv` the mean rank
+per method and metric, separately for synthetic and real cases.
+
+```
+python scripts/evaluate_methods.py --cases synth --loader dataloader_v2:get_dataloader \
+    --base-folder /path/to/data --n 10 --device cuda --Rs 4 --out runs/eval_local
+```
 
 Only R2R and SURE are noise-proof when an estimator sees every sample (joint calibration, `brain8`);
 the leave-coil-out and residual metrics are noise-proof outside the data the maps were fitted to.

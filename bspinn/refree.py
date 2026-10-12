@@ -45,6 +45,13 @@ The metrics below are built so that fitting noise does not pay off:
    (exact 6) but 3.2 at 1.0. Stochastic estimators (NN training on GPU) add jitter / (2 eps sigma) to
    d_maps: use a fixed seed and deterministic kernels, or a larger eps and more probes.
 
+6. ``coil_ssim`` (cheap, fully sampled): SSIM of the magnitude coil images after expansion against
+   the measured coil images, per coil (object mask, weighted by coil energy; also the worst coil):
+   (a) combine -> expand C_j m, (b) the same restricted to k-space outside the ACS (high-pass coil
+   images: data the maps did not see), (c) the leave-coil-out prediction C_j x_{-j}. HIGHER is better.
+   The reference is noisy, so even the true maps stay below 1 (the ceiling falls with SNR): compare
+   methods within a case, not across cases.
+
 ``summary`` collects one headline number per metric.
 """
 from __future__ import annotations
@@ -200,6 +207,35 @@ def residual_structure(C, case: EvalCase, obj, n_bins=5, lowpass_px=2.0, replica
             "whiteness_ratio": white, "lowpass_px": lowpass_px}
 
 
+# ----------------------------------------------------------------------------------- SSIM
+def _ssim_per_coil(est, ref, obj, w):
+    from skimage.metrics import structural_similarity
+    vals = []
+    for j in range(ref.shape[0]):
+        a, b = np.abs(est[j]), np.abs(ref[j])
+        dr = float(b.max())
+        if dr <= 0:
+            vals.append(float("nan")); continue
+        _, m = structural_similarity(a, b, data_range=dr, full=True)
+        vals.append(float(m[obj].mean()))
+    v = np.asarray(vals); ok = np.isfinite(v)
+    return {"weighted_mean": float((v[ok] * w[ok]).sum() / max(w[ok].sum(), 1e-30)), "worst_coil": float(v[ok].min()),
+            "per_coil": [float(x) for x in v]}
+
+
+def coil_ssim(C, case: EvalCase, obj):
+    s = case.sampled[None]
+    y = case.ksp * s
+    I = ifft2c(y)
+    E = expand(C, combine(C, I))
+    L = I - _lco_residual(C, I)
+    ho = (case.sampled & ~case.acs_mask())[None]
+    w = (np.abs(I[:, obj]) ** 2).sum(1)
+    return {"expand": _ssim_per_coil(E, I, obj, w),
+            "expand_outside_acs": _ssim_per_coil(ifft2c(fft2c(E) * ho), ifft2c(y * ho), obj, w),
+            "leave_coil_out": _ssim_per_coil(L, I, obj, w)}
+
+
 # ----------------------------------------------------------------------------------- 3. bandwidth
 def projector_bandwidth(C, case: EvalCase, obj, taper_px=3.0):
     from scipy.ndimage import gaussian_filter
@@ -290,6 +326,7 @@ def evaluate(C, case: EvalCase, obj, name=None, est_kw=None, resample=(), r2r_al
     if case.fully_sampled:
         out["leave_coil_out"] = leave_coil_out(C, case, obj)
         out["residual_structure"] = residual_structure(C, case, obj)
+        out["coil_ssim"] = coil_ssim(C, case, obj)
     else:
         out["leave_coil_out"] = leave_coil_out_cg(C, case, coils=lco_coils)
     out["projector_bandwidth"] = projector_bandwidth(C, case, obj)
@@ -302,7 +339,7 @@ def evaluate(C, case: EvalCase, obj, name=None, est_kw=None, resample=(), r2r_al
 
 
 def summary(rf):
-    """One headline number per metric (lower is better for all; ideal values in the README)."""
+    """One headline number per metric (lower is better except ssim_*; ideal values in the README)."""
     s = {}
     l = rf.get("leave_coil_out", {})
     if "outside_acs" in l:
@@ -315,6 +352,12 @@ def summary(rf):
     if "residual_structure" in rf:
         s["residual_signal_slope"] = rf["residual_structure"]["log_slope_vs_signal_power"]
         s["residual_whiteness"] = rf["residual_structure"]["whiteness_ratio"]
+    if "coil_ssim" in rf:
+        cs = rf["coil_ssim"]
+        s["ssim_expand"] = cs["expand"]["weighted_mean"]
+        s["ssim_expand_outside_acs"] = cs["expand_outside_acs"]["weighted_mean"]
+        s["ssim_leave_coil_out"] = cs["leave_coil_out"]["weighted_mean"]
+        s["ssim_leave_coil_out_worst_coil"] = cs["leave_coil_out"]["worst_coil"]
     s["projector_hf_fraction"] = rf["projector_bandwidth"]["frac_outside_calib_band"]
     if "recorrupted" in rf:
         r = rf["recorrupted"]
