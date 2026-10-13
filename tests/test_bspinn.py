@@ -997,3 +997,47 @@ def test_heldout_score_prefers_true_maps():
     assert _n_heldout(k * m, m, 16) > 0 and _n_heldout(k * m, np.pad(np.ones((16, 16), bool), 24), 16) == 0
     good_s, bad_s = _heldout_score(C[0], k * m, m, 16, "cpu"), _heldout_score(bad, k * m, m, 16, "cpu")
     assert good_s < 0.8 * bad_s, (good_s, bad_s)
+
+
+def test_mixing_and_smooth_factor_modules():
+    from bspinn.models import ChannelMixer, SmoothFactor
+    sf = SmoothFactor(4, (2, 0), order=2)
+    pts = torch.rand(50, 3) * 2 - 1
+    assert torch.allclose(sf(pts), torch.ones(4, 50, dtype=torch.complex64))      # starts at exp(0) = 1
+    assert float(sf.penalty()) == 0.0
+    far = pts.clone(); far[:, 2] += 2.0
+    edge = pts.clone(); edge[:, 2] = 1.0
+    with torch.no_grad():
+        sf.a.normal_()
+    assert torch.allclose(sf(far), sf(edge))                                     # constant beyond the FOV
+    mx = ChannelMixer(4)
+    C = torch.randn(4, 10, dtype=torch.complex64)
+    assert torch.allclose(mx(C), C)
+    with torch.no_grad():
+        mx.e.normal_()
+    assert not torch.allclose(mx(C), C) and float(mx.penalty()) > 0
+    assert torch.allclose(torch.diagonal(mx.off), torch.zeros(4))                # no diagonal (= gains)
+
+
+def test_learned_mixing_recovers_coupled_channels():
+    """Channels that are complex mixtures of Biot–Savart coils (coupling): the learnable mixing lowers
+    the map error substantially compared with the plain physics model."""
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    ax = (1, 2)
+    F = lambda x: np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(x, axes=ax), axes=ax, norm="ortho"), axes=ax)
+    Fi = lambda x: np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(x, axes=ax), axes=ax, norm="ortho"), axes=ax)
+    d, C, obj = make_synthetic(6, (48, 48), noise=0.001, seed=4)
+    rng = np.random.default_rng(0)
+    E = 0.1 * (rng.normal(size=(6, 6)) + 1j * rng.normal(size=(6, 6))); np.fill_diagonal(E, 0)
+    M = np.eye(6) + E
+    k = np.einsum("ij,jxy->ixy", M, d.kspace[0])
+    Ct = np.einsum("ij,jxy->ixy", M, C[0])
+    Gn = Ct / np.sqrt((np.abs(Ct) ** 2).sum(0, keepdims=True))
+    err = {}
+    for mix in (False, True):
+        Cm, _ = estimate_maps(k, "2d", calib=16, plane="axial", verbose=False, iters_auto=40, iters_wires=200,
+                              iters_pinn=300, learn_mixing=mix, resid_order=0, fold=False, threads=1)
+        Cn = Cm / np.sqrt((np.abs(Cm) ** 2).sum(0, keepdims=True))
+        err[mix] = float((1 - np.abs((Cn.conj() * Gn).sum(0)) ** 2)[obj[0] > 0].mean())
+    assert err[True] < 0.5 * err[False], err

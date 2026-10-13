@@ -53,9 +53,69 @@ def make_trunk(d_in: int, width: int, depth: int, d_out: int) -> nn.Sequential:
     return net
 
 
+class SmoothFactor(nn.Module):
+    """Per-coil complex multiplicative factor exp(u_j(r)) on the image plane, u_j = sum_b a_jb phi_b(r)
+    with a tensor-product cosine/sine basis of order K (1, cos(pi k x / 2), sin(pi k x / 2), k <= K) in
+    the two in-plane coordinates (normalised, |x| <= 1 over the FOV; period twice the FOV, so the factor is
+    not forced periodic across the FOV). It absorbs smooth per-coil deviations from the physics field
+    (wave/conductivity effects, coupling, transmit-receive phase) while the physics part keeps carrying
+    the extrapolation. Starts at exp(0) = 1; ``penalty`` is a Sobolev-type ridge (weight 1 + |k|^2)."""
+
+    def __init__(self, n_coils, comps, order=2):
+        super().__init__()
+        self.comps, self.order = tuple(int(c) for c in comps), int(order)
+        ks = []
+        for kx in range(-order, order + 1):
+            for ky in range(-order, order + 1):
+                ks.append((kx, ky))
+        self.register_buffer("kk", torch.tensor(ks, dtype=torch.float32))   # signed k: <0 sin, >0 cos
+        self.a = nn.Parameter(torch.zeros(n_coils, len(ks), 2))
+
+    def _phi1(self, x, k):
+        k_ = k.abs()
+        return torch.where(k > 0, torch.cos(np.pi * k_ * x / 2), torch.where(k < 0, torch.sin(np.pi * k_ * x / 2),
+                                                                              torch.ones_like(x)))
+
+    def forward(self, points):
+        p = points if points.dim() == 2 else points[0]
+        # constant continuation beyond the FOV (|x| > 1): the factor is only informed inside it, and the
+        # periodic basis would otherwise mirror it there (fold-over maps are evaluated one FOV away)
+        x = p[:, self.comps[0]][:, None].clamp(-1, 1)
+        y = p[:, self.comps[1]][:, None].clamp(-1, 1)
+        phi = self._phi1(x, self.kk[None, :, 0]) * self._phi1(y, self.kk[None, :, 1])   # (P, B)
+        u = torch.complex(phi @ self.a[..., 0].T, phi @ self.a[..., 1].T).T              # (N, P)
+        return torch.exp(u)
+
+    def penalty(self):
+        w = 1 + (self.kk ** 2).sum(1)
+        w = torch.where((self.kk == 0).all(1), torch.zeros_like(w), w)                 # constant: free (gain)
+        return (w[None, :, None] * self.a ** 2).sum() / self.a.shape[0]
+
+
+class ChannelMixer(nn.Module):
+    """C -> (I + E) C with a learnable complex off-diagonal E (N x N): residual inductive coupling and
+    preamplifier decoupling make every receive channel a complex mixture of the elements' fields, which a
+    single real (quasi-static) field per channel with one global phase cannot represent. Starts at E = 0;
+    ``penalty`` = mean |E_ij|^2 over coils."""
+
+    def __init__(self, n_coils):
+        super().__init__()
+        self.e = nn.Parameter(torch.zeros(n_coils, n_coils, 2))
+        self.register_buffer("off", 1.0 - torch.eye(n_coils))
+
+    def forward(self, C):
+        E = torch.complex(self.e[..., 0], self.e[..., 1]) * self.off
+        return C + E.to(C.dtype) @ C if C.dim() == 2 else C + torch.einsum("ij,j...->i...", E.to(C.dtype), C)
+
+    def penalty(self):
+        return (self.e ** 2).sum(-1).mul(self.off).sum() / self.e.shape[0]
+
+
 class CoilModel(nn.Module):
     n_coils: int
     handedness: int
+    # optional SmoothFactor multiplying the sensitivities: registered as the submodule 'resid'
+    # (looked up in _modules: a class attribute would shadow the registered module)
 
     def field(self, points: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
         """Return B with shape (N, P, 3, K); K=1 real field, K=2 (re, im)."""
@@ -70,7 +130,11 @@ class CoilModel(nn.Module):
 
     def sensitivity(self, points: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
         """Complex sensitivities, shape (N, P)."""
-        return self._sens_from_field(self.field(points, create_graph=create_graph))
+        C = self._sens_from_field(self.field(points, create_graph=create_graph))
+        r = self._modules.get("resid")
+        C = C if r is None else C * r(points)
+        x = self._modules.get("mixer")
+        return C if x is None else x(C)
 
     def _sens_from_field(self, B):
         if B.shape[-1] == 1:
@@ -432,6 +496,10 @@ class HarmonicPINN(CoilModel):
         B = -g[:, :P0]
         Bw = self._base_field(x[:, :P0])                                        # wires train too: with graph
         C = self._sens_from_field(B if Bw is None else B + Bw)
+        if self._modules.get("resid") is not None:
+            C = C * self._modules["resid"](pts)
+        if self._modules.get("mixer") is not None:
+            C = self._modules["mixer"](C)
         gc = g[:, P0:]
         with torch.no_grad():
             Bwc = self._base_field(x[:, P0:])

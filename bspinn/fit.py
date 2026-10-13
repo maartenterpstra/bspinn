@@ -17,6 +17,7 @@ the physics prior: phi must keep every coil's map a Biot–Savart field.
 """
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass
 
@@ -138,6 +139,16 @@ class FitConfig:
     lr_image_pinn: float = 1e-2
     lambda_temporal: float = 0.0     # ||m_t - m_t-1||^2 on frame images (dynamic data)
     support_thresh: float = 0.08
+    iters_polish: int = 0            # >0: full-batch L-BFGS refinement of every parameter after the PINN stage
+                                     #   (fixed collocation set of polish_colloc points); Adam alone stalls well
+                                     #   above the noise floor on high-SNR calibration data
+    polish_colloc: int = 4096
+    resid_order: int = 0             # >0: per-coil smooth complex factor exp(u_j) of this Fourier order
+                                     #   multiplying the physics maps (PINN stage on; see models.SmoothFactor)
+    lambda_resid: float = 1e-3       # Sobolev ridge on that factor's coefficients
+    learn_mixing: bool | str = False # learnable complex channel mixing C -> (I + E) C (coupling): True = PINN
+                                     #   stage, 'all' = from the wire stage on
+    lambda_mix: float = 1e-3         # ridge on E
     seed: int = 0
     log_every: int = 100
     threads: int = 0
@@ -481,6 +492,12 @@ def _wrap(primary, prob, cfg, prev=None, free=0):
 
 def _extra_penalty(model, Cs, m, cfg):
     pen = 0.0
+    res = model._modules.get("resid") if isinstance(model, torch.nn.Module) else None
+    if res is not None:
+        pen = pen + cfg.lambda_resid * res.penalty()
+    mx = model._modules.get("mixer") if isinstance(model, torch.nn.Module) else None
+    if mx is not None:
+        pen = pen + cfg.lambda_mix * mx.penalty()
     if isinstance(model, MultiSetCoils) and model.n_free:
         nf = model.n_free
         pen = pen + cfg.lambda_sets * (Cs[-nf:].abs() ** 2).mean() / (Cs[0].abs() ** 2).mean().detach()
@@ -546,6 +563,9 @@ def _wires_setup(prob, cfg, handedness, iters, log, tag):
     wires.init_gains(prob.coords.cpu(), prob.coil_images_model.cpu(),
                      (prob.weights_model * prob.support.flatten()[None]).cpu())
     wires.to(prob.device)
+    if cfg.learn_mixing == "all":                     # coupling learnt from the wire stage on
+        from .models import ChannelMixer
+        wires.mixer = ChannelMixer(wires.n_coils).to(prob.device)
     model = _wrap(wires, prob, cfg)
     params = [{"params": model.parameters(), "lr": cfg.lr_wires}]
     m = None
@@ -658,6 +678,40 @@ def fit_pinn(prob: Problem, cfg: FitConfig, model, m=None, log=print, iters=None
     _run_stage(prob, cfg, iters, params, cfg.lr_min_pinn * cfg.lr_pinn, step_loss, lambda: _colloc(prob, cfg, gen, wires),
                [_batch(prob, cfg, gen) for _ in range(iters)], [gen], after)
     return m, hist
+
+
+def polish(prob, cfg, model, m, log=print):
+    """Full-batch L-BFGS on the PINN-stage objective (data + physics on a FIXED collocation set + norm +
+    keep-out + extra penalties) over all parameters, image included. Deterministic objective, so a
+    quasi-Newton method can converge far below where Adam's stochastic steps stall."""
+    gen = _device_gen(prob, cfg.seed + 11)
+    wires = wire_modules(model)
+    c2 = copy.copy(cfg); c2.n_colloc = cfg.polish_colloc
+    pin, pair = _colloc(prob, c2, gen, wires)
+    sl = _batch(prob, cfg, gen)
+    params = [q for q in model.parameters() if q.requires_grad] + ([m] if m is not None else [])
+    opt = torch.optim.LBFGS(params, lr=1.0, max_iter=cfg.iters_polish, history_size=50,
+                            tolerance_grad=1e-12, tolerance_change=1e-14, line_search_fn="strong_wolfe")
+    state = {}
+
+    def closure():
+        opt.zero_grad(set_to_none=True)
+        Cs = sens_sets(model, prob.slice_coords(sl))
+        d = prob.data_loss(Cs, m, sl)
+        phys = _physics_at(model, cfg, pin, pair)
+        loss = d + cfg.lambda_phys * phys + cfg.lambda_norm * prob.norm_loss(Cs, sl) + _extra_penalty(model, Cs, m, cfg)
+        for w in wires:
+            out, _ = w.regularisers(prob.keep, cfg.outside_margin)
+            loss = loss + cfg.lambda_outside * out
+        loss.backward()
+        state["d"], state["phys"] = float(d.detach()), float(phys.detach())
+        return loss
+    d0 = None
+    with torch.enable_grad():
+        closure(); d0 = state["d"]
+        opt.step(closure)
+    log(f"[polish] L-BFGS {cfg.iters_polish} it: data {d0:.4e} -> {state['d']:.4e}  laplace {state['phys']:.3e}")
+    return [{"data0": d0, "data": state["d"], "phys": state["phys"]}]
 
 
 def _fft2c_t(x):
@@ -1084,8 +1138,19 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
         wires = wires_model.primary if isinstance(wires_model, MultiSetCoils) else wires_model
         with accel.phase("pinn", cfg.device):
             pinn = make_pinn(prob, cfg, wires, h)
+            if cfg.resid_order > 0:
+                from .models import SmoothFactor
+                pinn.resid = SmoothFactor(pinn.n_coils, prob.keep.comp, cfg.resid_order).to(prob.device)
+            if wires is not None and wires._modules.get("mixer") is not None:
+                pinn.mixer = wires._modules["mixer"]               # continue from the wire stage's coupling
+            elif cfg.learn_mixing:
+                from .models import ChannelMixer
+                pinn.mixer = ChannelMixer(pinn.n_coils).to(prob.device)
             model = _wrap(pinn, prob, cfg, prev=wires_model, free=cfg.free_sets)
             m, history["pinn"] = fit_pinn(prob, cfg, model, m, log=log)
+        if cfg.iters_polish > 0:
+            with accel.phase("polish", cfg.device):
+                history["polish"] = polish(prob, cfg, model, m, log=log)
     image_full = None
     if cfg.joint_full:
         with accel.phase("joint_image", cfg.device):

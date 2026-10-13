@@ -162,6 +162,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         cfg.calib = int(max(_calib(calib, 24, 1)))
     if layout == "dynamic":
         cfg.slice_batch = min(4, ksp.shape[-1])        # frames per optimisation step (cost ~ frames)
+    if layout == "2d" and model == "pinn":
+        # v33 defaults from scripts/method_lab.py (real knees/brain + synthetic): learnable complex channel
+        # coupling and a smooth per-coil complex factor (Fourier order 3)
+        cfg.learn_mixing, cfg.resid_order = True, 3
     for k, v in cfg_overrides.items():
         if not hasattr(cfg, k):
             raise TypeError(f"unknown option {k!r} (not a FitConfig field)")
