@@ -1025,6 +1025,57 @@ Tips: the cost scales with the calibration grid and the number of coils, not wit
 collocation points (`n_colloc`) or a larger calibration grid: use them. `joint_maps="exact"` is the
 reference for the hybrid maps; `"interp"` is the cheapest and slightly biased.
 
+### 8.3 Closing the gap to NLINV on real data (v33)
+
+`scripts/method_lab.py` fits one variant on a fixed panel and scores it with k-space-only metrics
+(ACS-only protocol, pre-whitened data, B0 orientation given, `quality='fast'`, CPU): item 19870 (fastMRI
+coronal knee, 15 ch), the BART-workshop knee, three held-out slices never used for tuning (two axial knees,
+one 12-channel Calgary-Campinas brain), a prospective fold-over knee, and the synthetic phantoms.
+
+**Diagnosis.** (1) A self-consistency test (the real knee anatomy times the PINN's own maps, i.e. data the
+model represents exactly) still left the combine->expand residual in the ACS at 75x the noise floor and a
+1.3 % subspace error: part of the gap is the optimisation, not the physics (more iterations, a 4x learning
+rate or an L-BFGS polish all help; finer calibration grids, weaker norm/image penalties do not). (2) The
+PINN/NLINV map ratio on the knee is 82 % explained by a smooth (Fourier order 2) per-coil complex factor:
+the model misses smooth per-coil deviations. (3) Real receive channels are complex mixtures of the elements
+(residual coupling, preamplifier decoupling), which one real quasi-static field per channel with a global
+phase cannot represent.
+
+**Changes** (both on by default for 2-D `estimate_maps`; off: `learn_mixing=False, resid_order=0`):
+* `learn_mixing`: channels = (I + E) x element maps, E complex off-diagonal, ridge `lambda_mix`
+  (`models.ChannelMixer`), learnt in the PINN stage (from the wire stage on, `'all'`, was worse).
+* `resid_order=3`: every map times exp(u_j), u_j a complex 2-D Fourier series of order 3 over the FOV with a
+  Sobolev ridge `lambda_resid` (`models.SmoothFactor`); constant beyond the FOV.
+* optional `iters_polish=N`: full-batch L-BFGS of all parameters after the PINN stage.
+
+Leave-coil-out prediction outside the ACS / noise floor (lower is better; 1 = true maps):
+
+| | k19870 | knee15 | axial knee A* | axial knee B* | CC brain* |
+|---|---|---|---|---|---|
+| v32 (physics only) | 1.216 | 1.032 | 1.607 | 1.042 | 1.043 |
+| + coupling | 1.095 | 1.029 | | | |
+| **v33** (+ coupling + factor) | 1.061 | 1.029 | 1.247 | 1.041 | 1.037 |
+| v33, `lr_pinn=4e-3` | 1.051 | 1.029 | 1.141 | 1.041 | 1.036 |
+| v33, default preset (2.5x iterations) | 1.054 | | 1.205 | | |
+| NLINV | 1.019 | 1.030 | 1.071 | 1.040 | 1.034 |
+| ESPIRiT | 1.590 | 1.123 | 1.084 | 1.040 | 1.035 |
+
+CG-SENSE R4 NRMSE (common support): k19870 0.083 -> 0.078 (NLINV 0.075), axial knee A 0.034 -> 0.028
+(0.025 with `lr_pinn=4e-3`; NLINV 0.024), the rest unchanged within 1 %. *held out (never used to choose).
+Synthetic subspace error (v32 -> v33; NLINV): Biot–Savart 1.3e-5 -> 3.5e-5 (1.2e-4); non-Biot–Savart
+1.5e-3 -> 1.4e-4 (3.3e-4: v33 now beats NLINV and ESPIRiT there); high noise 1.7e-4 -> 3.2e-4 (8.6e-4).
+Prospective fold-over knee, held-out k-space NRMSE: v32 1.042, v33 1.048, NLINV 1.056, ESPIRiT 1.078.
+The price of the extra freedom is a 2-3x larger error when the physics model is exact; it remains 3-4x
+below NLINV.
+
+**Not adopted:** `field_mode='complex'` (no gain on one slice), `shift_sets=1` (worse), coupling from the
+wire stage on (worse), `loops_per_coil=2` (+0.007, +20 % time), `calib_oversample=3`, lower norm/image
+penalties, `lambda_resid` 1e-2 (k19870 worse). `lr_pinn=4e-3` helps every real case (most on high-SNR
+slices) but together with the coupling it weakens the fold-over correction on the synthetic fold test
+(error 0.27 -> 0.34-0.42), so it is not the default: pass `lr_pinn=4e-3` for high-SNR data without
+fold-over. The B0 orientation remains the largest single risk: on axial knee A, coronal / coronal_t /
+axial give 1.30 / 1.12 / 1.14; give `plane=` when you know it.
+
 ## 9. Code map
 
 | file | content |
