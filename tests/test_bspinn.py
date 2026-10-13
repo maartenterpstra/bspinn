@@ -947,6 +947,38 @@ def test_evaluate_methods_dataset_items(tmp_path, monkeypatch):
     assert "real\twalsh\t2" in open(tmp_path / "ev" / "ranks.tsv").read()
 
 
+def test_evaluate_methods_skips_empty_slices(tmp_path, monkeypatch):
+    """A noise-only slice (edge of a volume) is skipped instead of crashing the run (also with --joint)."""
+    import importlib.util
+    import os
+    import sys
+    from bspinn import evaluation as ev
+    mod = tmp_path / "fake_ds_empty.py"
+    mod.write_text(
+        "import numpy as np\n"
+        "from bspinn.data import make_synthetic\n"
+        "class DS:\n"
+        "    def __len__(self): return 2\n"
+        "    def __getitem__(self, i):\n"
+        "        d, C, o = make_synthetic(6, (80, 72), noise=0.0, seed=i)\n"
+        "        r = np.random.default_rng(i)\n"
+        "        k = d.kspace[0] * (i == 0) + (r.normal(size=d.kspace[0].shape) + 1j * r.normal(size=d.kspace[0].shape)) * 0.01\n"
+        "        return {'kspace': k}\n"
+        "def get(base=None): return DS()\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    spec = importlib.util.spec_from_file_location("evm3", os.path.join(os.path.dirname(__file__), "..", "scripts", "evaluate_methods.py"))
+    evm = importlib.util.module_from_spec(spec); spec.loader.exec_module(evm)
+    monkeypatch.setattr(sys, "argv", ["x", "--loader", "fake_ds_empty:get", "--indices", "0", "1", "--methods", "lowres",
+                                      "--joint", "4", "--Rs", "2", "--out", str(tmp_path / "ev")])
+    evm.main()
+    rows = open(tmp_path / "ev" / "summary.tsv").read().splitlines()
+    assert len(rows) == 2 and rows[1].startswith("item0_j4")
+    # small objects (< 1 % of the image) still give a mask
+    case = next(iter(evm.loader_cases("fake_ds_empty:get", None, [0], 0, 0, "kspace", 0, 24, None, None)))()
+    big = ev.object_mask(case)
+    assert big.sum() > 0.01 * big.size
+
+
 def _fold_problem(X=64, Y=64, N=6, band=12, seed=0):
     """Smooth maps T on an extended grid; tissue beyond the left edge folds into the right `band` columns."""
     rng = np.random.default_rng(seed)

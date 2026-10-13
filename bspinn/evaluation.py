@@ -59,6 +59,8 @@ def object_mask(case: EvalCase, frac=0.05, noise_factor=1.3, smooth=9):
     for i in range(1, n + 1):
         if (lab == i).sum() > 0.01 * m.size:
             keep |= lab == i
+    if not keep.any() and n:                     # small object: keep the largest component
+        keep = lab == 1 + int(np.argmax(np.bincount(lab.ravel())[1:]))
     return keep
 
 
@@ -143,9 +145,12 @@ def reference_image(C, case: EvalCase, obj):
     good = obj & (den > 10 * case.N * s2)                        # debiasing is unreliable at very low SNR
     if not good.any():
         good = obj
-    out = {"snr_efficiency_mean": float(np.clip(eff[good], 0, 1.2).mean()),
-           "snr_efficiency_p05": float(np.quantile(eff[good], 0.05)),
-           "snr_loss_db_mean": float(-20 * np.log10(np.clip(eff[good], 1e-3, None)).mean())}
+    if good.any():
+        out = {"snr_efficiency_mean": float(np.clip(eff[good], 0, 1.2).mean()),
+               "snr_efficiency_p05": float(np.quantile(eff[good], 0.05)),
+               "snr_loss_db_mean": float(-20 * np.log10(np.clip(eff[good], 1e-3, None)).mean())}
+    else:
+        out = {"snr_efficiency_mean": float("nan"), "snr_efficiency_p05": float("nan"), "snr_loss_db_mean": float("nan")}
     rss = np.sqrt((np.abs(I) ** 2).sum(0))
     out["vs_rss"] = image_metrics(m, rss, obj)
     if case.gt_maps is not None:
@@ -275,7 +280,8 @@ def map_properties(C, case: EvalCase, obj):
         ov = np.abs((a.conj() * b).sum(0)) ** 2
         o2 = np.take(obj, range(obj.shape[ax - 1] - 1), axis=ax - 1) & np.take(obj, range(1, obj.shape[ax - 1]), axis=ax - 1)
         rough.append(np.sqrt(np.clip(2 - 2 * ov, 0, None))[o2])
-    out["projector_roughness"] = float(np.concatenate(rough).mean())
+    rough = np.concatenate(rough)
+    out["projector_roughness"] = float(rough.mean()) if rough.size else float("nan")
     if C.ndim == 4:      # 3-D: count in every slice along the first array axis
         v = phase_vortices(torch.from_numpy(np.ascontiguousarray(np.moveaxis(C, 1, 0))), torch.from_numpy(obj))
     else:

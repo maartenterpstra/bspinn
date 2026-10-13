@@ -158,11 +158,18 @@ def _json(o):
     return o
 
 
+MIN_OBJECT = 0.005          # fraction of the image the object mask must cover for a case to be scored
+
+
 def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=print, resample=(), r2r_alpha=0.7,
              sure_eps=0.1, sure_probes=1, device=None, quality=None, fit_case=None):
     """``fit_case``: what the estimators see (default: ``case``); every metric is computed on ``case``
     (--joint: the undersampled copy is fitted, the fully sampled original scores)."""
     fit_case = fit_case or case
+    obj = ev.object_mask(case)
+    if obj.sum() < MIN_OBJECT * obj.size:      # e.g. an edge slice of a volume: noise only, nothing to score
+        log(f"  [{case.name}] skipped: no object found ({int(obj.sum())} pixels above the noise threshold)")
+        return None
     cdir = os.path.join(out, case.name)
     os.makedirs(cdir, exist_ok=True)
     over = {}
@@ -180,7 +187,6 @@ def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=pr
             maps.update(m_); secs.update(s_)
         except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as e:
             log(f"  [{case.name}] skipping {mth}: {e}")
-    obj = ev.object_mask(case)
     from scipy.ndimage import binary_dilation
     sup = binary_dilation(obj, iterations=3)          # common SENSE support (same for every method)
     res = {"case": {"name": case.name, "n_coils": case.N, "shape": list(case.shape), "acs": list(case.acs),
@@ -373,7 +379,7 @@ def main():
         jobs += [(mk, dm) for mk in loader_cases(a.loader, a.base_folder, a.indices, a.n, a.pick_seed, a.key,
                                                  a.coil_axis, a.acs, a.pe_axis, noise)]
     os.makedirs(a.out, exist_ok=True)
-    results = []
+    results, skipped = [], []
     for make, methods in jobs:
         case = make()
         if case.meta.get("api_plane") == "auto" and a.pinn_plane != "auto":
@@ -384,11 +390,16 @@ def main():
             fit_case = undersampled(case, a.joint)
             case.name = fit_case.name = f"{case.name}_j{a.joint:g}"
             print(f"   joint protocol: fitted on {fit_case.sampled.mean():.3f} of k-space (R={a.joint:g} vd + ACS)", flush=True)
-        results.append(run_case(case, methods, a.out, Rs=tuple(a.Rs), threads=a.threads, log=log, resample=a.resample,
-                                fit_case=fit_case,
-                                r2r_alpha=a.r2r_alpha, sure_eps=a.sure_eps, sure_probes=a.sure_probes, device=a.device,
-                                quality=a.pinn_quality))
+        res = run_case(case, methods, a.out, Rs=tuple(a.Rs), threads=a.threads, log=log, resample=a.resample,
+                       fit_case=fit_case,
+                       r2r_alpha=a.r2r_alpha, sure_eps=a.sure_eps, sure_probes=a.sure_probes, device=a.device,
+                       quality=a.pinn_quality)
+        if res is None:
+            skipped.append(case.name); continue
+        results.append(res)
         write_summary(results, a.out)          # updated after every case
+    if skipped:
+        print(f"skipped (no object): {' '.join(skipped)}")
 
 
 if __name__ == "__main__":
