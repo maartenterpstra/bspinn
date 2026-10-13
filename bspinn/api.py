@@ -31,7 +31,7 @@ PRESETS = {      # iterations: (handedness/orientation probe, wire stage, PINN s
 def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, plane="auto", axes="auto",
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
-                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda=1e-2, sense_iters=60, mask_maps=False, support_threshold=0.1,
+                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda="auto", sense_lambda_scale=1.0, sense_iters=60, mask_maps=False, support_threshold=0.1,
                   support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout", **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
@@ -69,12 +69,19 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     phase_ref : common-phase convention: 'inati' (virtual body coil, default) | 'model' | 'coil'.
     return_image : also return the full-resolution image reconstructed with the estimated maps
         (SENSE: closed form when everything inside the acquired k-space extent is sampled, CG-SENSE with
-        Tikhonov ``sense_lambda`` (relative to the mean of sum |C|^2; default 1e-2) otherwise; zero-padded or partial-Fourier k-space edges are not
+        Tikhonov ``sense_lambda`` otherwise; zero-padded or partial-Fourier k-space edges are not
         extrapolated; per frame for dynamic data). Returns (maps, image, info). ``sense_lambda`` is the
-        main noise / aliasing trade-off (1e-2: close to least squares, the most residual noise; 3e-2 to 1e-1:
-        smoother, NLINV-like); ``sense_iters`` caps the CG iterations (fewer = stronger implicit
-        regularisation, as in NLINV). With ``solve_image`` the same ``sense_lambda`` weights the image of the
-        joint fit.
+        main noise / aliasing trade-off: a number (relative to the mean of sum |C|^2; 1e-2: close to least
+        squares, the most residual noise; 3e-2 to 1e-1: smoother, NLINV-like), or chosen from the data:
+        'auto' (= 'auto-cv', default: k-space cross-validation on withheld acquired samples, which tracks
+        the image error; no noise level needed), 'auto-map' (Wiener: noise variance / mean signal power,
+        closed form), 'auto-gcv', 'auto-discrepancy' (data-space criteria; less reliable here); see
+        bspinn/senselam.py. ``sense_lambda_scale`` multiplies the automatic value. The chosen value and
+        every rule's value are in ``info['sense_lambda']``. ``sense_iters`` caps the CG iterations (fewer =
+        stronger implicit regularisation, as in NLINV). With ``solve_image``: a numeric ``sense_lambda``
+        also weights the image of the joint fit (as before); with an automatic one the joint fit uses
+        ``lambda_joint_img`` (default 1e-2) and the returned image is recomputed by CG-SENSE with the
+        joint maps and the automatic weight (the joint image stays in ``info['image_joint']``).
     mask_maps : False (default; maps cover the whole FOV) | True (zero the maps, and the images, outside
         the estimated object support ``info['support']``, as ESPIRiT's cropped maps; CG-SENSE is then
         support-constrained) | a bool array of the spatial shape (your own support; also used for the
@@ -184,8 +191,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
             raise ValueError("solve_image with dynamic data needs rank=0 (one static map set)")
         cfg.joint_full = True
         return_image = True
-        if "lambda_joint_img" not in cfg_overrides:      # one image-regularisation knob for both image paths
-            cfg.lambda_joint_img = sense_lambda
+        if "lambda_joint_img" not in cfg_overrides and not isinstance(sense_lambda, str):
+            cfg.lambda_joint_img = sense_lambda              # one image-regularisation knob for both image paths
     under_info = {}
     if undersample is not None:
         ksp, mask, under_info = _apply_undersampling(ksp, mask, undersample, layout, cfg.calib)
@@ -261,11 +268,17 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     C = C.astype(np.complex64)
     if not return_image:
         return C, info
-    if x_solved is not None:
+    if x_solved is not None and not isinstance(sense_lambda, str):
         info["image_solved_jointly"] = True
         return C, x_solved, info
+    if x_solved is not None:
+        info["image_joint"] = x_solved
+        info["image_solved_jointly"] = False                   # maps jointly; image recomputed below
+    lam_rep = {}
     with accel.phase("sense_image", device):
-        img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda, iters=sense_iters, device=device)
+        img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda, iters=sense_iters, device=device,
+                          lam_scale=sense_lambda_scale, report=lam_rep)
+    info["sense_lambda"] = lam_rep
     info["timings"] = dict(accel.TIMES)
     info["seconds"] = time.time() - t0
     return C, img, info
@@ -796,7 +809,7 @@ def _sense_torch(ksp, C, m, box, lam, iters, device):
 
 
 def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=60, coil_axis=0, extrapolate=False,
-                device="cpu"):
+                device="cpu", lam_scale=1.0, report=None):
     """Full-resolution image from k-space and maps: argmin ||M F (C x) - y||^2 + lam' ||x||^2 with
     noise pre-whitening (if ``noise`` is given) applied to data and maps alike (``lam`` relative to the
     mean of sum_j |C_j|^2). Dynamic: frame by frame.
@@ -806,7 +819,9 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
     readout are left empty, as in a zero-filled reconstruction. Recovering those from coil
     sensitivities alone is ill-conditioned and only amplifies noise into high spatial frequencies.
     If everything inside the extent is acquired, this is the closed-form SENSE-1 combination of the
-    zero-filled data. ``extrapolate=True`` restores CG over the whole k-space grid."""
+    zero-filled data. ``extrapolate=True`` restores CG over the whole k-space grid.
+    ``lam`` may be 'auto' / 'auto-gcv' / 'auto-map' / 'auto-discrepancy' (bspinn.senselam, times
+    ``lam_scale``); the chosen value and the rules' diagnostics go into the dict ``report``."""
     ksp = np.moveaxis(np.asarray(ksp), coil_axis, 0).astype(np.complex64)
     C = np.moveaxis(np.asarray(maps), coil_axis, 0).astype(np.complex64)
     if noise is not None:
@@ -816,14 +831,29 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         C = np.einsum("ij,j...->i...", L, C)
     if layout == "dynamic":
         ms = [None if mask is None else mask[..., t] for t in range(ksp.shape[-1])]
-        return np.stack([sense_image(ksp[..., t], C[..., t], "2d", ms[t], None, lam, iters, extrapolate=extrapolate,
-                                     device=device) for t in range(ksp.shape[-1])], -1)
+        reps = [{} for _ in range(ksp.shape[-1])]
+        out = np.stack([sense_image(ksp[..., t], C[..., t], "2d", ms[t], None, lam, iters, extrapolate=extrapolate,
+                                    device=device, lam_scale=lam_scale, report=reps[t]) for t in range(ksp.shape[-1])], -1)
+        if report is not None:
+            report["frames"] = reps
+        return out
     m = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
     ax = tuple(range(1, ksp.ndim))
     den = (np.abs(C) ** 2).sum(0)
     box = np.ones(m.shape, bool) if extrapolate else acquired_extent(m)
     if (m | ~box).all():
         return ((C.conj() * _cfft(ksp * m[None], ax, True)).sum(0) / np.maximum(den, 1e-12)).astype(np.complex64)
+    if isinstance(lam, str):
+        from .senselam import choose_sense_lambda
+        method = {"auto": "cv"}.get(lam, lam.replace("auto-", ""))
+        lam, rep = choose_sense_lambda(ksp * m[None], C, m, noise_var=1.0 if noise is not None else None,
+                                       method=method, scale=lam_scale, device=device, iters=iters)
+        if report is not None:
+            report.update(rep, value=lam)
+        if lam is None:
+            lam = 0.0
+    elif report is not None:
+        report.update(method="manual", value=float(lam))
     lam = lam * float(den.mean())
     if str(device) != "cpu":
         return _sense_torch(ksp, C, m, box, lam, iters, device)

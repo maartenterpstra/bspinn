@@ -140,6 +140,9 @@ def main(argv=None):
                     help="zero the maps (and images) outside the object support: estimated, or your own bool .npy")
     pm.add_argument("--support-threshold", type=float, default=0.1, help="estimated support: fraction of the 99th pct")
     pm.add_argument("--support-dilate", type=int, default=2, help="estimated support: dilation in pixels")
+    pm.add_argument("--sense-lambda", default="auto",
+                    help="image Tikhonov weight: a number, or auto (= auto-cv) | auto-map | auto-gcv | auto-discrepancy")
+    pm.add_argument("--sense-lambda-scale", type=float, default=1.0, help="multiplies an automatic --sense-lambda")
     pm.add_argument("--image", "--combined", dest="image", default=None,
                     help="also write the full-resolution image (SENSE with the estimated maps; CG if undersampled) "
                          "here, and the joint-fit (calibration-resolution) image next to it as *_joint.npy")
@@ -289,7 +292,9 @@ def _run_maps(a):
                                model=a.model, rank=a.rank, quality=a.quality, normalise=a.normalise,
                                phase_ref=a.phase_ref, device=a.device, threads=a.threads,
                                mask_maps=np.load(a.mask_maps) if isinstance(a.mask_maps, str) else a.mask_maps,
-                               support_threshold=a.support_threshold, support_dilate=a.support_dilate, **over)
+                               support_threshold=a.support_threshold, support_dilate=a.support_dilate,
+                               sense_lambda=(a.sense_lambda if str(a.sense_lambda).startswith("auto") else float(a.sense_lambda)),
+                               sense_lambda_scale=a.sense_lambda_scale, **over)
     maps, info = (res[0], res[2]) if (a.image or a.solve_image) else res
     if a.solve_image and not a.image:
         a.image = a.out.replace(".npy", "") + "_image.npy"

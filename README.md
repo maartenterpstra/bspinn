@@ -1100,6 +1100,25 @@ slices) but together with the coupling it weakens the fold-over correction on th
 fold-over. The B0 orientation remains the largest single risk: on axial knee A, coronal / coronal_t /
 axial give 1.30 / 1.12 / 1.14; give `plane=` when you know it.
 
+### 8.4 Automatic SENSE regularisation (`sense_lambda="auto"`, v36)
+
+The Tikhonov weight of the returned image is now chosen from the data by default (`bspinn/senselam.py`);
+a number still sets it by hand, `sense_lambda_scale` multiplies an automatic value, and the choice and
+every rule's diagnostics are in `info['sense_lambda']`. Rules: `'auto'` = `'auto-cv'`: k-space
+cross-validation. Withhold 10 % of the acquired phase-encode lines outside the calibration box (2 folds),
+reconstruct from the rest on a log grid (1e-5..1, 16 values, batched CG on the device), predict the withheld
+lines, up to one global scale per lambda, and keep the best. Withholding whole lines makes the
+reconstruction unfold them, so the criterion sees noise amplification and residual aliasing / map errors
+alike. `'auto-map'` (Wiener sigma^2 / s^2, closed form), `'auto-gcv'` and `'auto-discrepancy'` are
+available but only see the fit to the samples used: on knee 19870 (R=4 vd, NLINV maps) they pick 1e-3,
+5e-3 and 1e-5 (NRMSE 1.27x, 1.07x, 1.38x the best), cross-validation 2.2e-2 (0.99x the best value of a
+5-point grid; fixed 1e-2: 1.00x). With `solve_image=True` and an automatic weight the joint stage keeps
+`lambda_joint_img` (1e-2) for the maps and the returned image is recomputed with the chosen weight.
+
+Calibrate on your own data (GPU) with `scripts/sense_lambda_eval.py` (`--loader ... --n 20`): per slice
+it fits the maps once, scans the grid against the fully sampled image combined with the same maps, and
+reports each rule against the oracle plus the `sense_lambda_scale` that would centre it.
+
 ## 9. Code map
 
 | file | content |

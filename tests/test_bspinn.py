@@ -663,7 +663,7 @@ def test_solve_image_joint_full_resolution():
     d, _, _ = make_synthetic(4, (32, 40), noise=0.005)
     k = d.kspace[0].copy(); k[:, :, :3] = 0; k[:, :, -3:] = 0          # zero-padded PE edges
     few = dict(plane="axial", calib=12, iters_auto=5, iters_wires=20, iters_pinn=20, iters_joint=10, verbose=False)
-    C, x, info = estimate_maps(k, "2d", solve_image=True, undersample=dict(R=2, pattern="uniform"), **few)
+    C, x, info = estimate_maps(k, "2d", solve_image=True, sense_lambda=1e-2, undersample=dict(R=2, pattern="uniform"), **few)
     assert info["image_solved_jointly"] and x.shape == (32, 40) and np.isfinite(x).all()
     m = info["mask"]; ku = k * m[None]
     r = np.linalg.norm((_cfft(C * x[None], (1, 2)) - ku)[:, m]) / np.linalg.norm(ku[:, m])
@@ -673,7 +673,7 @@ def test_solve_image_joint_full_resolution():
     # extrapolating CG-SENSE put 20-25 % there on real data)
     assert K[:, :3].sum() + K[:, -3:].sum() < 0.02 * K.sum()
     with pytest.raises(ValueError):
-        estimate_maps(np.stack([k] * 2, -1), "dynamic", solve_image=True, rank=1, **few)
+        estimate_maps(np.stack([k] * 2, -1), "dynamic", solve_image=True, sense_lambda=1e-2, rank=1, **few)
     # band-limited map interpolation keeps point values on the coarse grid
     import torch
     g = torch.randn(1, 2, 8, 10, dtype=torch.complex64)
@@ -846,7 +846,7 @@ def test_fold_over_detected_and_corrected():
     err = {}
     for fold in ("auto", False):
         C, img, info = estimate_maps(k * m[None], "2d", calib=16, mask=m, verbose=False, return_image=True,
-                                     fold=fold, iters_auto=40, iters_wires=150, iters_pinn=150)
+                                     fold=fold, sense_lambda=1e-2, iters_auto=40, iters_wires=150, iters_pinn=150)
         a = np.abs(img); s = (a * ref).sum() / (a ** 2).sum()
         err[fold] = np.linalg.norm(s * a - ref) / np.linalg.norm(ref)
         if fold == "auto":
@@ -1084,3 +1084,32 @@ def test_lbfgs_optimizer_option():
     import pytest
     with pytest.raises(ValueError):
         FitConfig(optimizer="sgd").validate()
+
+
+def test_auto_sense_lambda_grows_with_noise():
+    """The automatic SENSE weight (every rule) is larger for noisier data, and sense_image / estimate_maps
+    accept 'auto' while a number still works as before."""
+    from bspinn.api import sense_image
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    from bspinn.senselam import choose_sense_lambda
+    d, C, obj = make_synthetic(6, (64, 64), noise=0.0, seed=1)
+    k0 = d.kspace[0]
+    m = cartesian_mask((64, 64), R=3, acs=16, pattern="vd", seed=1)
+    Cn = C[0] / np.sqrt((np.abs(C[0]) ** 2).sum(0, keepdims=True))
+    rng = np.random.default_rng(0)
+    lam = {}
+    for s in (0.002, 0.05):
+        k = (k0 + s * (rng.normal(size=k0.shape) + 1j * rng.normal(size=k0.shape)) / np.sqrt(2)) * m[None]
+        _, info = choose_sense_lambda(k, Cn, m, method="gcv", iters=25, probes=2)
+        lam[s] = info
+        rep = {}
+        x = sense_image(k, Cn, "2d", mask=m, lam="auto-map", iters=25, report=rep)
+        assert np.isfinite(x).all() and rep["method"] == "map" and rep["value"] > 0
+    assert lam[0.05]["lam_map"] > 2 * lam[0.002]["lam_map"]      # (sharp phantom edges leak into the noise estimate)
+    assert lam[0.05]["lam_gcv"] > lam[0.002]["lam_gcv"]
+    lcv, icv = choose_sense_lambda(k, Cn, m, method="cv", calib=16, iters=25)     # default rule of 'auto'
+    assert 1e-5 <= lcv <= 1.0 and len(icv["cv_error"]) == 16 and lcv == icv["lam_cv"]
+    rep = {}
+    sense_image(k, Cn, "2d", mask=m, lam=3e-2, iters=10, report=rep)
+    assert rep == {"method": "manual", "value": 3e-2}
