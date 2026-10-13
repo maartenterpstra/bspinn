@@ -31,7 +31,7 @@ PRESETS = {      # iterations: (handedness/orientation probe, wire stage, PINN s
 def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, plane="auto", axes="auto",
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
-                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda="auto", sense_lambda_scale=1.0, sense_iters=60, mask_maps=False, support_threshold=0.1,
+                  threads=0, seed=0, verbose=True, return_image=False, sense_lambda="auto", sense_lambda_scale=1.0, sense_lambda_options=None, sense_iters=60, mask_maps=False, support_threshold=0.1,
                   support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout", **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
@@ -78,7 +78,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         (Wiener: noise variance / mean signal power, closed form), 'auto-gcv', 'auto-discrepancy'
         (data-space criteria; less reliable); see
         bspinn/senselam.py. ``sense_lambda_scale`` multiplies the automatic value. The chosen value and
-        every rule's value are in ``info['sense_lambda']``. ``sense_iters`` caps the CG iterations (fewer =
+        every rule's value are in ``info['sense_lambda']``. ``sense_lambda_options``: dict passed to
+        senselam.choose_sense_lambda (e.g. folds=4 for a lower-variance cross-validation, ceiling=10 to cap
+        the weight at 10x the Wiener value). ``sense_iters`` caps the CG iterations (fewer =
         stronger implicit regularisation, as in NLINV). With ``solve_image``: a numeric ``sense_lambda``
         also weights the image of the joint fit (as before); with an automatic one the joint fit uses
         ``lambda_joint_img`` (default 1e-2) and the returned image is recomputed by CG-SENSE with the
@@ -278,7 +280,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     lam_rep = {}
     with accel.phase("sense_image", device):
         img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda, iters=sense_iters, device=device,
-                          lam_scale=sense_lambda_scale, report=lam_rep)
+                          lam_scale=sense_lambda_scale, report=lam_rep, lam_options=sense_lambda_options)
     info["sense_lambda"] = lam_rep
     info["timings"] = dict(accel.TIMES)
     info["seconds"] = time.time() - t0
@@ -810,7 +812,7 @@ def _sense_torch(ksp, C, m, box, lam, iters, device):
 
 
 def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=60, coil_axis=0, extrapolate=False,
-                device="cpu", lam_scale=1.0, report=None):
+                device="cpu", lam_scale=1.0, report=None, lam_options=None):
     """Full-resolution image from k-space and maps: argmin ||M F (C x) - y||^2 + lam' ||x||^2 with
     noise pre-whitening (if ``noise`` is given) applied to data and maps alike (``lam`` relative to the
     mean of sum_j |C_j|^2). Dynamic: frame by frame.
@@ -834,7 +836,8 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         ms = [None if mask is None else mask[..., t] for t in range(ksp.shape[-1])]
         reps = [{} for _ in range(ksp.shape[-1])]
         out = np.stack([sense_image(ksp[..., t], C[..., t], "2d", ms[t], None, lam, iters, extrapolate=extrapolate,
-                                    device=device, lam_scale=lam_scale, report=reps[t]) for t in range(ksp.shape[-1])], -1)
+                                    device=device, lam_scale=lam_scale, report=reps[t], lam_options=lam_options)
+                        for t in range(ksp.shape[-1])], -1)
         if report is not None:
             report["frames"] = reps
         return out
@@ -848,7 +851,7 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         from .senselam import choose_sense_lambda
         method = {"auto": "cv+map"}.get(lam, lam.replace("auto-", ""))
         lam, rep = choose_sense_lambda(ksp * m[None], C, m, noise_var=1.0 if noise is not None else None,
-                                       method=method, scale=lam_scale, device=device, iters=iters)
+                                       method=method, scale=lam_scale, device=device, iters=iters, **(lam_options or {}))
         if report is not None:
             report.update(rep, value=lam)
         if lam is None:

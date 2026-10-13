@@ -1134,6 +1134,14 @@ NRMSE against the fully sampled image combined with the same maps, relative to t
 The floor was chosen on these same 20 slices (no tuned constant: max of two untuned rules); the median
 log10(lambda_cv / lambda_oracle) is 0.00, so no scale is needed.
 
+Held-out check, 20 different slices (`--pick-seed 698465`, maps by the joint fit): auto median 1.007,
+mean 1.029, 90th pct 1.047, worst 1.313, 90 % within 5 % (fixed 1e-2: 1.031 / 1.225 / 1.707 / 2.008 / 55 %;
+fixed 3e-2: 1.031 / 1.104 / 1.271 / 1.420 / 55 %; gcv: worst 1.554; map: worst 1.668). The floor never
+acted on this set; the one miss is the opposite failure (cv chose 0.46, the oracle 1.8e-2). Options for a
+third check (`sense_lambda_options`): `folds=4` (lower-variance cross-validation) and `ceiling=10` (at most
+10x the Wiener value; would have given worst 1.058 here and 1.077 on the first set, but was picked on this
+set). `sense_lambda_eval.py` now reports both and stores the cross-validation curves.
+
 ## 9. Code map
 
 | file | content |

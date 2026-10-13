@@ -180,7 +180,7 @@ def lambda_cv(ksp, C, m, grid, device="cpu", iters=60, holdout=0.1, folds=2, cal
 
 
 def choose_sense_lambda(ksp, C, mask=None, noise_var=None, method="cv", scale=1.0, device="cpu", grid=None,
-                        iters=60, probes=2, seed=0, calib=24, holdout=0.1, folds=2):
+                        iters=60, probes=2, seed=0, calib=24, holdout=0.1, folds=2, ceiling=None):
     """Automatic relative Tikhonov weight for api.sense_image (see module docstring). ``ksp`` (N, ...)
     acquired k-space (zeros elsewhere), ``C`` (N, ...) maps, ``mask`` acquired samples (default: non-zero),
     ``noise_var`` per-sample noise variance if known (1 after whitening). Returns (lam, info); lam is None
@@ -204,7 +204,10 @@ def choose_sense_lambda(ksp, C, mask=None, noise_var=None, method="cv", scale=1.
         if method == "cv":
             return lam_cv * scale, info
         info["floor"] = "map" if lam_map > lam_cv else "cv"
-        return max(lam_cv, lam_map) * scale, info
+        lam = max(lam_cv, lam_map)
+        if ceiling is not None and lam > ceiling * lam_map:              # optional: at most ceiling x Wiener
+            lam, info["ceiling_applied"] = ceiling * lam_map, True
+        return lam * scale, info
     y, A, Ah, cg, dev = _solver(ksp, C, m, device)
     den = float((np.abs(C) ** 2).sum(0).mean())
     lt = torch.tensor(grid * den, dtype=torch.float32, device=dev)

@@ -143,7 +143,12 @@ def main():
                "oracle": {"lam": float(grid[io]), **mg[io]}, "rules": {}}
         lam_auto, info = choose_sense_lambda(ku, Cn, m, method="gcv", device=a.device, iters=a.sense_iters, probes=a.probes)
         lam_cv, info_cv = choose_sense_lambda(ku, Cn, m, method="cv", device=a.device, iters=a.sense_iters, calib=a.acs)
-        cand = {"auto": max(lam_cv, info["lam_map"]), "cv": lam_cv, "map": info.get("lam_map"), "gcv": info.get("lam_gcv"), "discrepancy": info.get("lam_discrepancy"),
+        lam_cv4, info_cv4 = choose_sense_lambda(ku, Cn, m, method="cv", device=a.device, iters=a.sense_iters, calib=a.acs,
+                                                folds=4, seed=1)                      # lower-variance variant
+        lmap = info["lam_map"]
+        cand = {"auto": max(lam_cv, lmap), "cv": lam_cv, "cv4": lam_cv4,
+                "auto_cv4": max(lam_cv4, lmap), "auto_ceil10": min(max(lam_cv, lmap), 10 * lmap),
+                "auto_cv4_ceil10": min(max(lam_cv4, lmap), 10 * lmap), "map": info.get("lam_map"), "gcv": info.get("lam_gcv"), "discrepancy": info.get("lam_discrepancy"),
                 "fixed_1e-2": 1e-2, "fixed_3e-2": 3e-2}
         cand = {kk: v for kk, v in cand.items() if v is not None}
         Xc = grid_solutions(ku, Cn, m, list(cand.values()), device=a.device, iters=a.sense_iters)
@@ -154,6 +159,8 @@ def main():
         rec["vs_rss_oracle"] = metrics(X[io], rss, obj)
         rec["sigma2"] = info.get("sigma2"); rec["signal_power"] = info.get("signal_power")
         rec["seconds_lambda"] = time.time() - t1
+        rec["cv_error"] = info_cv.get("cv_error"); rec["cv4_error"] = info_cv4.get("cv_error")
+        rec["cv_grid"] = info_cv.get("grid")
         with open(a.out, "a") as f:
             f.write(json.dumps(rec) + "\n")
         print(f"{name}: oracle lam {rec['oracle']['lam']:.2e} (NRMSE {rec['oracle']['nrmse']:.4f}) | " +
@@ -166,7 +173,7 @@ def main():
     for kk in rows[0]["rules"]:
         r = np.array([x["rules"][kk]["nrmse_over_oracle"] for x in rows if kk in x["rules"]])
         l = np.array([x["rules"][kk]["log10_lam_over_oracle"] for x in rows if kk in x["rules"]])
-        sug = f"{10 ** -np.median(l):.3g}" if kk in ("auto", "cv", "map", "gcv", "discrepancy") else "-"
+        sug = f"{10 ** -np.median(l):.3g}" if not kk.startswith("fixed") else "-"
         print(f"  {kk:12s} {np.median(r):.3f}  {np.percentile(r, 90):.3f}  {np.mean(r < 1.05):.2f}   {np.median(l):+.2f}   {sug}")
     lo = np.array([x["oracle"]["lam"] for x in rows])
     print(f"  oracle lam: median {np.median(lo):.2e}, range {lo.min():.1e} .. {lo.max():.1e}")
