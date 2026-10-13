@@ -12,7 +12,7 @@ For every slice (fully sampled (coils, x, y); a volume (slices, coils, x, y) giv
      the regularisation differs (also reported: vs root-sum-of-squares),
   4. CG-SENSE images for a log grid of lambda (relative, as estimate_maps' sense_lambda) -> NRMSE / SSIM /
      PSNR inside the object; the oracle lambda (lowest NRMSE vs the reference),
-  5. every automatic rule (cv = the default 'auto', map, gcv, discrepancy) and fixed 1e-2 / 3e-2: their
+  5. every automatic rule (auto = max(cv, map), the default; cv, map, gcv, discrepancy) and fixed 1e-2 / 3e-2: their
      lambda and image metrics.
 Summary: per rule the median NRMSE relative to the oracle, how often it is within 5 %, and the median
 log10(lambda_rule / lambda_oracle) -> the --sense-lambda-scale that would centre it (printed as
@@ -143,7 +143,7 @@ def main():
                "oracle": {"lam": float(grid[io]), **mg[io]}, "rules": {}}
         lam_auto, info = choose_sense_lambda(ku, Cn, m, method="gcv", device=a.device, iters=a.sense_iters, probes=a.probes)
         lam_cv, info_cv = choose_sense_lambda(ku, Cn, m, method="cv", device=a.device, iters=a.sense_iters, calib=a.acs)
-        cand = {"cv": lam_cv, "map": info.get("lam_map"), "gcv": info.get("lam_gcv"), "discrepancy": info.get("lam_discrepancy"),
+        cand = {"auto": max(lam_cv, info["lam_map"]), "cv": lam_cv, "map": info.get("lam_map"), "gcv": info.get("lam_gcv"), "discrepancy": info.get("lam_discrepancy"),
                 "fixed_1e-2": 1e-2, "fixed_3e-2": 3e-2}
         cand = {kk: v for kk, v in cand.items() if v is not None}
         Xc = grid_solutions(ku, Cn, m, list(cand.values()), device=a.device, iters=a.sense_iters)
@@ -166,7 +166,7 @@ def main():
     for kk in rows[0]["rules"]:
         r = np.array([x["rules"][kk]["nrmse_over_oracle"] for x in rows if kk in x["rules"]])
         l = np.array([x["rules"][kk]["log10_lam_over_oracle"] for x in rows if kk in x["rules"]])
-        sug = f"{10 ** -np.median(l):.3g}" if kk in ("cv", "map", "gcv", "discrepancy") else "-"
+        sug = f"{10 ** -np.median(l):.3g}" if kk in ("auto", "cv", "map", "gcv", "discrepancy") else "-"
         print(f"  {kk:12s} {np.median(r):.3f}  {np.percentile(r, 90):.3f}  {np.mean(r < 1.05):.2f}   {np.median(l):+.2f}   {sug}")
     lo = np.array([x["oracle"]["lam"] for x in rows])
     print(f"  oracle lam: median {np.median(lo):.2e}, range {lo.min():.1e} .. {lo.max():.1e}")

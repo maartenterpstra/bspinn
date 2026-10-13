@@ -1110,6 +1110,8 @@ def test_auto_sense_lambda_grows_with_noise():
     assert lam[0.05]["lam_gcv"] > lam[0.002]["lam_gcv"]
     lcv, icv = choose_sense_lambda(k, Cn, m, method="cv", calib=16, iters=25)     # default rule of 'auto'
     assert 1e-5 <= lcv <= 1.0 and len(icv["cv_error"]) == 16 and lcv == icv["lam_cv"]
+    la, ia = choose_sense_lambda(k, Cn, m, method="cv+map", calib=16, iters=25)    # = 'auto'
+    assert la == max(ia["lam_cv"], ia["lam_map"])
     rep = {}
     sense_image(k, Cn, "2d", mask=m, lam=3e-2, iters=10, report=rep)
     assert rep == {"method": "manual", "value": 3e-2}

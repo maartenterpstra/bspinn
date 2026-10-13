@@ -1100,24 +1100,39 @@ slices) but together with the coupling it weakens the fold-over correction on th
 fold-over. The B0 orientation remains the largest single risk: on axial knee A, coronal / coronal_t /
 axial give 1.30 / 1.12 / 1.14; give `plane=` when you know it.
 
-### 8.4 Automatic SENSE regularisation (`sense_lambda="auto"`, v36)
+### 8.4 Automatic SENSE regularisation (`sense_lambda="auto"`, v36-v37)
 
-The Tikhonov weight of the returned image is now chosen from the data by default (`bspinn/senselam.py`);
-a number still sets it by hand, `sense_lambda_scale` multiplies an automatic value, and the choice and
-every rule's diagnostics are in `info['sense_lambda']`. Rules: `'auto'` = `'auto-cv'`: k-space
-cross-validation. Withhold 10 % of the acquired phase-encode lines outside the calibration box (2 folds),
-reconstruct from the rest on a log grid (1e-5..1, 16 values, batched CG on the device), predict the withheld
-lines, up to one global scale per lambda, and keep the best. Withholding whole lines makes the
-reconstruction unfold them, so the criterion sees noise amplification and residual aliasing / map errors
-alike. `'auto-map'` (Wiener sigma^2 / s^2, closed form), `'auto-gcv'` and `'auto-discrepancy'` are
-available but only see the fit to the samples used: on knee 19870 (R=4 vd, NLINV maps) they pick 1e-3,
-5e-3 and 1e-5 (NRMSE 1.27x, 1.07x, 1.38x the best), cross-validation 2.2e-2 (0.99x the best value of a
-5-point grid; fixed 1e-2: 1.00x). With `solve_image=True` and an automatic weight the joint stage keeps
-`lambda_joint_img` (1e-2) for the maps and the returned image is recomputed with the chosen weight.
+The Tikhonov weight of the returned image is chosen from the data by default (`bspinn/senselam.py`); a
+number still sets it by hand, `sense_lambda_scale` multiplies an automatic value, and the choice and every
+rule's diagnostics are in `info['sense_lambda']`.
 
-Calibrate on your own data (GPU) with `scripts/sense_lambda_eval.py` (`--loader ... --n 20`): per slice
-it fits the maps once, scans the grid against the fully sampled image combined with the same maps, and
-reports each rule against the oracle plus the `sense_lambda_scale` that would centre it.
+`'auto'` = `'auto-cv+map'`: k-space cross-validation, floored by a noise-based value. Withhold 10 % of the
+acquired phase-encode lines outside the calibration box (2 folds), reconstruct from the rest on a log grid
+(1e-5..1, 16 values, batched CG on the device), predict the withheld lines (up to one global scale per
+lambda) and keep the best; then take max(that, sigma^2 / s^2), the Gaussian-MAP (Wiener) weight from the
+noise variance (outer k-space) and the mean signal power. Withholding whole lines makes the reconstruction
+unfold them, so the criterion sees noise amplification and residual aliasing / map errors alike; the
+floor catches the rare collapses of cross-validation to tiny weights. Also available: `'auto-cv'`,
+`'auto-map'`, `'auto-gcv'`, `'auto-discrepancy'`. With `solve_image=True` and an automatic weight the joint
+stage keeps `lambda_joint_img` (1e-2) for the maps; the returned image is recomputed with the chosen weight.
+
+`scripts/sense_lambda_eval.py` on 20 slices of your dataset (fastMRI knee and brain, Calgary-Campinas;
+4-22 coils; R=4 variable density, ACS 24; maps by `estimate_maps`, GPU; ~5 s per slice for the choice).
+NRMSE against the fully sampled image combined with the same maps, relative to the best weight of a
+21-point grid (the oracle weight itself ranged 3e-3 .. 1):
+
+| rule | median | mean | 90th pct | worst | within 5 % |
+|---|---|---|---|---|---|
+| **auto (cv + map floor)** | **1.007** | **1.014** | **1.042** | **1.062** | **95 %** |
+| cv | 1.011 | 1.046 | 1.072 | 1.469 | 85 % |
+| gcv | 1.026 | 1.119 | 1.377 | 1.470 | 55 % |
+| discrepancy | 1.038 | 1.226 | 2.012 | 2.775 | 60 % |
+| map | 1.089 | 1.226 | 1.515 | 1.882 | 25 % |
+| fixed 1e-2 (old default) | 1.029 | 1.140 | 1.469 | 1.562 | 60 % |
+| fixed 3e-2 | 1.067 | 1.070 | 1.146 | 1.169 | 45 % |
+
+The floor was chosen on these same 20 slices (no tuned constant: max of two untuned rules); the median
+log10(lambda_cv / lambda_oracle) is 0.00, so no scale is needed.
 
 ## 9. Code map
 

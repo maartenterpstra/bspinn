@@ -141,7 +141,7 @@ def main(argv=None):
     pm.add_argument("--support-threshold", type=float, default=0.1, help="estimated support: fraction of the 99th pct")
     pm.add_argument("--support-dilate", type=int, default=2, help="estimated support: dilation in pixels")
     pm.add_argument("--sense-lambda", default="auto",
-                    help="image Tikhonov weight: a number, or auto (= auto-cv) | auto-map | auto-gcv | auto-discrepancy")
+                    help="image Tikhonov weight: a number, or auto (= auto-cv+map) | auto-cv | auto-map | auto-gcv | auto-discrepancy")
     pm.add_argument("--sense-lambda-scale", type=float, default=1.0, help="multiplies an automatic --sense-lambda")
     pm.add_argument("--image", "--combined", dest="image", default=None,
                     help="also write the full-resolution image (SENSE with the estimated maps; CG if undersampled) "

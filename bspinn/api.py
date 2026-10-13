@@ -73,9 +73,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         extrapolated; per frame for dynamic data). Returns (maps, image, info). ``sense_lambda`` is the
         main noise / aliasing trade-off: a number (relative to the mean of sum |C|^2; 1e-2: close to least
         squares, the most residual noise; 3e-2 to 1e-1: smoother, NLINV-like), or chosen from the data:
-        'auto' (= 'auto-cv', default: k-space cross-validation on withheld acquired samples, which tracks
-        the image error; no noise level needed), 'auto-map' (Wiener: noise variance / mean signal power,
-        closed form), 'auto-gcv', 'auto-discrepancy' (data-space criteria; less reliable here); see
+        'auto' (default: k-space cross-validation on withheld acquired phase-encode lines, which tracks the
+        image error, floored by the noise-based Wiener value; = 'auto-cv+map'), 'auto-cv', 'auto-map'
+        (Wiener: noise variance / mean signal power, closed form), 'auto-gcv', 'auto-discrepancy'
+        (data-space criteria; less reliable); see
         bspinn/senselam.py. ``sense_lambda_scale`` multiplies the automatic value. The chosen value and
         every rule's value are in ``info['sense_lambda']``. ``sense_iters`` caps the CG iterations (fewer =
         stronger implicit regularisation, as in NLINV). With ``solve_image``: a numeric ``sense_lambda``
@@ -845,7 +846,7 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         return ((C.conj() * _cfft(ksp * m[None], ax, True)).sum(0) / np.maximum(den, 1e-12)).astype(np.complex64)
     if isinstance(lam, str):
         from .senselam import choose_sense_lambda
-        method = {"auto": "cv"}.get(lam, lam.replace("auto-", ""))
+        method = {"auto": "cv+map"}.get(lam, lam.replace("auto-", ""))
         lam, rep = choose_sense_lambda(ksp * m[None], C, m, noise_var=1.0 if noise is not None else None,
                                        method=method, scale=lam_scale, device=device, iters=iters)
         if report is not None:
