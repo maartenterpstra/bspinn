@@ -139,6 +139,11 @@ class FitConfig:
     lr_image_pinn: float = 1e-2
     lambda_temporal: float = 0.0     # ||m_t - m_t-1||^2 on frame images (dynamic data)
     support_thresh: float = 0.08
+    optimizer: str = "adam"          # 'adam' (default) | 'lbfgs': every stage (wires, PINN, joint, dynamic,
+                                     #   probes) by full-batch L-BFGS with strong-Wolfe line search on a fixed
+                                     #   collocation set, iters_* then count L-BFGS iterations | 'adam+lbfgs':
+                                     #   Adam stages followed by the L-BFGS polish (iters_polish, default 200)
+    lbfgs_inner: int = 20            # L-BFGS iterations per outer step (logging granularity)
     iters_polish: int = 0            # >0: full-batch L-BFGS refinement of every parameter after the PINN stage
                                      #   (fixed collocation set of polish_colloc points); Adam alone stalls well
                                      #   above the noise floor on high-SNR calibration data
@@ -167,6 +172,8 @@ class FitConfig:
             err.append(f"--model must be pinn|wires|free, got {self.model}")
         if self.field_mode not in ("real", "complex"):
             err.append("--field-mode must be real|complex")
+        if self.optimizer not in ("adam", "lbfgs", "adam+lbfgs"):
+            err.append("optimizer must be adam|lbfgs|adam+lbfgs")
         if self.model_channels not in ("physical", "data"):
             err.append("--model-channels must be physical|data")
         if self.compress < 0:
@@ -895,6 +902,7 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             C = Cv.detach()
             Cg = model.sensitivity(pts, create_graph=True)
             rest = 0.0
+            state["d_in_rest"] = False
         elif single:                                                       # one graph: no recomputation
             C = rssn(to_full(prob.mixC(model.sensitivity(pts_full, create_graph=True), -2)), 1)
             d = (M * _fft2c_t(C * x[:, None]) - y).abs().pow(2).sum() / ynorm
@@ -908,6 +916,7 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             Cg = model.sensitivity(pts, create_graph=True)                 # calibration grid: norm term
             C = Cv.detach()
             rest = 0.0
+            state["d_in_rest"] = False
         else:
             d = (M * _fft2c_t(C * x[:, None]) - y).abs().pow(2).sum() / ynorm
             rest = d
@@ -929,7 +938,29 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             _log(hist, it, data=o[1].item())
             log(f"[joint full-res] it {it:5d}  data {o[1].item():.4e}")
 
-    if accel.graph_mode(cfg, dev, cfg.iters_joint):                        # the whole iteration, CG included
+    if getattr(cfg, "optimizer", "adam") == "lbfgs":
+        # maps by L-BFGS for the current image, then the image by warm-started CG; alternate
+        inner = max(1, min(int(cfg.lbfgs_inner), cfg.iters_joint))
+        opt = torch.optim.LBFGS(params, lr=1.0, max_iter=inner, history_size=50, tolerance_grad=1e-12,
+                                tolerance_change=1e-15, line_search_fn="strong_wolfe")
+
+        def closure():
+            opt.zero_grad(set_to_none=True)
+            rest, d = step()                                           # partial backward passes inside
+            if torch.is_tensor(rest) and rest.requires_grad:
+                rest.backward()
+            total = (rest.detach() if torch.is_tensor(rest) else torch.tensor(float(rest), device=dev))
+            if not state.get("d_in_rest", True):
+                total = total + d.detach()
+            state["o"] = (total, d)
+            return total
+        it = 0
+        while it < cfg.iters_joint:
+            opt.step(closure)
+            post()
+            it = min(cfg.iters_joint, it + inner)
+            after(it - 1, state["o"])
+    elif accel.graph_mode(cfg, dev, cfg.iters_joint):                      # the whole iteration, CG included
         opt, base = accel.capturable_adam(params, dev, default_lr=lr)
         accel.train_graphed(step, opt, base, 0.1 * lr, cfg.iters_joint, [gen], None, after,
                             log=log, post=post)
@@ -1038,6 +1069,8 @@ def _run_stage(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, af
     (cfg.compile; inside the graph: fused kernels replayed with one launch).
     Returns the outputs of the last iteration."""
     dev = prob.device
+    if getattr(cfg, "optimizer", "adam") == "lbfgs":
+        return _run_stage_lbfgs(prob, cfg, iters, groups, step_loss, draw, sls, after)
     if _graph_ok((prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, after)):
         return accel.train_graphed(*_graph_job(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, after))
     betas = (cfg.adam_beta1, cfg.adam_beta2)
@@ -1054,6 +1087,34 @@ def _run_stage(prob, cfg, iters, groups, eta_min, step_loss, draw, sls, gens, af
         out[0].backward(); opt.step()
         after(it, out)
     return out
+
+
+def _run_stage_lbfgs(prob, cfg, iters, groups, step_loss, draw, sls, after):
+    """The stage's objective minimised by full-batch L-BFGS (strong-Wolfe line search): the random inputs
+    (collocation points) are drawn once and kept fixed, all slices are used (sls[0], i.e. no slice
+    batching when there is one batch), and ``iters`` L-BFGS iterations are run in outer steps of
+    cfg.lbfgs_inner; after() is called once per outer step with the iteration count reached."""
+    params = [q for g in groups for q in (g["params"] if isinstance(g["params"], (list, tuple)) else list(g["params"]))]
+    params = [q for q in params if q.requires_grad]
+    fixed = draw()
+    sl = _sl_arg(prob, sls[0], False)
+    inner = max(1, min(int(cfg.lbfgs_inner), iters))
+    opt = torch.optim.LBFGS(params, lr=1.0, max_iter=inner, history_size=50, tolerance_grad=1e-12,
+                            tolerance_change=1e-15, line_search_fn="strong_wolfe")
+    state = {}
+
+    def closure():
+        opt.zero_grad(set_to_none=True)
+        out = step_loss(sl, *fixed)
+        out[0].backward()
+        state["out"] = out
+        return out[0]
+    it = 0
+    while it < iters:
+        opt.step(closure)
+        it = min(iters, it + inner)
+        after(it - 1, state["out"])
+    return state["out"]
 
 
 def _graph_ok(stage):
@@ -1164,7 +1225,9 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
                 pinn.mixer = ChannelMixer(pinn.n_coils).to(prob.device)
             model = _wrap(pinn, prob, cfg, prev=wires_model, free=cfg.free_sets)
             m, history["pinn"] = fit_pinn(prob, cfg, model, m, log=log)
-        if cfg.iters_polish > 0:
+        if cfg.iters_polish > 0 or cfg.optimizer == "adam+lbfgs":
+            if cfg.iters_polish <= 0:
+                cfg = copy.copy(cfg); cfg.iters_polish = 200
             with accel.phase("polish", cfg.device):
                 history["polish"] = polish(prob, cfg, model, m, log=log)
     image_full = None

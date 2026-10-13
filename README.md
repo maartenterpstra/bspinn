@@ -1047,6 +1047,11 @@ phase cannot represent.
 * `resid_order=3`: every map times exp(u_j), u_j a complex 2-D Fourier series of order 3 over the FOV with a
   Sobolev ridge `lambda_resid` (`models.SmoothFactor`); constant beyond the FOV.
 * optional `iters_polish=N`: full-batch L-BFGS of all parameters after the PINN stage.
+* `optimizer=` (`--optimizer` on the command line): `'adam'` (default); `'lbfgs'`: every stage (handedness /
+  orientation probes, wires, PINN, joint full-resolution, dynamic) is minimised by full-batch L-BFGS with a
+  strong-Wolfe line search on a fixed collocation set, and `iters_*` count L-BFGS iterations (in the joint
+  stage: L-BFGS on the maps for the current image, then CG on the image, alternating every `lbfgs_inner`
+  iterations); `'adam+lbfgs'`: the Adam stages, then the L-BFGS polish (`iters_polish`, default 200).
 
 Leave-coil-out prediction outside the ACS / noise floor (lower is better; 1 = true maps):
 

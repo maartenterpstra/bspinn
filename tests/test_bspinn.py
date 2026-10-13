@@ -1063,3 +1063,24 @@ def test_joint_stage_keeps_factor_and_coupling():
     err = float((1 - np.abs((Cn.conj() * Gn).sum(0)) ** 2)[obj[0] > 0].mean())
     res = np.linalg.norm(m[None] * F(Cm * img[None]) - k) / np.linalg.norm(k)
     assert err < 1e-3 and res < 0.1, (err, res)              # v32 joint: res 0.081 on the same data
+
+
+def test_lbfgs_optimizer_option():
+    """optimizer='lbfgs' (every stage, joint included) and 'adam+lbfgs' run and give accurate maps."""
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    d, C, obj = make_synthetic(6, (48, 48), noise=0.002, seed=5)
+    m = cartesian_mask((48, 48), R=3, acs=16, pattern="vd", seed=1)
+    k = d.kspace[0] * m[None]
+    Gn = C[0] / np.sqrt((np.abs(C[0]) ** 2).sum(0, keepdims=True))
+    for opt, extra in (("lbfgs", {}), ("adam+lbfgs", {"iters_polish": 40}), ("lbfgs", {"solve_image": True, "iters_joint": 10})):
+        out = estimate_maps(k, "2d", calib=16, mask=m, plane="axial", verbose=False, iters_auto=20, iters_wires=100,
+                            iters_pinn=100, fold=False, threads=1, optimizer=opt, **extra)
+        Cn = out[0] / np.sqrt((np.abs(out[0]) ** 2).sum(0, keepdims=True))
+        err = float((1 - np.abs((Cn.conj() * Gn).sum(0)) ** 2)[obj[0] > 0].mean())
+        assert np.isfinite(out[0]).all() and err < 2e-3, (opt, extra, err)
+    from bspinn.fit import FitConfig
+    import pytest
+    with pytest.raises(ValueError):
+        FitConfig(optimizer="sgd").validate()

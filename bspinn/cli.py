@@ -126,6 +126,8 @@ def main(argv=None):
     pm.add_argument("--no-cuda-graph", dest="cuda_graph", action="store_false",
                     help="GPU: run the training iterations eagerly instead of replaying a captured CUDA graph")
     pm.add_argument("--tf32", action="store_true", help="TF32 matmuls on Ampere+ GPUs")
+    pm.add_argument("--optimizer", default="adam", choices=["adam", "lbfgs", "adam+lbfgs"],
+                    help="adam (default) | lbfgs: full-batch L-BFGS in every stage | adam+lbfgs: Adam, then an L-BFGS polish")
     pm.add_argument("--threads", type=int, default=0)
     pm.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="any FitConfig field, e.g. iters_pinn=1000")
     pm.add_argument("--solve-image", action="store_true",
@@ -275,6 +277,7 @@ def _run_maps(a):
     over.setdefault("compile", a.compile)
     over.setdefault("tf32", a.tf32)
     over.setdefault("cuda_graph", a.cuda_graph)
+    over.setdefault("optimizer", a.optimizer)
     calib = None if a.calib is None else (a.calib[0] if len(a.calib) == 1 else tuple(a.calib))
     under = None
     if a.undersample_mask:
