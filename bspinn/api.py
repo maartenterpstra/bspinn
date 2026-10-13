@@ -130,7 +130,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         ``info['mask']``, ``info['R_effective']`` report what was used.
     cfg_overrides : any other FitConfig field (e.g. lambda_phys=0.1, field_mode='complex',
         optimizer='lbfgs' for full-batch L-BFGS in every stage, or 'adam+lbfgs' for Adam followed by an
-        L-BFGS polish of all parameters; iters_* then count L-BFGS iterations, each costing ~1-3 Adam
+        L-BFGS polish of all parameters (the 2-D PINN default; optimizer='adam' for Adam only); with
+        'lbfgs' iters_* count L-BFGS iterations, each costing ~1-3 Adam
         iterations). GPU:
         compile=True | 'reduce-overhead' (torch.compile of each stage's iteration, + CUDA graphs),
         tf32=True (README §8.2).
@@ -184,6 +185,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         # v33 defaults from scripts/method_lab.py (real knees/brain + synthetic): learnable complex channel
         # coupling and a smooth per-coil complex factor (Fourier order 3)
         cfg.learn_mixing, cfg.resid_order = True, 3
+        # v42: Adam followed by a full-batch L-BFGS polish (runs/eval_joint, 20 real slices, joint protocol R=4:
+        # lower leave-coil-out residual than Adam alone on 19/20, lower SENSE R4 error on 16/20, ~+4 s)
+        cfg.optimizer = "adam+lbfgs"
     for k, v in cfg_overrides.items():
         if not hasattr(cfg, k):
             raise TypeError(f"unknown option {k!r} (not a FitConfig field)")
@@ -565,7 +569,7 @@ def _calib(calib, default, n):
 
 
 def _last(hist):
-    for key in ("pinn", "wires"):
+    for key in ("polish", "pinn", "wires"):
         h = hist.get(key) if isinstance(hist, dict) else None
         if h:
             rec = h[-1]

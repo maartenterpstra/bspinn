@@ -1047,11 +1047,12 @@ phase cannot represent.
 * `resid_order=3`: every map times exp(u_j), u_j a complex 2-D Fourier series of order 3 over the FOV with a
   Sobolev ridge `lambda_resid` (`models.SmoothFactor`); constant beyond the FOV.
 * optional `iters_polish=N`: full-batch L-BFGS of all parameters after the PINN stage.
-* `optimizer=` (`--optimizer` on the command line): `'adam'` (default); `'lbfgs'`: every stage (handedness /
+* `optimizer=` (`--optimizer` on the command line): `'adam'`; `'lbfgs'`: every stage (handedness /
   orientation probes, wires, PINN, joint full-resolution, dynamic) is minimised by full-batch L-BFGS with a
   strong-Wolfe line search on a fixed collocation set, and `iters_*` count L-BFGS iterations (in the joint
   stage: L-BFGS on the maps for the current image, then CG on the image, alternating every `lbfgs_inner`
-  iterations); `'adam+lbfgs'`: the Adam stages, then the L-BFGS polish (`iters_polish`, default 200).
+  iterations); `'adam+lbfgs'`: the Adam stages, then the L-BFGS polish (`iters_polish`, default 200). Since v42 `'adam+lbfgs'` is the `estimate_maps` default for 2-D PINN fits (§8.6); the
+  `FitConfig` / CLI default stays `'adam'`.
 
 Leave-coil-out prediction outside the ACS / noise floor (lower is better; 1 = true maps):
 
@@ -1183,6 +1184,34 @@ python scripts/evaluate_methods.py --cases synth --loader dataloader_v2:get_data
     --pinn-variant joint_start solve_image=true joint_start=wires joint_image=gradient \
     --out runs/eval_joint
 ```
+
+Result (v40 code, 20 random dataloader slices + 4 synthetic phantoms, joint protocol R = 4; one noise-only
+slice is skipped since v41). Real slices, medians; excess = leave-coil-out outside the ACS / floor − 1; SENSE
+NRMSE with common support; wins = slices where the method beats `pinn_api` (leave-coil-out, SENSE R4):
+
+| method | LCO excess | worst-coil excess | ACS c→e / floor | SENSE R4 | SENSE R8 | wins vs pinn_api | s |
+|---|---|---|---|---|---|---|---|
+| pinn_api (maps only, Adam) | 0.0591 | 0.0911 | 2.44 | 0.0786 | 0.1739 | – | 11 |
+| pinn_joint (solve_image) | 0.0550 | 0.0900 | 2.33 | 0.0785 | 0.1730 | 20/20, 16/20 | 21 |
+| **pinn_best** (solve_image, adam+lbfgs) | 0.0543 | 0.0869 | 2.23 | 0.0785 | 0.1726 | 19/20, 16/20 | 25 |
+| pinn_best_lr (+ lr_pinn 4e-3) | 0.0534 | 0.0882 | 2.28 | 0.0785 | 0.1721 | 20/20, 15/20 | 27 |
+| pinn_joint_start (wires, gradient) | 0.0524 | 0.0800 | 2.10 | 0.0800 | 0.1722 | 19/20, 11/20 | 72 |
+| NLINV | 0.0520 | 0.0816 | 1.29 | 0.0784 | 0.1721 | 17/20, 10/20 | 25 |
+| ESPIRiT | 0.0652 | 0.1214 | 2.60 | 0.0890 | 0.1850 | 8/20, 5/20 | 22 |
+| Walsh | 0.0645 | 0.1302 | 8.09 | 0.0883 | 0.1850 | 7/20, 0/20 | 3 |
+| low-res | 0.0714 | 0.1361 | 6.30 | 0.0879 | 0.1847 | 8/20, 1/20 | 0 |
+
+* Every tuned variant improves on `pinn_api` on almost every slice, but by little in absolute terms
+  (−8 to −11 % of the excess over the noise floor; SENSE errors within 0.3 %). The PINNs, NLINV and nothing
+  else are at the noise floor + ~5 %; ESPIRiT, Walsh, low-res are 25–35 % further from it.
+* `pinn_best` (joint fit + L-BFGS polish) is the default since v42: consistent wins on held-out and SENSE
+  metrics at NLINV's runtime. The higher Adam learning rate adds nothing reliable (kept optional).
+* `joint_start='wires'` gives the lowest PINN residuals (worst coil at NLINV level) but the worst SENSE R4 of
+  the PINNs on 9 of 20 slices and 3× the runtime: kept optional until `scripts/joint_eval.py` measures the
+  joint image directly.
+* Remaining gap to NLINV: the combine → expand residual inside the ACS (2.2 vs 1.3 × floor), concentrated on
+  four high-SNR slices (9–18 × vs 3.8–6.3 ×). This does not show at R4/R8, but it is where the model is still
+  too restricted.
 
 ## 9. Code map
 
