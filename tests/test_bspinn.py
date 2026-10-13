@@ -1041,3 +1041,25 @@ def test_learned_mixing_recovers_coupled_channels():
         Cn = Cm / np.sqrt((np.abs(Cm) ** 2).sum(0, keepdims=True))
         err[mix] = float((1 - np.abs((Cn.conj() * Gn).sum(0)) ** 2)[obj[0] > 0].mean())
     assert err[True] < 0.5 * err[False], err
+
+
+def test_joint_stage_keeps_factor_and_coupling():
+    """solve_image=True refines the same model the API returns (smooth factor and channel coupling applied
+    in the joint stage too): the returned maps and image explain the acquired data, and the maps stay
+    accurate (v33 before the fix: the joint stage optimised maps without them, the API applied them)."""
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    ax = (1, 2)
+    F = lambda x: np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(x, axes=ax), axes=ax, norm="ortho"), axes=ax)
+    d, C, obj = make_synthetic(6, (48, 48), noise=0.002, seed=5)
+    m = cartesian_mask((48, 48), R=3, acs=16, pattern="vd", seed=1)
+    k = d.kspace[0] * m[None]
+    Gn = C[0] / np.sqrt((np.abs(C[0]) ** 2).sum(0, keepdims=True))
+    Cm, img, info = estimate_maps(k, "2d", calib=16, mask=m, plane="axial", verbose=False, iters_auto=30,
+                                  iters_wires=150, iters_pinn=200, iters_joint=60, solve_image=True, fold=False,
+                                  threads=1)
+    Cn = Cm / np.sqrt((np.abs(Cm) ** 2).sum(0, keepdims=True))
+    err = float((1 - np.abs((Cn.conj() * Gn).sum(0)) ** 2)[obj[0] > 0].mean())
+    res = np.linalg.norm(m[None] * F(Cm * img[None]) - k) / np.linalg.norm(k)
+    assert err < 1e-3 and res < 0.1, (err, res)              # v32 joint: res 0.081 on the same data

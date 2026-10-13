@@ -149,6 +149,8 @@ class FitConfig:
     learn_mixing: bool | str = False # learnable complex channel mixing C -> (I + E) C (coupling): True = PINN
                                      #   stage, 'all' = from the wire stage on
     lambda_mix: float = 1e-3         # ridge on E
+    joint_freeze_extra: bool = False # joint full-resolution stage: keep the smooth factor and the coupling
+                                     #   fixed (True: better on exact Biot–Savart phantoms, worse on real knees)
     seed: int = 0
     log_every: int = 100
     threads: int = 0
@@ -795,12 +797,20 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
 
     h_, w_ = prob.calib
 
+    res_f = model._modules.get("resid") if isinstance(model, torch.nn.Module) else None
+    mix_f = model._modules.get("mixer") if isinstance(model, torch.nn.Module) else None
+
     def sens_from_field(B):                                                # CoilModel.sensitivity on a field
+        """B on the full-resolution grid pts_full (every caller): the same smooth factor and channel
+        coupling as CoilModel.sensitivity, so the joint stage refines the model the API returns."""
         if B.shape[-1] == 1:
             Bx, By = B[..., 0, 0], B[..., 1, 0]
         else:
             Bx = torch.complex(B[..., 0, 0], B[..., 0, 1]); By = torch.complex(B[..., 1, 0], B[..., 1, 1])
-        return (Bx + 1j * model.handedness * By) * model.gain()[:, None]
+        C = (Bx + 1j * model.handedness * By) * model.gain()[:, None]
+        if res_f is not None:
+            C = C * res_f(pts_full)
+        return C if mix_f is None else mix_f(C)
 
     def wire_field(points):                                               # (N,P,3,K), closed form
         Bw = model.base.field(points)
@@ -852,7 +862,13 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         lam = cfg.lambda_joint_img * float((C0.abs() ** 2).sum(1).mean())
         x = _cg_image(C0, y, M, box, lam, torch.zeros(S, H, W, dtype=torch.complex64, device=dev), 30, check=True)
     ynorm = float((y.abs() ** 2).sum())
-    params = [q for q in model.parameters() if q.requires_grad]
+    frozen = set()
+    if cfg.joint_freeze_extra:              # smooth factor / coupling stay at their calibration values
+        for nm in ("resid", "mixer"):
+            mod = model._modules.get(nm) if isinstance(model, torch.nn.Module) else None
+            if mod is not None:
+                frozen |= {id(q) for q in mod.parameters()}
+    params = [q for q in model.parameters() if q.requires_grad and id(q) not in frozen]
     lr = cfg.lr_joint or cfg.lr_pinn
     hist = []
     state = {}

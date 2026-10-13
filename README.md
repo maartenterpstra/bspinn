@@ -1068,6 +1068,25 @@ Prospective fold-over knee, held-out k-space NRMSE: v32 1.042, v33 1.048, NLINV 
 The price of the extra freedom is a 2-3x larger error when the physics model is exact; it remains 3-4x
 below NLINV.
 
+**With joint optimisation** (`solve_image=True`; `method_lab.py --joint 4`): the fully sampled slices
+retrospectively undersampled (variable density, R=4, ACS 24), every method gets all acquired samples
+(NLINV too), maps scored against the fully sampled data. Leave-coil-out / floor; SENSE R4:
+
+| | k19870 | knee15 | axial knee A* | CC brain* |
+|---|---|---|---|---|
+| v32 joint | 1.200 / 0.082 | 1.031 / 0.175 | 1.331 / 0.032 | 1.043 / 0.098 |
+| **v33 joint** | **1.048 / 0.076** | **1.029 / 0.173** | **1.112 / 0.026** | **1.036 / 0.098** |
+| v33 calibration only | 1.061 / 0.078 | 1.029 / 0.174 | 1.247 / 0.028 | 1.037 / 0.098 |
+| NLINV (all samples) | 1.014 / 0.075 | 1.031 / 0.173 | 1.056 / 0.024 | 1.034 / 0.099 |
+| ESPIRiT | 1.590 / 0.136 | 1.123 / 0.278 | 1.084 / 0.024 | 1.035 / 0.099 |
+
+v33 as first released ignored the smooth factor and the coupling inside the joint stage while the API
+applied them to the returned maps (k19870 joint: 2.45 / 0.142); fixed in v34 (`fit_joint_full` applies both).
+`joint_freeze_extra=True` keeps them at their calibration values in the joint stage: better on an exact
+Biot–Savart phantom (subspace error 7.1e-5 vs 3.0e-4), worse on the real knees (k19870 1.056 vs 1.048,
+knee A 1.130 vs 1.112), so off by default. On exact Biot–Savart phantoms the joint stage itself raises the
+map error (v32: 7.6e-5 -> 1.1e-4), as before.
+
 **Not adopted:** `field_mode='complex'` (no gain on one slice), `shift_sets=1` (worse), coupling from the
 wire stage on (worse), `loops_per_coil=2` (+0.007, +20 % time), `calib_oversample=3`, lower norm/image
 penalties, `lambda_resid` 1e-2 (k19870 worse). `lr_pinn=4e-3` helps every real case (most on high-SNR

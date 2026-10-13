@@ -105,9 +105,26 @@ def parse_set(items):
     return out
 
 
+def undersampled(case, R, seed=1):
+    """Joint protocol: the fully sampled case retrospectively undersampled (variable density, R, ACS kept);
+    every estimator sees all of these samples (NLINV / ESPIRiT through calib_kspace with joint=True)."""
+    import dataclasses
+    from bspinn.masks import cartesian_mask
+    m = cartesian_mask(case.shape, R=R, acs=int(max(case.acs)), pattern="vd", seed=seed) & case.sampled
+    return dataclasses.replace(case, ksp=case.ksp * m[None], sampled=m, joint=True, meta=dict(case.meta))
+
+
 def fit(case, overrides, quality, device, threads):
     from bspinn.api import estimate_maps
     t = time.time()
+    if case.joint:                            # joint protocol: all acquired samples, maps + full image jointly
+        out = estimate_maps(case.ksp, "2d", mask=case.sampled, calib=int(max(case.acs)),
+                                spacing=tuple(case.pixel_spacing), plane=case.meta.get("api_plane", case.plane),
+                                device=device, seed=0, quality=quality, verbose=False, threads=threads,
+                                readout_axis=1 - case.pe_axis, fold=case.meta.get("fold", False),
+                                **{"solve_image": True, **overrides})
+        C, info = out[0], out[-1]                 # (maps, image, info) with solve_image
+        return np.asarray(C), time.time() - t, info
     C, info = estimate_maps(case.calib_kspace(), "2d", mask=case.acs_mask(), calib=int(max(case.acs)),
                             spacing=tuple(case.pixel_spacing), plane=case.meta.get("api_plane", case.plane),
                             device=device, seed=0, quality=quality, verbose=False, threads=threads,
@@ -163,6 +180,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "runs", "lab"))
     ap.add_argument("--maps", default=None, help="score a ready .npy (whitened channels) instead of fitting")
     ap.add_argument("--estimator", default=None, help="score a bspinn.methods estimator (nlinv, espirit, ...) instead")
+    ap.add_argument("--joint", type=float, default=0, help="joint protocol: retrospective vd undersampling at this R, "
+                    "solve_image=True for the PINN, all samples for NLINV/ESPIRiT; scored on the fully sampled data")
     ap.add_argument("--report", default=None)
     a = ap.parse_args()
     if a.report:
@@ -171,21 +190,22 @@ def main():
     os.makedirs(os.path.join(a.out, a.variant), exist_ok=True)
     for cn in a.cases:
         case = CASES[cn]()
+        fcase = undersampled(case, a.joint) if a.joint else case
         cache = os.path.join(a.out, a.variant, f"{cn}.npy")
         secs, plane = float("nan"), None
         if a.maps:
             C = np.load(a.maps)
         elif a.estimator and not os.path.exists(cache):
             from bspinn.methods import ESTIMATORS
-            t0 = time.time(); C = np.asarray(ESTIMATORS[a.estimator](case)); secs = time.time() - t0
+            t0 = time.time(); C = np.asarray(ESTIMATORS[a.estimator](fcase)); secs = time.time() - t0
             np.save(cache, C.astype(np.complex64))
         elif os.path.exists(cache):
             C = np.load(cache)
         else:
-            C, secs, info = fit(case, over, a.quality, a.device, a.threads)
+            C, secs, info = fit(fcase, over, a.quality, a.device, a.threads)
             plane = info.get("plane")
             np.save(cache, C.astype(np.complex64))
-        r = {"variant": a.variant, "case": cn, "set": over, "quality": a.quality, "secs": secs, "plane": plane, **score(C, case)}
+        r = {"variant": a.variant, "case": cn, "set": over, "quality": a.quality, "secs": secs, "plane": plane, "joint_R": a.joint, **score(C, case)}
         with open(os.path.join(a.out, "results.jsonl"), "a") as f:
             f.write(json.dumps(r) + "\n")
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()}), flush=True)
