@@ -1164,6 +1164,26 @@ start/CG): the physics model leaves little for the joint fit to add there. Real 
 `scripts/joint_eval.py` (variants calib_only, joint_cg, joint_grad, joint_start_cg, joint_start_grad,
 `*_lbfgs`; image vs fully sampled RSS, map leave-coil-out). Defaults unchanged until that is measured.
 
+### 8.6 Re-running the full comparison with tuned PINN variants
+
+`scripts/evaluate_methods.py` takes named PINN variants (`--pinn-variant NAME key=value ...`, repeatable;
+each becomes a method `pinn_NAME` = `estimate_maps` with those options) and a joint protocol (`--joint R`:
+every case is retrospectively undersampled, variable density R + ACS, every method sees all acquired
+samples, the metrics use the fully sampled data; results under `<case>_jR`). With `--joint` the PINN's
+`plane='auto'` resolves rows-vs-columns by held-out k-space (there are samples outside the ACS).
+`--resample` is not available with `--joint`.
+
+```
+# joint protocol (the realistic one: your undersampled data, maps + image from all samples)
+python scripts/evaluate_methods.py --cases synth --loader dataloader_v2:get_dataloader --base-folder ... \
+    --n 20 --joint 4 --device cuda --Rs 2 4 8 --pinn-quality default \
+    --pinn-variant joint solve_image=true \
+    --pinn-variant best solve_image=true optimizer=adam+lbfgs \
+    --pinn-variant best_lr solve_image=true optimizer=adam+lbfgs lr_pinn=4e-3 \
+    --pinn-variant joint_start solve_image=true joint_start=wires joint_image=gradient \
+    --out runs/eval_joint
+```
+
 ## 9. Code map
 
 | file | content |

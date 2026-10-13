@@ -259,20 +259,25 @@ def _bs(case: EvalCase, model="pinn", cfg_overrides=None, return_wires=False, lo
     return out
 
 
-def pinn_api(case: EvalCase, device="cpu", seed=0, quality="default", **kw):
+def pinn_api(case: EvalCase, device="cpu", seed=0, quality="default", pinn_options=None, **kw):
     """``bspinn.estimate_maps`` exactly as a user calls it (presets, plane search, fold-over
-    handling), on the calibration data the other methods see. The mask handed over is the ACS box,
-    which does not reveal the readout axis, so it is passed explicitly (1 - pe_axis)."""
+    handling). Calibration-only cases: the ACS box the other methods see (that mask does not reveal the
+    readout axis, so it is passed explicitly, 1 - pe_axis). Joint cases (``case.joint``, e.g. the
+    retrospectively undersampled protocol of evaluate_methods --joint): every acquired sample, with its
+    mask. ``pinn_options``: extra estimate_maps / FitConfig options (e.g. solve_image=True,
+    optimizer='adam+lbfgs'); evaluate_methods --pinn-variant registers named variants with them."""
     from .api import estimate_maps
+    opts = dict(pinn_options or {})
     seen = case.sampled if case.joint else case.acs_mask()
-    plane = case.meta.get("api_plane", case.plane)
-    C, _ = estimate_maps(case.calib_kspace(), "2d" if case.ndim == 2 else "3d", mask=seen,
-                         calib=int(max(case.acs)) if case.ndim == 2 else tuple(int(a) for a in case.acs),
-                         spacing=tuple(case.pixel_spacing) if case.ndim == 2 else tuple(case.voxel),
-                         plane=plane if case.ndim == 2 else "auto", device=device, seed=seed,
-                         quality=quality, verbose=False,
-                         **({"readout_axis": 1 - case.pe_axis} if case.ndim == 2 else {}))
-    return np.asarray(C)
+    data = case.ksp * case.sampled[None] if case.joint else case.calib_kspace()
+    plane = opts.pop("plane", case.meta.get("api_plane", case.plane))
+    out = estimate_maps(data, "2d" if case.ndim == 2 else "3d", mask=seen,
+                        calib=int(max(case.acs)) if case.ndim == 2 else tuple(int(a) for a in case.acs),
+                        spacing=tuple(case.pixel_spacing) if case.ndim == 2 else tuple(case.voxel),
+                        plane=plane if case.ndim == 2 else "auto", device=device, seed=seed,
+                        quality=opts.pop("quality", quality), verbose=False,
+                        **({"readout_axis": 1 - case.pe_axis} if case.ndim == 2 else {}), **opts)
+    return np.asarray(out[0])
 
 
 ESTIMATORS = {"pinn_api": pinn_api, "lowres": lowres, "walsh": walsh, "inati": inati, "espirit": espirit, "nlinv": nlinv}

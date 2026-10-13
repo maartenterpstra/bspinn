@@ -159,7 +159,10 @@ def _json(o):
 
 
 def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=print, resample=(), r2r_alpha=0.7,
-             sure_eps=0.1, sure_probes=1, device=None, quality=None):
+             sure_eps=0.1, sure_probes=1, device=None, quality=None, fit_case=None):
+    """``fit_case``: what the estimators see (default: ``case``); every metric is computed on ``case``
+    (--joint: the undersampled copy is fitted, the fully sampled original scores)."""
+    fit_case = fit_case or case
     cdir = os.path.join(out, case.name)
     os.makedirs(cdir, exist_ok=True)
     over = {}
@@ -173,7 +176,7 @@ def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=pr
     maps, secs = {}, {}
     for mth in methods:                 # one at a time: a missing tool (BART) skips that method only
         try:
-            m_, s_ = estimate(case, [mth], cache_dir=os.path.join(cdir, "maps"), log=log, **est_kw)
+            m_, s_ = estimate(fit_case, [mth], cache_dir=os.path.join(cdir, "maps"), log=log, **est_kw)
             maps.update(m_); secs.update(s_)
         except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as e:
             log(f"  [{case.name}] skipping {mth}: {e}")
@@ -183,7 +186,9 @@ def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=pr
     res = {"case": {"name": case.name, "n_coils": case.N, "shape": list(case.shape), "acs": list(case.acs),
                     "fully_sampled": case.fully_sampled, "joint_calibration": case.joint, "sigma": case.sigma,
                     "object_pixels": int(obj.sum()), "sampled_fraction": float(case.sampled.mean()),
-                    "synthetic": case.gt_maps is not None, **case.meta},
+                    "synthetic": case.gt_maps is not None,
+                    "protocol": "joint" if fit_case is not case else "calibration",
+                    "fit_sampled_fraction": float(fit_case.sampled.mean()), **case.meta},
            "runtime_s": secs, "methods": {}}
     figs = {"object": obj, "support": sup}
     I = ifft2c(case.ksp * case.sampled[None])
@@ -308,6 +313,13 @@ def main():
     ap.add_argument("--out", default="runs/eval")
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--device", default=None, help="for the Biot-Savart methods, e.g. cuda")
+    ap.add_argument("--pinn-variant", nargs="+", action="append", default=[], metavar=("NAME", "KEY=VALUE"),
+                    help="add a PINN method 'pinn_NAME' = estimate_maps with these options (repeatable), e.g. "
+                         "--pinn-variant best solve_image=true optimizer=adam+lbfgs")
+    ap.add_argument("--joint", type=float, default=0,
+                    help="joint protocol: every case retrospectively undersampled (variable density, R, ACS kept), "
+                         "every method sees all acquired samples (NLINV, the PINN with its mask), metrics on the "
+                         "fully sampled data; results in <out>/<case>_jR")
     ap.add_argument("--pinn-quality", default=None, choices=["fast", "default"], help="estimate_maps preset for pinn_api")
     ap.add_argument("--Rs", type=int, nargs="+", default=[2, 3, 4, 5, 6], help="SENSE accelerations")
     ap.add_argument("--list", action="store_true")
@@ -341,10 +353,23 @@ def main():
         if not torch.cuda.is_available():
             print("CUDA not available, using the CPU"); a.device = "cpu"
     log = lambda *x: print(*x, flush=True)  # noqa: E731
-    jobs = [(CASES[c], a.methods or ALL_METHODS) for c in names]
+    from functools import partial
+    from bspinn import methods as bm
+    from method_lab import parse_set, undersampled
+    pv = []
+    for spec in a.pinn_variant:
+        nm = f"pinn_{spec[0]}"
+        bm.ESTIMATORS[nm] = partial(bm.pinn_api, pinn_options=parse_set(spec[1:]))
+        bm._PASS[nm] = bm._PASS["pinn_api"]
+        pv.append(nm)
+        print(f"method {nm}: estimate_maps options {parse_set(spec[1:])}")
+    if a.joint and a.resample:
+        print("--resample is not available with --joint (it re-fits on the calibration protocol); ignored")
+        a.resample = []
+    jobs = [(CASES[c], (a.methods or ALL_METHODS) + [m for m in pv if not a.methods or m not in a.methods]) for c in names]
     if a.loader:
         noise = np.load(a.noise_npy).reshape(-1, np.load(a.noise_npy).shape[-1]) if a.noise_npy else None
-        dm = a.methods or ["lowres", "walsh", "inati", "espirit", "nlinv", "pinn_api"]
+        dm = (a.methods or ["lowres", "walsh", "inati", "espirit", "nlinv", "pinn_api"]) + [m for m in pv if not a.methods or m not in a.methods]
         jobs += [(mk, dm) for mk in loader_cases(a.loader, a.base_folder, a.indices, a.n, a.pick_seed, a.key,
                                                  a.coil_axis, a.acs, a.pe_axis, noise)]
     os.makedirs(a.out, exist_ok=True)
@@ -354,7 +379,13 @@ def main():
         if case.meta.get("api_plane") == "auto" and a.pinn_plane != "auto":
             case.meta["api_plane"] = a.pinn_plane
         print(f"== {case.name}: {case.N} coils, {case.shape}, ACS {case.acs}, PE axis {case.pe_axis}", flush=True)
+        fit_case = None
+        if a.joint:
+            fit_case = undersampled(case, a.joint)
+            case.name = fit_case.name = f"{case.name}_j{a.joint:g}"
+            print(f"   joint protocol: fitted on {fit_case.sampled.mean():.3f} of k-space (R={a.joint:g} vd + ACS)", flush=True)
         results.append(run_case(case, methods, a.out, Rs=tuple(a.Rs), threads=a.threads, log=log, resample=a.resample,
+                                fit_case=fit_case,
                                 r2r_alpha=a.r2r_alpha, sure_eps=a.sure_eps, sure_probes=a.sure_probes, device=a.device,
                                 quality=a.pinn_quality))
         write_summary(results, a.out)          # updated after every case
