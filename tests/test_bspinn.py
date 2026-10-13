@@ -1115,3 +1115,24 @@ def test_auto_sense_lambda_grows_with_noise():
     rep = {}
     sense_image(k, Cn, "2d", mask=m, lam=3e-2, iters=10, report=rep)
     assert rep == {"method": "manual", "value": 3e-2}
+
+
+def test_true_joint_fit_options():
+    """joint_start='wires' (maps and image jointly from the first PINN step) and joint_image='gradient'
+    (simultaneous steps on maps and image) run, return the joint image, and choose the automatic image
+    weight inside the joint stage."""
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    d, C, obj = make_synthetic(6, (64, 64), noise=0.003, seed=5)
+    m = cartesian_mask((64, 64), R=3, acs=16, pattern="vd", seed=1)
+    k = d.kspace[0] * m[None]
+    Gn = C[0] / np.sqrt((np.abs(C[0]) ** 2).sum(0, keepdims=True))
+    for ov in (dict(joint_start="wires"), dict(joint_image="gradient"), dict(joint_start="wires", joint_image="gradient")):
+        Cm, img, info = estimate_maps(k, "2d", calib=16, mask=m, plane="axial", verbose=False, iters_auto=20,
+                                      iters_wires=100, iters_pinn=100, iters_joint=20, solve_image=True, fold=False,
+                                      threads=1, **ov)
+        Cn = Cm / np.sqrt((np.abs(Cm) ** 2).sum(0, keepdims=True))
+        err = float((1 - np.abs((Cn.conj() * Gn).sum(0)) ** 2)[obj[0] > 0].mean())
+        assert info["image_solved_jointly"] and info["sense_lambda"]["method"] == "cv+map", ov
+        assert np.isfinite(img).all() and err < 2e-3, (ov, err)

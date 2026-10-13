@@ -81,10 +81,15 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         every rule's value are in ``info['sense_lambda']``. ``sense_lambda_options``: dict passed to
         senselam.choose_sense_lambda (e.g. folds=4 for a lower-variance cross-validation, ceiling=10 to cap
         the weight at 10x the Wiener value). ``sense_iters`` caps the CG iterations (fewer =
-        stronger implicit regularisation, as in NLINV). With ``solve_image``: a numeric ``sense_lambda``
-        also weights the image of the joint fit (as before); with an automatic one the joint fit uses
-        ``lambda_joint_img`` (default 1e-2) and the returned image is recomputed by CG-SENSE with the
-        joint maps and the automatic weight (the joint image stays in ``info['image_joint']``).
+        stronger implicit regularisation, as in NLINV). With ``solve_image`` the weight (numeric, or chosen
+        automatically at the start of the joint stage from the calibration maps) is the image weight of the
+        joint fit itself, and the returned image is the joint solution (dynamic data with an automatic
+        weight: the image is recomputed with it after the fit). Joint-fit options (FitConfig fields):
+        ``joint_start='wires'`` skips the calibration-only PINN stage, so maps and image are fitted
+        together from the first PINN iteration on all acquired k-space (the joint stage then runs
+        iters_pinn + iters_joint iterations); ``joint_image='gradient'`` makes the image a parameter of the
+        same optimiser as the maps (simultaneous steps, Adam or L-BFGS) instead of an exact CG-SENSE solve
+        after every map step (default 'cg').
     mask_maps : False (default; maps cover the whole FOV) | True (zero the maps, and the images, outside
         the estimated object support ``info['support']``, as ESPIRiT's cropped maps; CG-SENSE is then
         support-constrained) | a bool array of the spatial shape (your own support; also used for the
@@ -194,8 +199,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
             raise ValueError("solve_image with dynamic data needs rank=0 (one static map set)")
         cfg.joint_full = True
         return_image = True
-        if "lambda_joint_img" not in cfg_overrides and not isinstance(sense_lambda, str):
+        if "lambda_joint_img" not in cfg_overrides and (not isinstance(sense_lambda, str) or layout == "2d"):
             cfg.lambda_joint_img = sense_lambda              # one image-regularisation knob for both image paths
+            cfg._lam_options = sense_lambda_options          # 2-D 'auto': chosen inside the joint stage
     under_info = {}
     if undersample is not None:
         ksp, mask, under_info = _apply_undersampling(ksp, mask, undersample, layout, cfg.calib)
@@ -271,11 +277,12 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     C = C.astype(np.complex64)
     if not return_image:
         return C, info
-    if x_solved is not None and not isinstance(sense_lambda, str):
+    if x_solved is not None and (not isinstance(sense_lambda, str) or layout == "2d"):
         info["image_solved_jointly"] = True
+        if info.get("joint_lambda") is not None:
+            info["sense_lambda"] = info["joint_lambda"]
         return C, x_solved, info
-    if x_solved is not None:
-        info["image_joint"] = x_solved
+    if x_solved is not None:                                   # dynamic + automatic weight
         info["image_solved_jointly"] = False                   # maps jointly; image recomputed below
     lam_rep = {}
     with accel.phase("sense_image", device):
@@ -398,7 +405,7 @@ def _fit_2d_plane(ksp, mask, spacing, plane, noise, cfg, log):
         model.cpu()
     return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob,
                "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane,
-               "_fold_maps": fold_maps}
+               "_fold_maps": fold_maps, "joint_lambda": extra.get("joint_lambda")}
 
 
 def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):

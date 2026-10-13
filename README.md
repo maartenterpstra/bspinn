@@ -1142,6 +1142,28 @@ third check (`sense_lambda_options`): `folds=4` (lower-variance cross-validation
 10x the Wiener value; would have given worst 1.058 here and 1.077 on the first set, but was picked on this
 set). `sense_lambda_eval.py` now reports both and stores the cross-validation curves.
 
+### 8.5 True joint fitting (v39)
+
+`solve_image=True` used to be sequential in two ways: the maps were first fitted to the calibration data
+alone, and with `sense_lambda='auto'` (v36-v38) the returned image was recomputed after the joint stage.
+Now:
+* the automatic image weight is chosen once at the start of the joint stage (from the calibration maps)
+  and used inside it; the returned image is the joint solution (`info['sense_lambda']`);
+* `joint_start='wires'`: the wire model is still initialised on the calibration data, but the PINN stage
+  is replaced by the joint stage, so the maps (network, wires, coupling, smooth factor) and the
+  full-resolution image are fitted together on all acquired k-space from the first PINN step
+  (iters_pinn + iters_joint iterations);
+* `joint_image='gradient'`: the image is a parameter of the same optimiser as the maps (simultaneous
+  steps; with `optimizer='lbfgs'` one quasi-Newton problem in maps and image) instead of an exact
+  CG-SENSE solve after every map step (`'cg'`, default). The final image is the exact CG solution for the
+  final maps either way.
+
+On a 96x96 8-coil Biot–Savart phantom (R=4) all variants give the same image (NRMSE 0.1881-0.1888) and
+map error within 2x (2.0e-5 calibration only, 2.4e-5 joint/gradient, 2.8e-5 joint/CG, 4.0e-5 joint from the
+start/CG): the physics model leaves little for the joint fit to add there. Real data: run
+`scripts/joint_eval.py` (variants calib_only, joint_cg, joint_grad, joint_start_cg, joint_start_grad,
+`*_lbfgs`; image vs fully sampled RSS, map leave-coil-out). Defaults unchanged until that is measured.
+
 ## 9. Code map
 
 | file | content |

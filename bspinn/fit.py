@@ -154,6 +154,13 @@ class FitConfig:
     learn_mixing: bool | str = False # learnable complex channel mixing C -> (I + E) C (coupling): True = PINN
                                      #   stage, 'all' = from the wire stage on
     lambda_mix: float = 1e-3         # ridge on E
+    joint_start: str = "calibration" # 'calibration': wires -> PINN on the calibration data -> joint stage;
+                                     #   'wires': wires on the calibration data (initialisation) -> the joint stage
+                                     #   directly (maps + full image from the first PINN step; it then runs
+                                     #   iters_pinn + iters_joint iterations)
+    joint_image: str = "cg"          # joint stage image update: 'cg' (exact CG-SENSE for the current maps after
+                                     #   every map step, alternating) | 'gradient' (the image is a parameter of
+                                     #   the same optimiser: simultaneous steps on maps and image)
     joint_freeze_extra: bool = False # joint full-resolution stage: keep the smooth factor and the coupling
                                      #   fixed (True: better on exact Biot–Savart phantoms, worse on real knees)
     seed: int = 0
@@ -172,6 +179,10 @@ class FitConfig:
             err.append(f"--model must be pinn|wires|free, got {self.model}")
         if self.field_mode not in ("real", "complex"):
             err.append("--field-mode must be real|complex")
+        if self.joint_start not in ("calibration", "wires"):
+            err.append("joint_start must be calibration|wires")
+        if self.joint_image not in ("cg", "gradient"):
+            err.append("joint_image must be cg|gradient")
         if self.optimizer not in ("adam", "lbfgs", "adam+lbfgs"):
             err.append("optimizer must be adam|lbfgs|adam+lbfgs")
         if self.model_channels not in ("physical", "data"):
@@ -866,8 +877,28 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
     with torch.no_grad():
         Cg0 = model.sensitivity(pts, create_graph=False).detach()          # calibration solution (prox anchor)
         C0, _ = maps(False)
-        lam = cfg.lambda_joint_img * float((C0.abs() ** 2).sum(1).mean())
+        lam_rel = cfg.lambda_joint_img
+        if isinstance(lam_rel, str):                       # 'auto' (or 'auto-<rule>'): from the data, once
+            from .senselam import choose_sense_lambda
+            method = {"auto": "cv+map"}.get(lam_rel, lam_rel.replace("auto-", ""))
+            vals, infos = [], []
+            for si in range(S):
+                v, inf = choose_sense_lambda(y[si].cpu().numpy(), C0[si].cpu().numpy(),
+                                             (M[si, 0] > 0).cpu().numpy(), method=method,
+                                             device=str(dev), iters=40, calib=int(np.max(cfg.calib)),
+                                             **(getattr(cfg, "_lam_options", None) or {}))
+                vals.append(1e-2 if v is None else v); infos.append(inf)
+            lam_rel = float(np.median(vals))
+            prob._joint_lambda = {"method": method, "value": lam_rel, "per_slice": vals,
+                                  **({k: infos[0].get(k) for k in ("lam_cv", "lam_map", "cv_error", "grid", "sigma2")} if infos else {})}
+            log(f"joint full-res: image weight {lam_rel:.3g} ({method}, chosen with the calibration maps)")
+        else:
+            prob._joint_lambda = {"method": "manual", "value": float(lam_rel)}
+        lam = lam_rel * float((C0.abs() ** 2).sum(1).mean())
         x = _cg_image(C0, y, M, box, lam, torch.zeros(S, H, W, dtype=torch.complex64, device=dev), 30, check=True)
+    grad_img = cfg.joint_image == "gradient"
+    if grad_img:                                            # simultaneous: the image is optimised with the maps
+        x = torch.nn.Parameter(x.clone())
     ynorm = float((y.abs() ** 2).sum())
     frozen = set()
     if cfg.joint_freeze_extra:              # smooth factor / coupling stay at their calibration values
@@ -877,6 +908,10 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
                 frozen |= {id(q) for q in mod.parameters()}
     params = [q for q in model.parameters() if q.requires_grad and id(q) not in frozen]
     lr = cfg.lr_joint or cfg.lr_pinn
+    if grad_img:
+        params = [{"params": params, "lr": lr}, {"params": [x], "lr": cfg.lr_image_pinn}]
+        if cfg.optimizer == "lbfgs":
+            params = params[0]["params"] + [x]
     hist = []
     state = {}
 
@@ -921,6 +956,8 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             d = (M * _fft2c_t(C * x[:, None]) - y).abs().pow(2).sum() / ynorm
             rest = d
         rest = rest + cfg.lambda_phys * _physics(model, prob, cfg, gen, wires) + cfg.lambda_norm * prob.norm_loss(Cg)
+        if grad_img:                                        # the image's own Tikhonov term
+            rest = rest + lam * x.abs().pow(2).sum() / ynorm
         if cfg.lambda_joint_prox:
             rest = rest + cfg.lambda_joint_prox * (Cg - Cg0).abs().pow(2).sum() / Cg0.abs().pow(2).sum()
         for w in wires:
@@ -930,6 +967,8 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         return rest, d
 
     def post():                                                            # image update for the new maps
+        if grad_img:
+            return                                                         # (updated by the optimiser)
         with torch.no_grad():
             x.copy_(_cg_image(state["C"].detach(), y, M, box, lam, x, cfg.joint_cg))
 
@@ -975,7 +1014,7 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             after(it, o)
     with torch.no_grad():
         C, _ = maps(False)
-        x = _cg_image(C, y, M, box, lam, x, 20, check=True)
+        x = _cg_image(C, y, M, box, lam, x.detach(), 20, check=True)        # exact image for the final maps
     return x.detach(), hist
 
 
@@ -1224,8 +1263,11 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
                 from .models import ChannelMixer
                 pinn.mixer = ChannelMixer(pinn.n_coils).to(prob.device)
             model = _wrap(pinn, prob, cfg, prev=wires_model, free=cfg.free_sets)
-            m, history["pinn"] = fit_pinn(prob, cfg, model, m, log=log)
-        if cfg.iters_polish > 0 or cfg.optimizer == "adam+lbfgs":
+            if cfg.joint_full and cfg.joint_start == "wires":
+                log("joint from the start: the PINN is trained jointly with the full-resolution image")
+            else:
+                m, history["pinn"] = fit_pinn(prob, cfg, model, m, log=log)
+        if (cfg.iters_polish > 0 or cfg.optimizer == "adam+lbfgs") and not (cfg.joint_full and cfg.joint_start == "wires"):
             if cfg.iters_polish <= 0:
                 cfg = copy.copy(cfg); cfg.iters_polish = 200
             with accel.phase("polish", cfg.device):
@@ -1233,7 +1275,10 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
     image_full = None
     if cfg.joint_full:
         with accel.phase("joint_image", cfg.device):
-            image_full, history["joint"] = fit_joint_full(prob, cfg, model, log=log)
+            cj = cfg
+            if cfg.joint_start == "wires" and cfg.model == "pinn":
+                cj = copy.copy(cfg); cj.iters_joint = cfg.iters_joint + cfg.iters_pinn
+            image_full, history["joint"] = fit_joint_full(prob, cj, model, log=log)
     log(f"fit done in {time.time() - t0:.1f}s")
     wires = wires_model.primary if isinstance(wires_model, MultiSetCoils) else wires_model
     # evaluation runs on CPU
@@ -1243,4 +1288,5 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
     if m is not None:
         m = m.detach().cpu()
     return model, prob, history, {"wires": wires, "handedness": h, "image_lowres": m,
-                                  "image_full": None if image_full is None else image_full.cpu()}
+                                  "image_full": None if image_full is None else image_full.cpu(),
+                                  "joint_lambda": getattr(prob, "_joint_lambda", None)}
