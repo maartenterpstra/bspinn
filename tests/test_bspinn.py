@@ -1205,3 +1205,55 @@ def test_zs_ssl_script(tmp_path, monkeypatch):
     assert all(np.isfinite(r["nrmse"]) for r in rows) and (out / "pretrained_lowres.pt").exists()
     zs.main()                                   # resume: nothing recomputed
     assert len(open(out / "results.jsonl").read().splitlines()) == 3
+
+
+def test_train_recon_script(tmp_path, monkeypatch):
+    """scripts/train_recon.py: split (evaluation items + window never trained on), random-mask training with
+    on-the-fly and cached maps, resume, evaluation with ZS fine-tuning (tiny network, CPU)."""
+    import importlib.util
+    import json
+    import os
+    import sys
+    mod = tmp_path / "fake_ds_tr.py"
+    mod.write_text(
+        "import numpy as np\n"
+        "from bspinn.data import make_synthetic\n"
+        "class DS:\n"
+        "    def __len__(self): return 12\n"
+        "    def __getitem__(self, i):\n"
+        "        d, C, o = make_synthetic(4, (64, 64), noise=0.0, seed=i % 3)\n"
+        "        r = np.random.default_rng(i)\n"
+        "        return {'kspace': d.kspace[0] + (r.normal(size=d.kspace[0].shape) + 1j * r.normal(size=d.kspace[0].shape)) * 0.01}\n"
+        "def get(base=None): return DS()\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    spec = importlib.util.spec_from_file_location("trr", os.path.join(os.path.dirname(__file__), "..", "scripts", "train_recon.py"))
+    tr = importlib.util.module_from_spec(spec); spec.loader.exec_module(tr)
+    out = tmp_path / "rec"
+    tiny = ["--unrolls", "1", "--cg-iters", "2", "--blocks", "1", "--ch", "4", "--device", "cpu", "--workers", "0",
+            "--loader", "fake_ds_tr:get", "--indices", "5", "--exclude-window", "1", "--val-n", "2", "--out", str(out)]
+    a = tr.main.__globals__["argparse"]  # noqa: F841
+    import argparse
+    ns = argparse.Namespace(indices=[5], n=1, pick_seed=0, exclude_window=1, split_seed=1, val_n=2, train_n=0)
+    ev, val, train = tr.split_indices(ns, 12)
+    assert ev == [5] and not set(train) & {4, 5, 6} and not set(train) & set(val) and len(val) == 2
+    monkeypatch.setattr(sys, "argv", ["x"] + tiny + ["--steps", "3", "--val-every", "2", "--log-every", "1",
+                                                     "--acs-choices", "16", "--train-maps", "lowres"])
+    tr.main()
+    log = [json.loads(l) for l in open(out / "train_log.jsonl")]
+    assert log[-1]["step"] == 3 and np.isfinite(log[-1]["val_nrmse"]) and (out / "best.pt").exists()
+    monkeypatch.setattr(sys, "argv", ["x"] + tiny + ["--steps", "4", "--val-every", "2", "--acs-choices", "16",
+                                                     "--train-maps", "lowres", "--loss", "ssdu"])
+    tr.main()                                                       # resumes at step 3
+    assert json.loads(open(out / "train_log.jsonl").read().splitlines()[-1])["step"] == 4
+    # cached maps: precompute for the training/validation items, then train from the cache
+    monkeypatch.setattr(sys, "argv", ["x"] + tiny + ["--precompute-maps", "lowres", "--maps-acs", "16"])
+    tr.main()
+    assert (out / "maps" / "lowres" / f"item{train[0]}" / "lowres.npy").exists()
+    assert not (out / "maps" / "lowres" / "item5").exists()
+    monkeypatch.setattr(sys, "argv", ["x"] + tiny + ["--steps", "5", "--val-every", "5", "--train-maps", "cache:lowres", "--maps-acs", "16"])
+    tr.main()
+    monkeypatch.setattr(sys, "argv", ["x"] + tiny + ["--eval", "--eval-maps", "lowres", "--zs-epochs", "0", "1",
+                                                     "--splits", "2", "--patience", "1"])
+    tr.main()
+    rows = [json.loads(l) for l in open(out / "eval.jsonl")]
+    assert {r["method"] for r in rows} == {"cg_auto", "net", "net_zs1"} and rows[0]["case"] == "item5_j4"

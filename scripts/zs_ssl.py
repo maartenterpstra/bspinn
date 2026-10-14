@@ -239,7 +239,7 @@ def train_zero_shot(net, sl, a, rng, log, tag=""):
             out = net(op_train, sl.y * sl.mask_t(train))
             vl = float(kspace_loss(op_full, out, sl.y, g_t))
         hist.append({"epoch": ep, "train": tl / len(lams), "val": vl, "seconds": time.time() - t0})
-        log(f"  {tag} epoch {ep:3d}  train {tl / len(lams):.4f}  val {vl:.4f}  mu {float(net.mu):.3f}  "
+        log(f"  {tag} epoch {ep:3d}  train {tl / len(lams):.4f}  val {vl:.4f}  mu {float(net.mu.detach()):.3f}  "
             f"{time.time() - t0:.1f}s", flush=True)
         if vl < best - 1e-5:
             best, bad = vl, 0

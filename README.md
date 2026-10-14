@@ -1243,6 +1243,20 @@ The reference is noisy, so a denoising reconstruction is slightly penalised on l
 (synth8_noisehi, tiny network: 4 unrolls, 4 blocks x 24 channels, 40 epochs): SSIM 0.689 -> 0.784,
 PSNR 25.1 -> 26.3 dB against CG-SENSE with the same (true) maps.
 
+### 8.8 Training the reconstruction network on the whole dataset
+
+`scripts/train_recon.py` trains the same unrolled network (zs_ssl.py) on every item of the dataloader, with
+a new random mask per sample (R ~ U[2, 8], vd / random / uniform lines, 16 / 24 / 32 calibration lines,
+along the item's phase-encode axis), so that one network serves any mask. Maps during training: a fast
+estimator from that mask's calibration region (Inati by default, in the data workers), or a per-item cache
+of any estimator (`--precompute-maps pinn_api --shard k/n`, then `--train-maps cache:pinn_api`; the training
+calibration size is then fixed to `--maps-acs`). Loss `supervised` (fully sampled SENSE-1 image with the same
+maps) or `ssdu` (acquired samples only). The 20 evaluation items of §8.6 (same --n / --pick-seed) and every
+index within `--exclude-window` (300) of them are never trained on; `--val-n` validation items (fixed R = 4
+masks) pick `best.pt`. Training resumes from `last.pt`. `--eval` scores CG-SENSE vs the network (and
+optionally per-slice ZS-SSL fine-tuning, `--zs-epochs 0 10`) at `--eval-R` with `--eval-maps` (PINN / NLINV
+maps from the `evaluate_methods.py --joint` cache).
+
 ## 9. Code map
 
 | file | content |
