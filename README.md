@@ -1322,6 +1322,45 @@ python scripts/prior_eval.py --loader dataloader_v2:get_dataloader --base-folder
 # + --net runs/recon/best.pt to add the trained network (§8.8) with the same maps
 ```
 
+### 8.10 Higher-order smooth factor (continuation) and the prior inside the joint fit (v48)
+
+**Smooth factor.** The investigation of v42 showed that the PINN's remaining calibration-region residual is
+smooth, coil-specific structure at a 2-3 cm scale (Fourier orders 4-8 over the FOV) that the order-3 factor
+cannot carry. `resid_order_final=8` (new `estimate_maps` 2-D default) raises the factor after the PINN stage
+(`SmoothFactor.grown`: same values, new coefficients 0) for the polish and joint stages, with the penalty
+(1 + |k|^2 / `resid_k0`^2)^`resid_sobolev` (3, 2) and ridge `lambda_resid` (`lambda_resid_final` to change it).
+The PINN stage keeps order 3, so the physics carries the large-scale field first. Calibration-only fits, quality
+fast:
+
+| case | variant | ACS c->e / floor | lco / floor (held out) | worst coil | SENSE R4 | gt subspace error |
+|---|---|---|---|---|---|---|
+| k19870 (knee) | v47 (order 3) | 29.6 | 1.0469 | 1.225 | 0.0771 | |
+| | order 3 -> 8 | 17.4 | 1.0259 | 1.174 | 0.0757 | |
+| | order 3 -> 8, ridge 1e-4 | 16.0 | 1.0213 | 1.156 | 0.0753 | |
+| val_cc (brain) | v47 / ->8 / ->8 ridge 1e-4 | 2.15 / 1.61 / 1.52 | 1.0361 / 1.0355 / 1.0353 | 1.075 | 0.0984 | |
+| synth8 (exact Biot-Savart) | v47 / ->8 / ->8 ridge 1e-4 | 0.94 / 0.90 / 0.87 | 0.997 / 1.000 / 0.998 | 1.05 | 0.0717 | 3.5e-5 / 1.0e-4 / 1.7e-4 |
+
+NLINV on k19870: lco 1.019. Two real slices: confirm on 20 (below). `resid_order_final=0` restores v47.
+
+**Prior inside the joint fit.** With `solve_image=True` and `image_prior='tv'` (or another built-in prior) the
+joint stage now updates its image with the prior: after every map step a few warm-started ADMM iterations
+(`joint_prior_admm`, default 3; splits and duals persist across steps), the weight chosen once by k-space
+cross-validation with the calibration maps (the same rule as §8.9). The maps are then refined against a
+denoised image instead of a noisy Tikhonov one. `joint_prior=None` keeps the Tikhonov image inside the fit.
+FitConfig: `joint_prior`, `joint_prior_weight`, `joint_prior_admm`, `joint_prior_options`; `info['joint_prior']`.
+
+GPU validation on the 20 slices (final TV images; maps: v47 order 3 and Tikhonov joint, order 8 + Tikhonov
+joint, order 8 + TV joint, NLINV):
+
+```
+BART=bart/bart python scripts/prior_eval.py --loader dataloader_v2:get_dataloader --base-folder ... --n 20 --R 4 6 \
+    --pinn-variant r3 solve_image=true resid_order_final=0 joint_prior=none \
+    --pinn-variant r8 solve_image=true joint_prior=none \
+    --pinn-variant r8tv solve_image=true image_prior=tv \
+    --maps pinn_r3 pinn_r8 pinn_r8tv nlinv --maps-cache runs/eval_joint --methods tikhonov tv \
+    --oracle --device cuda --out runs/prior_eval_v48.jsonl
+```
+
 ## 9. Code map
 
 | file | content |

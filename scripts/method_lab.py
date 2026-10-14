@@ -100,7 +100,7 @@ def parse_set(items):
             except ValueError:
                 pass
         else:
-            v = {"true": True, "false": False}.get(v.lower(), v)
+            v = {"true": True, "false": False, "none": None}.get(v.lower(), v)
         out[k] = v
     return out
 

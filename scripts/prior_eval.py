@@ -38,6 +38,9 @@ def main():
     ap.add_argument("--lab-cases", nargs="*", default=[], help="scripts/method_lab.py cases (LAB_DATA)")
     ap.add_argument("--R", type=float, nargs="+", default=[4.0])
     ap.add_argument("--maps", nargs="+", default=["pinn_api"])
+    ap.add_argument("--pinn-variant", nargs="+", action="append", default=[], metavar=("NAME", "KEY=VALUE"),
+                    help="register maps 'pinn_NAME' = estimate_maps with these options (as evaluate_methods.py), "
+                         "e.g. --pinn-variant jtv solve_image=true image_prior=tv")
     ap.add_argument("--maps-cache", default=None, help="evaluate_methods.py --joint results folder (<case>_jR/maps)")
     ap.add_argument("--maps-dir", default=None, help="folder with <case>.npy maps (overrides --maps; e.g. runs/lab/j_nlinv)")
     ap.add_argument("--methods", nargs="+", default=["tikhonov", "tv", "wavelet", "tvw"])
@@ -80,6 +83,11 @@ def main():
         if a.loader:
             yield from evm.loader_cases(a.loader, a.base_folder, a.indices, a.n, a.pick_seed, a.key, a.coil_axis, 24, None, None)
 
+    from functools import partial
+    from method_lab import parse_set
+    for spec in a.pinn_variant:
+        bm.ESTIMATORS[f"pinn_{spec[0]}"] = partial(bm.pinn_api, pinn_options=parse_set(spec[1:]))
+        bm._PASS[f"pinn_{spec[0]}"] = bm._PASS["pinn_api"]
     est_kw = {"threads": 1, "cfg_overrides": {}, "device": a.device, "quality": a.pinn_quality}
     for make in makers():
         case0 = make()

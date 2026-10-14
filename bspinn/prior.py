@@ -107,51 +107,76 @@ def _bcg(apply, rhs, x, iters):
     return x
 
 
+class ADMM:
+    """Scaled-form ADMM for 1/2 ||M F (C x) - y||^2 + b_tv TV(x) + b_w ||W x||_1 + lam/2 ||x||^2, batched over
+    a leading axis of L candidate weights (or L slices). The splits and duals persist between ``run`` calls,
+    so it can be warm-started repeatedly while the maps change (the joint fit's image update)."""
+
+    def __init__(self, shape, beta, prior="tv", ratio=1.0, rho=0.5, lam=1e-6, levels=4, wave="db4", fill=1.0,
+                 device="cpu"):
+        if prior not in PRIORS:
+            raise ValueError(f"prior must be one of {PRIORS}")
+        beta = torch.as_tensor(beta, dtype=torch.float32, device=device).reshape(-1)
+        L = beta.numel()
+        self.r_ = rho * float(fill)
+        self.lam = lam
+        self.b_tv = beta.view(L, 1, 1) if "tv" in prior else None
+        self.b_w = (beta * (ratio if prior == "tv+wavelet" else 1.0)).view(L, 1, 1) if "wavelet" in prior else None
+        self.Wt = Wavelet2D(shape, levels, wave, device) if self.b_w is not None else None
+        self.z1 = self.u1 = self.z2 = self.u2 = None
+
+    def run(self, x, C, m, y, iters=50, cg_iters=5):
+        """x (L,H,W) start; C (N,H,W) or (L,N,H,W) RSS-normalised maps; m (H,W) float; y like C."""
+        r_ = self.r_
+
+        def AHA(v):
+            return (C.conj() * _ifft2c(m * _fft2c(C * v[:, None]))).sum(-3)
+
+        def lhs(v):
+            out = AHA(v) + self.lam * v
+            if self.b_tv is not None:
+                out = out + r_ * _grad_adj(_grad(v))
+            if self.Wt is not None:
+                out = out + r_ * v
+            return out
+
+        AHy = (C.conj() * _ifft2c(m * y)).sum(-3)
+        if AHy.dim() == 2:
+            AHy = AHy[None].expand(x.shape[0], -1, -1)
+        if self.b_tv is not None and self.z1 is None:
+            self.z1 = _grad(x); self.u1 = torch.zeros_like(self.z1)
+        if self.Wt is not None and self.z2 is None:
+            self.z2 = self.Wt.fwd(x); self.u2 = torch.zeros_like(self.z2)
+        for _ in range(iters):
+            rhs = AHy.clone()
+            if self.z1 is not None:
+                rhs = rhs + r_ * _grad_adj(self.z1 - self.u1)
+            if self.z2 is not None:
+                rhs = rhs + r_ * self.Wt.adj(self.z2 - self.u2)
+            x = _bcg(lhs, rhs, x, cg_iters)
+            if self.z1 is not None:
+                v = _grad(x) + self.u1
+                mag = torch.sqrt((v.abs() ** 2).sum(-3, keepdim=True)).clamp_min(1e-12)
+                self.z1 = v * torch.clamp(1 - (self.b_tv / r_)[:, None] / mag, min=0)
+                self.u1 = v - self.z1
+            if self.z2 is not None:
+                v = self.Wt.fwd(x) + self.u2
+                shr = torch.clamp(1 - (self.b_w / r_) / v.abs().clamp_min(1e-12), min=0)
+                self.z2 = torch.where(self.Wt.detail, v * shr, v)
+                self.u2 = v - self.z2
+        return x
+
+
 def admm(y, C, m, beta, prior="tv", ratio=1.0, iters=50, cg_iters=5, rho=0.5, lam=1e-6, levels=4, wave="db4", x0=None):
     """y (N,H,W) complex tensor (zero outside m), C (N,H,W) RSS-normalised maps, m (H,W) float mask,
     beta (L,) weights -> images (L,H,W)."""
-    if prior not in PRIORS:
-        raise ValueError(f"prior must be one of {PRIORS}")
     L = beta.numel()
-    fill = float(m.mean())
-    r_ = rho * fill
-    b_tv = beta.view(L, 1, 1) if "tv" in prior else None
-    b_w = (beta * (ratio if prior == "tv+wavelet" else 1.0)).view(L, 1, 1) if "wavelet" in prior else None
-    Wt = Wavelet2D(m.shape, levels, wave, y.device) if b_w is not None else None
-
-    def AHA(x):
-        return (C.conj() * _ifft2c(m * _fft2c(C * x[:, None]))).sum(1)
-
-    def lhs(x):
-        out = AHA(x) + lam * x
-        if b_tv is not None:
-            out = out + r_ * _grad_adj(_grad(x))
-        if Wt is not None:
-            out = out + r_ * x
-        return out
-
-    AHy = (C.conj() * _ifft2c(m * y)).sum(0)[None].expand(L, -1, -1)
-    x = AHy.clone() if x0 is None else x0.expand(L, -1, -1).clone()
-    z1 = _grad(x) if b_tv is not None else None; u1 = torch.zeros_like(z1) if z1 is not None else None
-    z2 = Wt.fwd(x) if Wt is not None else None; u2 = torch.zeros_like(z2) if z2 is not None else None
-    for _ in range(iters):
-        rhs = AHy.clone()
-        if z1 is not None:
-            rhs = rhs + r_ * _grad_adj(z1 - u1)
-        if z2 is not None:
-            rhs = rhs + r_ * Wt.adj(z2 - u2)
-        x = _bcg(lhs, rhs, x, cg_iters)
-        if z1 is not None:
-            v = _grad(x) + u1
-            mag = torch.sqrt((v.abs() ** 2).sum(-3, keepdim=True)).clamp_min(1e-12)
-            z1 = v * torch.clamp(1 - (b_tv / r_)[:, None] / mag, min=0)
-            u1 = v - z1
-        if z2 is not None:
-            v = Wt.fwd(x) + u2
-            shr = torch.clamp(1 - (b_w / r_) / v.abs().clamp_min(1e-12), min=0)
-            z2 = torch.where(Wt.detail, v * shr, v)
-            u2 = v - z2
-    return x
+    solver = ADMM(m.shape, beta, prior, ratio, rho, lam, levels, wave, float(m.mean()), y.device)
+    if x0 is None:
+        x = (C.conj() * _ifft2c(m * y)).sum(0)[None].expand(L, -1, -1).clone()
+    else:
+        x = x0.expand(L, -1, -1).clone()
+    return solver.run(x, C, m, y, iters, cg_iters)
 
 
 def _setup(ksp, C, mask, device):

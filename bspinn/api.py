@@ -94,8 +94,11 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     image_prior, image_prior_weight, image_prior_options : the returned image with a sparsity prior instead
         of Tikhonov (2-D): 'tv' | 'wavelet' | 'tv+wavelet' (weight 'auto' = k-space cross-validation, or a
         relative number), or 'net:<weights.pt>' (a network from scripts/train_recon.py / zs_ssl.py); see
-        sense_image. With ``solve_image`` the maps are still fitted jointly (Tikhonov image inside the fit,
-        kept in ``info['image_tikhonov_joint']``) and the returned image is recomputed with the prior.
+        sense_image. With ``solve_image`` and a built-in prior the joint fit uses the same prior for its image
+        updates (warm-started ADMM after every map step, weight by cross-validation with the calibration maps;
+        ``joint_prior=None`` keeps the Tikhonov image there); the joint image is kept in
+        ``info['image_prior_joint']`` (or ``info['image_tikhonov_joint']``) and the returned image is recomputed
+        with the prior for the final maps; ``info['joint_prior']`` has the joint weight.
         The weight and the cross-validation curve are in ``info['image_prior']``.
     mask_maps : False (default; maps cover the whole FOV) | True (zero the maps, and the images, outside
         the estimated object support ``info['support']``, as ESPIRiT's cropped maps; CG-SENSE is then
@@ -192,6 +195,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         # v33 defaults from scripts/method_lab.py (real knees/brain + synthetic): learnable complex channel
         # coupling and a smooth per-coil complex factor (Fourier order 3)
         cfg.learn_mixing, cfg.resid_order = True, 3
+        # v48: continuation of the smooth factor to order 8 after the PINN stage (README 8.10; k19870:
+        # held-out leave-coil-out excess 0.047 -> 0.026, ACS residual 29.6 -> 17.4 x floor); resid_order_final=0
+        # for the v47 behaviour (better on exact Biot-Savart phantoms: ground-truth error 3.5e-5 vs 1.0e-4)
+        cfg.resid_order_final = 8
         # v42: Adam followed by a full-batch L-BFGS polish (runs/eval_joint, 20 real slices, joint protocol R=4:
         # lower leave-coil-out residual than Adam alone on 19/20, lower SENSE R4 error on 16/20, ~+4 s)
         cfg.optimizer = "adam+lbfgs"
@@ -210,6 +217,11 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
             raise ValueError("solve_image with dynamic data needs rank=0 (one static map set)")
         cfg.joint_full = True
         return_image = True
+        from .prior import PRIORS
+        if image_prior in PRIORS and layout == "2d" and "joint_prior" not in cfg_overrides:
+            # the prior inside the joint fit as well: the maps are refined against the prior image (v48)
+            cfg.joint_prior, cfg.joint_prior_weight = image_prior, image_prior_weight
+            cfg.joint_prior_options = dict(image_prior_options or {})
         if "lambda_joint_img" not in cfg_overrides and (not isinstance(sense_lambda, str) or layout == "2d"):
             cfg.lambda_joint_img = sense_lambda              # one image-regularisation knob for both image paths
             cfg._lam_options = sense_lambda_options          # 2-D 'auto': chosen inside the joint stage
@@ -290,7 +302,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         return C, info
     if x_solved is not None and image_prior is not None:      # maps jointly; the returned image with the prior
         info["image_solved_jointly"] = False
-        info["image_tikhonov_joint"] = x_solved
+        info["image_prior_joint" if info.get("joint_prior") else "image_tikhonov_joint"] = x_solved
     elif x_solved is not None and (not isinstance(sense_lambda, str) or layout == "2d"):
         info["image_solved_jointly"] = True
         if info.get("joint_lambda") is not None:
@@ -420,7 +432,8 @@ def _fit_2d_plane(ksp, mask, spacing, plane, noise, cfg, log):
         model.cpu()
     return C, {"handedness": extra["handedness"], "data_loss": _last(hist), "model": model, "problem": prob,
                "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane,
-               "_fold_maps": fold_maps, "joint_lambda": extra.get("joint_lambda")}
+               "_fold_maps": fold_maps, "joint_lambda": extra.get("joint_lambda"),
+               "joint_prior": extra.get("joint_prior")}
 
 
 def _run_2d(ksp, mask, spacing, plane, noise, cfg, log):

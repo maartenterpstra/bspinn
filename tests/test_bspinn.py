@@ -1327,7 +1327,11 @@ def test_estimate_maps_image_prior():
     C, img, info = estimate_maps(k, "2d", mask=m, return_image=True, image_prior="tv", image_prior_weight=1e-2, **few)
     assert img.shape == (48, 48) and np.isfinite(img).all() and info["image_prior"]["method"] == "manual"
     C, img, info = estimate_maps(k, "2d", mask=m, solve_image=True, image_prior="tv", image_prior_weight=1e-2, **few)
-    assert not info["image_solved_jointly"] and info["image_tikhonov_joint"].shape == (48, 48)
+    assert not info["image_solved_jointly"] and info["image_prior_joint"].shape == (48, 48)
+    assert info["joint_prior"]["prior"] == "tv" and info["joint_prior"]["weight"] == [1e-2]
+    C, img, info = estimate_maps(k, "2d", mask=m, solve_image=True, image_prior="tv", image_prior_weight=1e-2,
+                                 joint_prior=None, **few)                       # Tikhonov inside the joint fit
+    assert info["joint_prior"] is None and info["image_tikhonov_joint"].shape == (48, 48)
 
 
 def test_prior_weight_rule_and_wiener_guard():
@@ -1364,3 +1368,23 @@ def test_low_snr_slice_support_fallback():
     C, info = estimate_maps(k * m[None], "2d", mask=m, calib=12, verbose=False, iters_auto=2, iters_wires=3,
                             iters_pinn=3)
     assert np.isfinite(C).all() and C.shape == (4, 48, 48)
+
+
+def test_smooth_factor_continuation():
+    """SmoothFactor.grown keeps the values (new coefficients 0) and only changes the penalty shape; a fit
+    with resid_order_final raises the factor after the PINN stage."""
+    import torch
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.models import SmoothFactor
+    f = SmoothFactor(3, (0, 1), order=3)
+    with torch.no_grad():
+        f.a.normal_(0, 0.1)
+    g = f.grown(8, k0=3.0, sobolev=2.0)
+    p = torch.rand(50, 3) * 2 - 1
+    assert torch.allclose(f(p), g(p), atol=1e-5) and g.a.shape[1] == 17 * 17
+    assert g.penalty() < f.penalty()                     # same coefficients, weaker low-k weights
+    d, _, _ = make_synthetic(4, (48, 48), noise=0.01, seed=0)
+    C, info = estimate_maps(d.kspace[0], "2d", calib=12, verbose=False, iters_auto=2, iters_wires=3, iters_pinn=3,
+                            resid_order_final=6)
+    assert np.isfinite(C).all() and info["model"].resid.order == 6

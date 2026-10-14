@@ -151,6 +151,16 @@ class FitConfig:
     resid_order: int = 0             # >0: per-coil smooth complex factor exp(u_j) of this Fourier order
                                      #   multiplying the physics maps (PINN stage on; see models.SmoothFactor)
     lambda_resid: float = 1e-3       # Sobolev ridge on that factor's coefficients
+    resid_order_final: int = 0       # > resid_order: continuation, the factor is raised to this order (new
+                                     #   coefficients 0) after the PINN stage, for the polish and joint stages
+    resid_k0: float = 3.0            # penalty weight of the raised factor (1 + |k|^2 / k0^2)^resid_sobolev
+    resid_sobolev: float = 2.0       #   (the PINN-stage factor keeps 1 + |k|^2)
+    lambda_resid_final: float = 0.0  # ridge of the raised factor (0: lambda_resid)
+    joint_prior: str | None = None   # joint stage: image update with a sparsity prior instead of Tikhonov
+                                     #   ('tv' | 'wavelet' | 'tv+wavelet', bspinn.prior; joint_image='cg' only)
+    joint_prior_weight: float | str = "auto"   # relative weight, or 'auto' (k-space CV with the calibration maps)
+    joint_prior_admm: int = 3        # warm-started ADMM iterations per map step (duals kept across steps)
+    joint_prior_options: dict | None = None    # bspinn.prior options (ratio, rho, levels, wave, cv_options, scale)
     learn_mixing: bool | str = False # learnable complex channel mixing C -> (I + E) C (coupling): True = PINN
                                      #   stage, 'all' = from the wire stage on
     lambda_mix: float = 1e-3         # ridge on E
@@ -183,6 +193,10 @@ class FitConfig:
             err.append("joint_start must be calibration|wires")
         if self.joint_image not in ("cg", "gradient"):
             err.append("joint_image must be cg|gradient")
+        if self.joint_prior not in (None, "tv", "wavelet", "tv+wavelet"):
+            err.append("joint_prior must be None|tv|wavelet|tv+wavelet")
+        if self.joint_prior is not None and self.joint_image != "cg":
+            err.append("joint_prior needs joint_image='cg' (the image update is the prior's ADMM)")
         if self.optimizer not in ("adam", "lbfgs", "adam+lbfgs"):
             err.append("optimizer must be adam|lbfgs|adam+lbfgs")
         if self.model_channels not in ("physical", "data"):
@@ -904,6 +918,12 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             prob._joint_lambda = {"method": "manual", "value": float(lam_rel)}
         lam = lam_rel * float((C0.abs() ** 2).sum(1).mean())
         x = _cg_image(C0, y, M, box, lam, torch.zeros(S, H, W, dtype=torch.complex64, device=dev), 30, check=True)
+    jp = _joint_prior_setup(cfg, y, C0, M, x, dev, log) if cfg.joint_prior else None
+    if jp is not None:
+        prob._joint_prior = {"prior": cfg.joint_prior, "weight": [j[2] for j in jp], "rule": [j[3].get("rule") for j in jp],
+                             "cv_error": [j[3].get("cv_error") for j in jp], "grid": jp[0][3].get("grid")}
+        with torch.no_grad():
+            x = _joint_prior_image(jp, x, C0, y, M, 20)
     grad_img = cfg.joint_image == "gradient"
     if grad_img:                                            # simultaneous: the image is optimised with the maps
         x = torch.nn.Parameter(x.clone())
@@ -978,7 +998,10 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         if grad_img:
             return                                                         # (updated by the optimiser)
         with torch.no_grad():
-            x.copy_(_cg_image(state["C"].detach(), y, M, box, lam, x, cfg.joint_cg))
+            if jp is not None:                                             # warm-started ADMM with the prior
+                x.copy_(_joint_prior_image(jp, x, state["C"].detach(), y, M, cfg.joint_prior_admm))
+            else:
+                x.copy_(_cg_image(state["C"].detach(), y, M, box, lam, x, cfg.joint_cg))
 
     def after(it, o):
         if it % cfg.log_every == 0 or it == cfg.iters_joint - 1:
@@ -1007,7 +1030,7 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             post()
             it = min(cfg.iters_joint, it + inner)
             after(it - 1, state["o"])
-    elif accel.graph_mode(cfg, dev, cfg.iters_joint):                      # the whole iteration, CG included
+    elif accel.graph_mode(cfg, dev, cfg.iters_joint) and jp is None:      # the whole iteration, CG included
         opt, base = accel.capturable_adam(params, dev, default_lr=lr)
         accel.train_graphed(step, opt, base, 0.1 * lr, cfg.iters_joint, [gen], None, after,
                             log=log, post=post)
@@ -1022,8 +1045,42 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             after(it, o)
     with torch.no_grad():
         C, _ = maps(False)
-        x = _cg_image(C, y, M, box, lam, x.detach(), 20, check=True)        # exact image for the final maps
+        if jp is not None:
+            x = _joint_prior_image(jp, x.detach(), C, y, M, 20)            # converged prior image, final maps
+        else:
+            x = _cg_image(C, y, M, box, lam, x.detach(), 20, check=True)    # exact image for the final maps
     return x.detach(), hist
+
+
+def _joint_prior_setup(cfg, y, C0, M, x0, dev, log):
+    """Per slice: (ADMM solver, data scale, weight, CV info) for the joint stage's prior image update; the
+    weight from k-space cross-validation with the calibration maps (as sense_lambda='auto')."""
+    from .prior import ADMM, AUTO_SCALE, _setup, choose_weight
+    po = dict(cfg.joint_prior_options or {})
+    cvo = dict(po.pop("cv_options", None) or {})
+    cvo.setdefault("calib", int(np.max(cfg.calib)))
+    sc, grid = po.pop("scale", AUTO_SCALE), po.pop("grid", None)
+    solver_kw = {k: po[k] for k in ("ratio", "rho", "lam", "levels", "wave") if k in po}
+    out = []
+    for si in range(y.shape[0]):
+        ys, Cs, ms = y[si].cpu().numpy(), C0[si].cpu().numpy(), (M[si, 0] > 0).cpu().numpy()
+        if isinstance(cfg.joint_prior_weight, str):
+            w, inf = choose_weight(ys, Cs, ms, cfg.joint_prior, grid=grid, device=str(dev), scale=sc, **cvo, **po)
+        else:
+            w, inf = float(cfg.joint_prior_weight), {"method": "manual"}
+        s_ = _setup(ys, Cs, ms, str(dev))[-1]
+        out.append((ADMM(ms.shape, [w], cfg.joint_prior, fill=float(ms.mean()), device=dev, **solver_kw), s_, w, inf))
+        log(f"joint full-res: image prior {cfg.joint_prior}, weight {w:.3g}"
+            + (f" ({inf.get('rule')}, chosen with the calibration maps)" if "rule" in inf else ""))
+    return out
+
+
+def _joint_prior_image(jp, x, C, y, M, iters):
+    """``iters`` warm-started ADMM iterations per slice (persistent splits / duals), data-scaled units."""
+    xs = []
+    for si, (solver, s_, _, _) in enumerate(jp):
+        xs.append(solver.run(x[si:si + 1] / s_, C[si], M[si, 0], y[si] / s_, iters, 3)[0] * s_)
+    return torch.stack(xs)
 
 
 def _joint_chunk(cfg, model, n_coils, dev, n_points):
@@ -1277,6 +1334,15 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
                 log("joint from the start: the PINN is trained jointly with the full-resolution image")
             else:
                 m, history["pinn"] = fit_pinn(prob, cfg, model, m, log=log)
+        res0 = pinn._modules.get("resid")
+        if res0 is not None and cfg.resid_order_final > res0.order:
+            # continuation: the PINN stage fits the physics with a low-order factor; the finer, coil-specific
+            # structure (2-3 cm scale, README 8.10) is added for the polish and joint stages
+            pinn.resid = res0.grown(cfg.resid_order_final, cfg.resid_k0, cfg.resid_sobolev)
+            if cfg.lambda_resid_final:
+                cfg = copy.copy(cfg); cfg.lambda_resid = cfg.lambda_resid_final
+            log(f"smooth factor: order {res0.order} -> {cfg.resid_order_final} "
+                f"(weight (1+|k|^2/{cfg.resid_k0:g}^2)^{cfg.resid_sobolev:g}, ridge {cfg.lambda_resid:g})")
         if (cfg.iters_polish > 0 or cfg.optimizer == "adam+lbfgs") and not (cfg.joint_full and cfg.joint_start == "wires"):
             if cfg.iters_polish <= 0:
                 cfg = copy.copy(cfg); cfg.iters_polish = 200
@@ -1299,4 +1365,5 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
         m = m.detach().cpu()
     return model, prob, history, {"wires": wires, "handedness": h, "image_lowres": m,
                                   "image_full": None if image_full is None else image_full.cpu(),
-                                  "joint_lambda": getattr(prob, "_joint_lambda", None)}
+                                  "joint_lambda": getattr(prob, "_joint_lambda", None),
+                                  "joint_prior": getattr(prob, "_joint_prior", None)}
