@@ -1213,6 +1213,36 @@ NRMSE with common support; wins = slices where the method beats `pinn_api` (leav
   four high-SNR slices (9–18 × vs 3.8–6.3 ×). This does not show at R4/R8, but it is where the model is still
   too restricted.
 
+### 8.7 Image prior: zero-shot self-supervised reconstruction (ZS-SSL)
+
+The error budget of v42 (README §8.6 slices k19870, val_outlier and the self-consistency case) puts the
+remaining R = 4 image error in the reconstruction, not in the maps: CG-SENSE with PINN vs NLINV maps differs
+by ~1 % NRMSE, and even exact maps leave 0.03-0.05 noise-free NRMSE (Tikhonov bias + g-factor noise).
+`scripts/zs_ssl.py` replaces the Tikhonov prior by ZS-SSL (Yaman et al., ICLR 2022,
+https://arxiv.org/abs/2102.07737): an unrolled network (ResNet denoiser, 15 blocks x 64 channels, CG data
+consistency, 10 unrolls, shared weights) trained per scan on its own acquired samples only. Omega is split
+into Gamma (20 %, early stopping) and K = 50 Theta / Lambda splits (rho = 0.4, Gaussian selection, centre
+kept); loss: normalised l1-l2 on the Lambda k-space. The maps are any estimator's, by default read from the
+cache of an `evaluate_methods.py --joint` run, so the slices, masks and maps are those of §8.6. Optional
+`--pretrain-n N`: self-supervised (SSDU) pretraining on N other items of the dataset, then zero-shot
+fine-tuning per slice (ZS-SSL-TL). Fully sampled data is only used to score.
+
+```
+# 3 slices first, to time it (~0.3-0.5 s per step on a recent GPU at 320x368x15, 50 steps per epoch)
+python scripts/zs_ssl.py --loader dataloader_v2:get_dataloader --base-folder ... --n 20 --indices <3 of them> \
+    --R 4 --maps pinn_api nlinv --maps-cache runs/eval_joint --device cuda --amp --out runs/zs_ssl
+# all 20 (resume-safe), then: pretraining + short fine-tuning
+python scripts/zs_ssl.py ... --n 20 --maps pinn_api nlinv --maps-cache runs/eval_joint --device cuda --amp --out runs/zs_ssl
+python scripts/zs_ssl.py ... --n 20 --maps pinn_api --maps-cache runs/eval_joint --pretrain-n 200 \
+    --pretrain-steps 20000 --finetune-epochs 10 --device cuda --amp --out runs/zs_ssl_tl
+```
+
+Reported per (slice, maps): `cg_auto` (CG-SENSE, automatic lambda, same maps), `zs`, and with pretraining
+`tl0` (pretrained network, no fine-tuning); NRMSE / SSIM / PSNR vs the fully sampled RSS inside the object.
+The reference is noisy, so a denoising reconstruction is slightly penalised on low-SNR slices. CPU check
+(synth8_noisehi, tiny network: 4 unrolls, 4 blocks x 24 channels, 40 epochs): SSIM 0.689 -> 0.784,
+PSNR 25.1 -> 26.3 dB against CG-SENSE with the same (true) maps.
+
 ## 9. Code map
 
 | file | content |

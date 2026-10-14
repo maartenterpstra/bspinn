@@ -1168,3 +1168,40 @@ def test_true_joint_fit_options():
         err = float((1 - np.abs((Cn.conj() * Gn).sum(0)) ** 2)[obj[0] > 0].mean())
         assert info["image_solved_jointly"] and info["sense_lambda"]["method"] == "cv+map", ov
         assert np.isfinite(img).all() and err < 2e-3, (ov, err)
+
+
+def test_zs_ssl_script(tmp_path, monkeypatch):
+    """scripts/zs_ssl.py: pretraining on other dataset items (disjoint from the evaluation item), zero-shot
+    fine-tuning, CG-SENSE baseline, resume-safe results (tiny network, CPU)."""
+    import importlib.util
+    import json
+    import os
+    import sys
+    mod = tmp_path / "fake_ds_zs.py"
+    mod.write_text(
+        "import numpy as np\n"
+        "from bspinn.data import make_synthetic\n"
+        "class DS:\n"
+        "    def __len__(self): return 4\n"
+        "    def __getitem__(self, i):\n"
+        "        d, C, o = make_synthetic(4, (64, 64), noise=0.0, seed=i)\n"
+        "        r = np.random.default_rng(i)\n"
+        "        return {'kspace': d.kspace[0] + (r.normal(size=d.kspace[0].shape) + 1j * r.normal(size=d.kspace[0].shape)) * 0.01}\n"
+        "def get(base=None): return DS()\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    spec = importlib.util.spec_from_file_location("zs", os.path.join(os.path.dirname(__file__), "..", "scripts", "zs_ssl.py"))
+    zs = importlib.util.module_from_spec(spec); spec.loader.exec_module(zs)
+    m = np.zeros((32, 32), bool); m[:, ::2] = True
+    lam = zs.select(m, 0.4, np.random.default_rng(0))
+    assert lam.sum() == round(0.4 * m.sum()) and not (lam & ~m).any() and not lam[14:18, 14:18].any()
+    out = tmp_path / "zs"
+    argv = ["x", "--loader", "fake_ds_zs:get", "--indices", "1", "--acs", "16", "--maps", "lowres", "--device", "cpu",
+            "--unrolls", "1", "--cg-iters", "2", "--blocks", "1", "--ch", "4", "--splits", "2", "--epochs", "1",
+            "--pretrain-n", "2", "--pretrain-steps", "2", "--out", str(out)]
+    monkeypatch.setattr(sys, "argv", argv)
+    zs.main()
+    rows = [json.loads(l) for l in open(out / "results.jsonl")]
+    assert {r["method"] for r in rows} == {"cg_auto", "tl0", "zs"} and all(r["case"] == "item1_j4" for r in rows)
+    assert all(np.isfinite(r["nrmse"]) for r in rows) and (out / "pretrained_lowres.pt").exists()
+    zs.main()                                   # resume: nothing recomputed
+    assert len(open(out / "results.jsonl").read().splitlines()) == 3
