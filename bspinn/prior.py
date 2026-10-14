@@ -170,14 +170,17 @@ def _setup(ksp, C, mask, device):
     return C, m, Ct, mt, yt / s, x0 / s, s
 
 
-AUTO_SCALE = 0.5      # the CV folds withhold 10 % of the lines, a harder problem that wants more regularisation
+AUTO_SCALE = 0.35     # the CV folds withhold 10 % of the lines, a harder problem that wants more regularisation;
+#                       v47: 0.35 centres the chosen weight on the oracle (median 0.92-0.96 x on two 20-slice runs)
+#                       at the same NRMSE as 0.5 (which chose 1.3 x the oracle: visibly over-smoothed)
 FALLBACK_WEIGHT = 2e-3  # used when the CV curve has no interior minimum
-FLAT_CV = 0.01        # CV error range below which the curve is uninformative (noise-dominated slice)
+FLAT_CV = 0.04        # CV error range below which the curve is uninformative (noise-dominated slice); v47: 0.01
+#                       missed a 2-4 % plateau (held-out worst case 1.97 -> 1.24 x the oracle NRMSE)
 
 
 def select_weight(grid, err, scale=AUTO_SCALE, fallback=FALLBACK_WEIGHT, flat=FLAT_CV, refine=True):
-    """Weight from a CV error curve over ``grid`` (v46 rule, calibrated on 20 dataloader slices x 2 map sets x
-    R = 4, 6; README 8.9):
+    """Weight from a CV error curve over ``grid`` (rule of v46, constants of v47; calibrated on two disjoint
+    sets of 20 dataloader slices x 2 map sets x R = 4, 6; README 8.9):
       flat      max/min error < 1 + flat: held-out k-space is noise-dominated, the data cannot tell -> the
                 largest grid weight;
       interior  the lowest interior local minimum, refined by a parabola in log weight, times ``scale``;

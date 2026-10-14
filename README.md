@@ -1265,8 +1265,8 @@ x = argmin 1/2 ||M F C x - y||^2 + beta TV(x) + ratio beta ||W x||_1, by ADMM (w
 closed-form shrinkage), batched over a grid of weights. The weight is chosen like the SENSE lambda, by
 k-space cross-validation on withheld phase-encode lines (`senselam.cv_masks`, scale-invariant held-out
 error) and `prior.select_weight` (v46, calibrated on the 20-slice GPU run below):
-* flat CV curve (max / min < 1.01): held-out k-space is noise-dominated, the largest grid weight;
-* otherwise the lowest INTERIOR local minimum, refined by a parabola in log weight, x `AUTO_SCALE` = 0.5
+* flat CV curve (max / min < 1.04, `FLAT_CV`): held-out k-space is noise-dominated, the largest grid weight;
+* otherwise the lowest INTERIOR local minimum, refined by a parabola in log weight, x `AUTO_SCALE` = 0.35
   (the folds withhold 10 % of the lines, a harder problem that wants more regularisation); minima at the
   grid edges are ignored: the lowest-weight edge was a spurious global minimum in 20 % of the cases
   (1.2-3x the oracle NRMSE with the plain argmin);
@@ -1302,8 +1302,15 @@ worst slice; and NRMSE / oracle-weight NRMSE over all 20 (v45 argmin x 0.5 rule 
 | 6, NLINV | 0.1323 | **0.0943** (x0.75, +2.5 dB, 95 %, x1.14) | 0.1181 (x0.91) | 0.0988 (x0.79, 95 %) | |
 
 TV is the recommended prior (best or tied everywhere, the most robust weight selection); wavelets alone
-gain least. The tuning (scale, fallback, flat threshold) used these 20 slices: confirm on another pick
-(`--pick-seed 31415`). The Tikhonov failure on item40813 (very low SNR: noise estimate >= ~ all the
+gain least.
+
+Held-out check (v46 rule, a disjoint pick, `--pick-seed 31415`, 19 slices): TV beats Tikhonov on 100 % (R = 4)
+and 89-95 % (R = 6) of the slices; median NRMSE 0.1029 -> 0.0720 (R = 4, PINN maps), 0.1347 -> 0.0934 (R = 6).
+Two corrections from both runs together (v47): `FLAT_CV` 0.01 -> 0.04 (a 2-4 % CV plateau on a noise-dominated
+slice gave 1.97 x the oracle NRMSE; now 1.24 x), `AUTO_SCALE` 0.5 -> 0.35 (same median NRMSE, 1.006 x the
+oracle, but the weight centred on the oracle, 0.92-0.96 x, instead of 1.3 x, which looked over-smoothed).
+For a less smoothed look than the NRMSE optimum: `image_prior_options={"scale": 0.2}` or a fixed
+`image_prior_weight`. The Tikhonov failure on item40813 (very low SNR: noise estimate >= ~ all the
 energy, Wiener value 113 overriding the cross-validation) is fixed in v46: `sense_lambda='auto'` drops the
 Wiener floor when its signal estimate collapses (`info['sense_lambda']['map_unreliable']`).
 
