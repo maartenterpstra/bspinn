@@ -1346,3 +1346,19 @@ def test_prior_weight_rule_and_wiener_guard():
     k = (rng.normal(size=(N, H, W)) + 1j * rng.normal(size=(N, H, W))) / np.sqrt(2) * m[None]   # noise only
     lam, info = choose_sense_lambda(k, C, m, noise_var=1.0, method="cv+map", calib=12)
     assert info.get("map_unreliable") and lam <= 1.0
+
+
+def test_low_snr_slice_support_fallback():
+    """A slice whose signal never clears 3x the noise RSS (the low-SNR dataloader items) still fits:
+    the object support falls back instead of being empty (plane search, wire initialisation)."""
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    d, _, _ = make_synthetic(4, (48, 48), noise=0.0, seed=0)
+    k = d.kspace[0]
+    rng = np.random.default_rng(0)
+    k = k / np.abs(k).max() * 0.5 + (rng.normal(size=k.shape) + 1j * rng.normal(size=k.shape)) / np.sqrt(2)
+    m = cartesian_mask((48, 48), R=3, acs=12, pattern="vd", seed=1)
+    C, info = estimate_maps(k * m[None], "2d", mask=m, calib=12, verbose=False, iters_auto=2, iters_wires=3,
+                            iters_pinn=3)
+    assert np.isfinite(C).all() and C.shape == (4, 48, 48)

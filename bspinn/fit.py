@@ -374,10 +374,18 @@ class Problem:
 
     def object_support(self, rss):
         """Object mask: RSS above both a fraction of its 99th percentile and ~3x the expected noise RSS."""
-        thr = self.cfg.support_thresh * float(torch.quantile(rss.flatten(), 0.99))
-        thr = max(thr, 3.0 * self.noise_sigma * np.sqrt(self.I.shape[1]))
+        thr_rel = self.cfg.support_thresh * float(torch.quantile(rss.flatten(), 0.99))
+        thr = max(thr_rel, 3.0 * self.noise_sigma * np.sqrt(self.I.shape[1]))
         from .keepout import clean_support
-        return torch.from_numpy(clean_support((rss > thr).cpu().numpy(), per_slice=True)).float()
+        r = rss.cpu().numpy()
+        m = clean_support(r > thr, per_slice=True)
+        if not m.any():          # very low SNR: nothing clears 3x the noise RSS -> the relative threshold alone
+            m = clean_support(r > thr_rel, per_slice=True)
+            self.support_note = "low SNR: support from the relative threshold only"
+        if not m.any():          # still empty (tiny / fragmented object): the brightest 10 % of the pixels
+            m = r >= np.quantile(r, 0.9)
+            self.support_note = "low SNR: support = brightest 10 % of the calibration image"
+        return torch.from_numpy(np.ascontiguousarray(m)).float()
 
     # ---------------------------------------------------------------- device
     _tensors = ("ks_full", "yk", "mk", "I", "support", "coords", "support_pts", "weights", "coil_images",
@@ -1228,6 +1236,8 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
             f"{'physical coils + known mixing' if prob.mix is not None else 'virtual channels directly'}")
     log(f"data: {prob.S} slice(s), {prob.N} coils, calib {prob.calib}, data term '{prob.data_term}', "
         f"{prob.support_pts.shape[0]} support points, device {cfg.device}")
+    if getattr(prob, "support_note", None):
+        log(f"note: {prob.support_note}")
     history = {}
 
     if cfg.model == "free":

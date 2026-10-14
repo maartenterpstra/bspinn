@@ -99,7 +99,11 @@ def main():
                     C = np.load(os.path.join(a.maps_dir, f"{case0.name}.npy"))
                 else:
                     cdir = os.path.join(a.maps_cache, fit.name, "maps") if a.maps_cache else os.path.join(os.path.dirname(os.path.abspath(a.out)), "prior_maps", fit.name)
-                    C = bm.estimate(fit, [mname], cache_dir=cdir, log=print, **est_kw)[0][mname]
+                    try:
+                        C = bm.estimate(fit, [mname], cache_dir=cdir, log=print, **est_kw)[0][mname]
+                    except Exception as e:          # one bad slice must not stop a long run
+                        print(f"{fit.name} {mname}: maps failed ({type(e).__name__}: {e}); skipped", flush=True)
+                        continue
                 Cn = ev.normalise(C)
                 recs = []
 
