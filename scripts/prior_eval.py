@@ -124,7 +124,7 @@ def main():
                         rep = {}
                         x = prior_image(fit.ksp, Cn, fit.sampled, pr, "auto", device=a.device, report=rep, grid=grid,
                                         ratio=a.ratio, scale=AUTO_SCALE if a.scale is None else a.scale, **kw)
-                        extra = {"weight": rep["weight"], "weight_grid": rep["weight_grid"], "cv_error": rep["cv_error"],
+                        extra = {"weight": rep["weight"], "weight_grid": rep["weight_grid"], "cv_error": rep["cv_error"], "rule": rep.get("rule"),
                                  "at_grid_edge": rep["at_grid_edge"], "seconds": time.time() - t0}
                         if a.oracle:          # every grid weight against the reference
                             _, _, Ct, mt, yt, x0, s = _setup(fit.ksp, Cn, fit.sampled, a.device)

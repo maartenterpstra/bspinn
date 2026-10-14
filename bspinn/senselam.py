@@ -83,10 +83,11 @@ def lambda_map(ksp, C, m, sigma2):
     d = density(m)
     e_tot = float(((np.abs(ksp[:, m]) ** 2) / d[m][None]).sum())        # density-compensated energy
     n_ext = float(_extent(m).sum())
+    floor = e_tot - sigma2 * N * n_ext < 0.05 * e_tot      # (almost) no signal above the noise estimate
     e_sig = max(e_tot - sigma2 * N * n_ext, 1e-3 * e_tot)
     s2 = e_sig / m.size                                                  # per pixel (maps RSS-normalised)
     den = float((np.abs(C) ** 2).sum(0).mean())
-    return sigma2 / s2 / max(den, 1e-12), {"sigma2": sigma2, "signal_power": s2}
+    return sigma2 / s2 / max(den, 1e-12), {"sigma2": sigma2, "signal_power": s2, "map_signal_floor": bool(floor)}
 
 
 def _extent(m):
@@ -214,6 +215,11 @@ def choose_sense_lambda(ksp, C, mask=None, noise_var=None, method="cv", scale=1.
                                 calib=calib, seed=seed)
         info.update(grid=grid.tolist(), cv_error=err.tolist(), lam_cv=lam_cv)
         if method == "cv":
+            return lam_cv * scale, info
+        if mi.get("map_signal_floor") or lam_map > grid.max():
+            # the Wiener value is unreliable when the signal estimate collapses (noise estimate >= ~ all the
+            # energy; one of 20 real slices gave lam_map = 113, an empty image): cross-validation alone
+            info["map_unreliable"] = True
             return lam_cv * scale, info
         info["floor"] = "map" if lam_map > lam_cv else "cv"
         lam = max(lam_cv, lam_map)

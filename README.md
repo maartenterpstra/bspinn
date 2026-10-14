@@ -1264,8 +1264,13 @@ variation, orthonormal Daubechies wavelets (db4, 4 levels, coarsest band free) o
 x = argmin 1/2 ||M F C x - y||^2 + beta TV(x) + ratio beta ||W x||_1, by ADMM (warm-started CG image steps,
 closed-form shrinkage), batched over a grid of weights. The weight is chosen like the SENSE lambda, by
 k-space cross-validation on withheld phase-encode lines (`senselam.cv_masks`, scale-invariant held-out
-error), refined by a parabola in log weight, times `prior.AUTO_SCALE` = 0.5: the folds withhold 10 % of the
-lines, a harder problem that wants more regularisation (CV weight = 2.15 x the oracle in 5 of 6 cases below).
+error) and `prior.select_weight` (v46, calibrated on the 20-slice GPU run below):
+* flat CV curve (max / min < 1.01): held-out k-space is noise-dominated, the largest grid weight;
+* otherwise the lowest INTERIOR local minimum, refined by a parabola in log weight, x `AUTO_SCALE` = 0.5
+  (the folds withhold 10 % of the lines, a harder problem that wants more regularisation); minima at the
+  grid edges are ignored: the lowest-weight edge was a spurious global minimum in 20 % of the cases
+  (1.2-3x the oracle NRMSE with the plain argmin);
+* no interior minimum (6 of 240 cases): `FALLBACK_WEIGHT` = 2e-3.
 
 ```python
 C, img, info = estimate_maps(ksp, "2d", mask=mask, solve_image=True, image_prior="tv+wavelet")   # weight 'auto'
@@ -1282,7 +1287,27 @@ before the 0.5 scale; oracle = best weight of the grid):
 | k19870 (knee, 15 ch) | 0.0691 / 0.919 / 36.1 | 0.0546 / 0.952 / 38.1 | 0.0585 / 0.942 / 37.5 | **0.0527 / 0.954 / 38.4** | 0.0527 |
 
 About +2.3 to +3 dB over Tikhonov with the same maps, so the prior is worth far more than the remaining map
-differences (~1 % NRMSE, §8.6 error budget). On 20 slices with your GPU:
+differences (~1 % NRMSE, §8.6 error budget).
+
+GPU run, 20 dataloader slices (§8.6 picks), joint protocol, maps of runs/eval_joint (v40) and NLINV; the v46
+rule applied to the stored CV curves and every grid weight's true NRMSE (19 slices: item40813's automatic
+Tikhonov weight was 113 = an empty image, see below). Median NRMSE, ratio to Tikhonov, wins over Tikhonov,
+worst slice; and NRMSE / oracle-weight NRMSE over all 20 (v45 argmin x 0.5 rule -> v46):
+
+| R, maps | Tikhonov | TV | wavelet | TV + wavelet | TV vs oracle, worst (v45 -> v46) |
+|---|---|---|---|---|---|
+| 4, PINN | 0.1043 | **0.0773** (x0.78, +2.2 dB, 95 %, worst x1.04) | 0.0886 (x0.87) | 0.0767 (x0.78, 95 %) | 3.09 -> 1.06 |
+| 4, NLINV | 0.1067 | **0.0752** (x0.79, +2.1 dB, 89 %, x1.04) | 0.0855 (x0.88) | 0.0750 (x0.80, 89 %) | |
+| 6, PINN | 0.1334 | **0.0955** (x0.78, +2.2 dB, 95 %, x1.14) | 0.1183 (x0.92) | 0.0991 (x0.80, 95 %) | 3.12 -> 1.08 |
+| 6, NLINV | 0.1323 | **0.0943** (x0.75, +2.5 dB, 95 %, x1.14) | 0.1181 (x0.91) | 0.0988 (x0.79, 95 %) | |
+
+TV is the recommended prior (best or tied everywhere, the most robust weight selection); wavelets alone
+gain least. The tuning (scale, fallback, flat threshold) used these 20 slices: confirm on another pick
+(`--pick-seed 31415`). The Tikhonov failure on item40813 (very low SNR: noise estimate >= ~ all the
+energy, Wiener value 113 overriding the cross-validation) is fixed in v46: `sense_lambda='auto'` drops the
+Wiener floor when its signal estimate collapses (`info['sense_lambda']['map_unreliable']`).
+
+On 20 slices with your GPU:
 
 ```
 python scripts/prior_eval.py --loader dataloader_v2:get_dataloader --base-folder ... --n 20 --R 4 6 \

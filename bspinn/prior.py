@@ -170,10 +170,40 @@ def _setup(ksp, C, mask, device):
     return C, m, Ct, mt, yt / s, x0 / s, s
 
 
+AUTO_SCALE = 0.5      # the CV folds withhold 10 % of the lines, a harder problem that wants more regularisation
+FALLBACK_WEIGHT = 2e-3  # used when the CV curve has no interior minimum
+FLAT_CV = 0.01        # CV error range below which the curve is uninformative (noise-dominated slice)
+
+
+def select_weight(grid, err, scale=AUTO_SCALE, fallback=FALLBACK_WEIGHT, flat=FLAT_CV, refine=True):
+    """Weight from a CV error curve over ``grid`` (v46 rule, calibrated on 20 dataloader slices x 2 map sets x
+    R = 4, 6; README 8.9):
+      flat      max/min error < 1 + flat: held-out k-space is noise-dominated, the data cannot tell -> the
+                largest grid weight;
+      interior  the lowest interior local minimum, refined by a parabola in log weight, times ``scale``;
+                minima at the grid edges are ignored (the lowest-weight edge was a spurious global minimum
+                in 20 % of the cases, at 1.2-3x the oracle NRMSE);
+      fallback  no interior minimum -> ``fallback``.
+    Returns (weight, rule)."""
+    grid = np.asarray(grid, float); e = np.asarray(err, float) / max(float(np.min(err)), 1e-30)
+    if e.max() < 1 + flat:
+        return float(grid[-1]), "flat"
+    mins = [i for i in range(1, len(e) - 1) if e[i] <= e[i - 1] and e[i] <= e[i + 1]]
+    if not mins:
+        return float(fallback), "fallback"
+    i = min(mins, key=lambda j: e[j])
+    w = float(grid[i])
+    if refine:
+        lx = np.log(grid[i - 1:i + 2])
+        c2, c1, _ = np.polyfit(lx, e[i - 1:i + 2], 2)
+        if c2 > 0:
+            w = float(np.exp(np.clip(-c1 / (2 * c2), lx[0], lx[2])))
+    return w * scale, "interior"
+
+
 def choose_weight(ksp, C, mask, prior="tv", grid=None, device="cpu", holdout=0.1, folds=2, calib=24, seed=0,
-                  refine=True, **kw):
-    """k-space cross-validation over ``grid`` (relative weights; ``refine``: parabolic interpolation of the
-    error in log weight between grid points): (best weight, info)."""
+                  scale=AUTO_SCALE, fallback=FALLBACK_WEIGHT, flat=FLAT_CV, refine=True, **kw):
+    """k-space cross-validation over ``grid`` (relative weights), weight by ``select_weight``: (weight, info)."""
     grid = np.asarray(grid if grid is not None else np.logspace(-4, -1, 10))
     C, m, Ct, mt, yt, x0, s = _setup(ksp, C, mask, device)
     err = np.zeros(len(grid))
@@ -183,29 +213,21 @@ def choose_weight(ksp, C, mask, prior="tv", grid=None, device="cpu", holdout=0.1
             X = admm(yt * trt, Ct, trt, torch.tensor(grid, dtype=torch.float32, device=device), prior, x0=x0, **kw)
         err += heldout_error(X.cpu().numpy(), C, np.asarray(ksp) / s, ho)
     i = int(np.argmin(err))
-    w = float(grid[i])
-    if refine and 0 < i < len(grid) - 1:         # parabola through the minimum and its neighbours (log weight)
-        lx = np.log(grid[i - 1:i + 2]); e = err[i - 1:i + 2]
-        c2, c1, _ = np.polyfit(lx, e, 2)
-        if c2 > 0:
-            w = float(np.exp(np.clip(-c1 / (2 * c2), lx[0], lx[2])))
+    w, rule = select_weight(grid, err, scale, fallback, flat, refine)
     return w, {"grid": grid.tolist(), "cv_error": err.tolist(), "weight_grid": float(grid[i]), "weight": w,
-               "at_grid_edge": i in (0, len(grid) - 1)}
-
-
-AUTO_SCALE = 0.5   # the CV folds withhold 10 % of the lines, a harder problem that wants more regularisation:
-#                    on k19870 / val_cc (R = 4) the CV weight was 2.15x the oracle in 5 of 6 (slice, prior) pairs
+               "rule": rule, "scale": scale, "at_grid_edge": i in (0, len(grid) - 1)}
 
 
 def prior_image(ksp, C, mask, prior="tv", weight="auto", device="cpu", report=None, grid=None, cv_options=None,
                 scale=AUTO_SCALE, **kw):
-    """Image with a sparsity prior; ``weight`` a number (relative) or 'auto' (k-space cross-validation, times
-    ``scale``, default AUTO_SCALE). kw: ratio, iters, cg_iters, rho, lam, levels, wave (see admm)."""
+    """Image with a sparsity prior; ``weight`` a number (relative) or 'auto' (k-space cross-validation and
+    ``select_weight``; ``scale`` multiplies a CV-selected interior minimum). kw: ratio, iters, cg_iters, rho,
+    lam, levels, wave (see admm). ``cv_options``: holdout, folds, calib, seed, fallback, flat, refine."""
     if isinstance(weight, str):
-        weight, info = choose_weight(ksp, C, mask, prior, grid=grid, device=device, **(cv_options or {}), **kw)
-        weight = weight * scale
+        weight, info = choose_weight(ksp, C, mask, prior, grid=grid, device=device, scale=scale,
+                                     **(cv_options or {}), **kw)
         if report is not None:
-            report.update(info, method="cv", scale=scale, weight=weight)
+            report.update(info, method="cv")
     elif report is not None:
         report.update(method="manual", weight=float(weight))
     _, _, Ct, mt, yt, x0, s = _setup(ksp, C, mask, device)

@@ -1327,3 +1327,22 @@ def test_estimate_maps_image_prior():
     assert img.shape == (48, 48) and np.isfinite(img).all() and info["image_prior"]["method"] == "manual"
     C, img, info = estimate_maps(k, "2d", mask=m, solve_image=True, image_prior="tv", image_prior_weight=1e-2, **few)
     assert not info["image_solved_jointly"] and info["image_tikhonov_joint"].shape == (48, 48)
+
+
+def test_prior_weight_rule_and_wiener_guard():
+    """select_weight: spurious lowest-weight minimum ignored, flat curve -> strongest, no interior minimum ->
+    fallback; the Wiener floor of sense_lambda='auto' is dropped when its signal estimate collapses."""
+    from bspinn.prior import FALLBACK_WEIGHT, select_weight
+    from bspinn.senselam import choose_sense_lambda
+    g = np.logspace(-4, -1, 10)
+    w, rule = select_weight(g, [1.0, 1.05, 1.16, 1.15, 1.10, 1.07, 1.08, 1.13, 1.27, 1.56])   # item1066_j6 (tv)
+    assert rule == "interior" and 2e-3 < w < 4e-3
+    assert select_weight(g, [1.0, 1.0, 1.001, 1.003, 1.006, 1.008, 1.008, 1.008, 1.008, 1.007]) == (0.1, "flat")
+    assert select_weight(g, [1.0, 1.11, 1.4, 1.8, 2.0, 2.1, 2.3, 2.6, 2.9, 3.4]) == (FALLBACK_WEIGHT, "fallback")
+    rng = np.random.default_rng(0)
+    N, H, W = 4, 48, 48
+    C = np.ones((N, H, W), complex) / 2
+    m = np.zeros((H, W), bool); m[:, ::3] = True; m[:, 18:30] = True
+    k = (rng.normal(size=(N, H, W)) + 1j * rng.normal(size=(N, H, W))) / np.sqrt(2) * m[None]   # noise only
+    lam, info = choose_sense_lambda(k, C, m, noise_var=1.0, method="cv+map", calib=12)
+    assert info.get("map_unreliable") and lam <= 1.0
