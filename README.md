@@ -1257,6 +1257,39 @@ masks) pick `best.pt`. Training resumes from `last.pt`. `--eval` scores CG-SENSE
 optionally per-slice ZS-SSL fine-tuning, `--zs-epochs 0 10`) at `--eval-R` with `--eval-maps` (PINN / NLINV
 maps from the `evaluate_methods.py --joint` cache).
 
+### 8.9 Image priors with the estimated maps: TV, wavelets, a trained network
+
+`bspinn/prior.py` replaces the Tikhonov term of the image reconstruction (maps fixed) by isotropic total
+variation, orthonormal Daubechies wavelets (db4, 4 levels, coarsest band free) or both:
+x = argmin 1/2 ||M F C x - y||^2 + beta TV(x) + ratio beta ||W x||_1, by ADMM (warm-started CG image steps,
+closed-form shrinkage), batched over a grid of weights. The weight is chosen like the SENSE lambda, by
+k-space cross-validation on withheld phase-encode lines (`senselam.cv_masks`, scale-invariant held-out
+error), refined by a parabola in log weight, times `prior.AUTO_SCALE` = 0.5: the folds withhold 10 % of the
+lines, a harder problem that wants more regularisation (CV weight = 2.15 x the oracle in 5 of 6 cases below).
+
+```python
+C, img, info = estimate_maps(ksp, "2d", mask=mask, solve_image=True, image_prior="tv+wavelet")   # weight 'auto'
+img = sense_image(ksp, C, "2d", mask=mask, prior="tv", prior_weight="auto")
+img = sense_image(ksp, C, "2d", mask=mask, prior="net:runs/recon/best.pt")    # network of §8.8 as the prior
+```
+
+Local check (CPU; joint protocol R = 4, NLINV maps of the joint fit, vs the fully sampled RSS; weight by CV
+before the 0.5 scale; oracle = best weight of the grid):
+
+| slice | Tikhonov (auto) | TV | wavelet | TV + wavelet | TV + wavelet at the oracle weight |
+|---|---|---|---|---|---|
+| val_cc (CC brain, 12 ch) NRMSE / SSIM / PSNR | 0.1087 / 0.860 / 29.4 | 0.0794 / 0.911 / 32.1 | 0.0857 / 0.899 / 31.4 | **0.0769 / 0.915 / 32.4** | 0.0740 |
+| k19870 (knee, 15 ch) | 0.0691 / 0.919 / 36.1 | 0.0546 / 0.952 / 38.1 | 0.0585 / 0.942 / 37.5 | **0.0527 / 0.954 / 38.4** | 0.0527 |
+
+About +2.3 to +3 dB over Tikhonov with the same maps, so the prior is worth far more than the remaining map
+differences (~1 % NRMSE, §8.6 error budget). On 20 slices with your GPU:
+
+```
+python scripts/prior_eval.py --loader dataloader_v2:get_dataloader --base-folder ... --n 20 --R 4 6 \
+    --maps pinn_api nlinv --maps-cache runs/eval_joint --oracle --device cuda --out runs/prior_eval.jsonl
+# + --net runs/recon/best.pt to add the trained network (§8.8) with the same maps
+```
+
 ## 9. Code map
 
 | file | content |
@@ -1270,6 +1303,8 @@ maps from the `evaluate_methods.py --joint` cache).
 | `encoding.py` | Cartesian masked FFT and exact separable NUDFT operators |
 | `volume.py` | 3-D encoded data: geometry, `Problem3D`, coarse-grid PINN correction, orientation selection, `fit3d`, synthetic volumes |
 | `methods.py` | estimator registry for the comparison (low-res, Walsh, Inati, ESPIRiT, NLINV, Biot–Savart variants) |
+| `prior.py` | sparsity priors (TV, db4 wavelets) for the image with fixed maps: batched ADMM, weight by k-space CV |
+| `unrolled.py` | unrolled reconstruction network (ResNet + CG data consistency) of scripts/zs_ssl.py / train_recon.py; `load_network` |
 | `evaluation.py` | comparison metrics: combine→expand k-space residual vs noise floor, reference image, SENSE at R, g-factor, map errors |
 | `refree.py` | reference-free metrics from k-space only: leave-coil-out prediction, residual structure, projector bandwidth, recorrupted-to-recorrupted, Monte-Carlo SURE |
 | `recon.py` | CG-SENSE, low-res division baseline, projection residual, ground-truth metrics; phase-vortex counter |

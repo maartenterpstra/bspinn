@@ -32,7 +32,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   calib=None, noise=None, physics="laplace", b0_tesla=3.0, model="pinn", rank=2,
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda="auto", sense_lambda_scale=1.0, sense_lambda_options=None, sense_iters=60, mask_maps=False, support_threshold=0.1,
-                  support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout", **cfg_overrides):
+                  support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout",
+                  image_prior=None, image_prior_weight="auto", image_prior_options=None, **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
     Parameters
@@ -90,6 +91,12 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         iters_pinn + iters_joint iterations); ``joint_image='gradient'`` makes the image a parameter of the
         same optimiser as the maps (simultaneous steps, Adam or L-BFGS) instead of an exact CG-SENSE solve
         after every map step (default 'cg').
+    image_prior, image_prior_weight, image_prior_options : the returned image with a sparsity prior instead
+        of Tikhonov (2-D): 'tv' | 'wavelet' | 'tv+wavelet' (weight 'auto' = k-space cross-validation, or a
+        relative number), or 'net:<weights.pt>' (a network from scripts/train_recon.py / zs_ssl.py); see
+        sense_image. With ``solve_image`` the maps are still fitted jointly (Tikhonov image inside the fit,
+        kept in ``info['image_tikhonov_joint']``) and the returned image is recomputed with the prior.
+        The weight and the cross-validation curve are in ``info['image_prior']``.
     mask_maps : False (default; maps cover the whole FOV) | True (zero the maps, and the images, outside
         the estimated object support ``info['support']``, as ESPIRiT's cropped maps; CG-SENSE is then
         support-constrained) | a bool array of the spatial shape (your own support; also used for the
@@ -281,7 +288,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     C = C.astype(np.complex64)
     if not return_image:
         return C, info
-    if x_solved is not None and (not isinstance(sense_lambda, str) or layout == "2d"):
+    if x_solved is not None and image_prior is not None:      # maps jointly; the returned image with the prior
+        info["image_solved_jointly"] = False
+        info["image_tikhonov_joint"] = x_solved
+    elif x_solved is not None and (not isinstance(sense_lambda, str) or layout == "2d"):
         info["image_solved_jointly"] = True
         if info.get("joint_lambda") is not None:
             info["sense_lambda"] = info["joint_lambda"]
@@ -291,8 +301,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     lam_rep = {}
     with accel.phase("sense_image", device):
         img = sense_image(ksp, C, layout, mask=mask, noise=noise, lam=sense_lambda, iters=sense_iters, device=device,
-                          lam_scale=sense_lambda_scale, report=lam_rep, lam_options=sense_lambda_options)
-    info["sense_lambda"] = lam_rep
+                          lam_scale=sense_lambda_scale, report=lam_rep, lam_options=sense_lambda_options,
+                          prior=image_prior, prior_weight=image_prior_weight, prior_options=image_prior_options)
+    info["image_prior" if image_prior is not None else "sense_lambda"] = lam_rep
     info["timings"] = dict(accel.TIMES)
     info["seconds"] = time.time() - t0
     return C, img, info
@@ -823,7 +834,8 @@ def _sense_torch(ksp, C, m, box, lam, iters, device):
 
 
 def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=60, coil_axis=0, extrapolate=False,
-                device="cpu", lam_scale=1.0, report=None, lam_options=None):
+                device="cpu", lam_scale=1.0, report=None, lam_options=None, prior=None, prior_weight="auto",
+                prior_options=None):
     """Full-resolution image from k-space and maps: argmin ||M F (C x) - y||^2 + lam' ||x||^2 with
     noise pre-whitening (if ``noise`` is given) applied to data and maps alike (``lam`` relative to the
     mean of sum_j |C_j|^2). Dynamic: frame by frame.
@@ -835,7 +847,14 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
     If everything inside the extent is acquired, this is the closed-form SENSE-1 combination of the
     zero-filled data. ``extrapolate=True`` restores CG over the whole k-space grid.
     ``lam`` may be 'auto' / 'auto-gcv' / 'auto-map' / 'auto-discrepancy' (bspinn.senselam, times
-    ``lam_scale``); the chosen value and the rules' diagnostics go into the dict ``report``."""
+    ``lam_scale``); the chosen value and the rules' diagnostics go into the dict ``report``.
+
+    ``prior`` replaces the Tikhonov term (2-D): 'tv' (total variation), 'wavelet' (orthonormal db4,
+    coarsest band free), 'tv+wavelet' (bspinn.prior; ADMM), with ``prior_weight`` a relative number or
+    'auto' (k-space cross-validation on withheld phase-encode lines, as for lam; the choice and the CV curve
+    go into ``report``); or 'net:<weights.pt>' for a network trained by scripts/train_recon.py or
+    scripts/zs_ssl.py (bspinn.unrolled). ``prior_options``: ratio (wavelet / TV weight), iters, cg_iters,
+    rho, levels, wave, grid, cv_options (holdout, folds, calib, seed); for 'net:' architecture overrides."""
     ksp = np.moveaxis(np.asarray(ksp), coil_axis, 0).astype(np.complex64)
     C = np.moveaxis(np.asarray(maps), coil_axis, 0).astype(np.complex64)
     if noise is not None:
@@ -847,7 +866,8 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         ms = [None if mask is None else mask[..., t] for t in range(ksp.shape[-1])]
         reps = [{} for _ in range(ksp.shape[-1])]
         out = np.stack([sense_image(ksp[..., t], C[..., t], "2d", ms[t], None, lam, iters, extrapolate=extrapolate,
-                                    device=device, lam_scale=lam_scale, report=reps[t], lam_options=lam_options)
+                                    device=device, lam_scale=lam_scale, report=reps[t], lam_options=lam_options,
+                                    prior=prior, prior_weight=prior_weight, prior_options=prior_options)
                         for t in range(ksp.shape[-1])], -1)
         if report is not None:
             report["frames"] = reps
@@ -858,6 +878,22 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
     box = np.ones(m.shape, bool) if extrapolate else acquired_extent(m)
     if (m | ~box).all():
         return ((C.conj() * _cfft(ksp * m[None], ax, True)).sum(0) / np.maximum(den, 1e-12)).astype(np.complex64)
+    if prior is not None:
+        if ksp.ndim != 3:
+            raise ValueError("prior= is implemented for 2-D images")
+        po = dict(prior_options or {})
+        if str(prior).startswith("net:"):
+            from .unrolled import load_network, reconstruct
+            net = load_network(str(prior)[4:], device, **po)
+            x = reconstruct(net, ksp, C, m, device)
+            if report is not None:
+                report.update(method="net", weights=str(prior)[4:])
+        else:
+            from .prior import prior_image
+            x = prior_image(ksp, C, m, prior, prior_weight, device=device, report=report, **po)
+        if not box.all():                    # as the CG path: nothing estimated outside the acquired extent
+            x = _cfft(_cfft(x, (0, 1)) * box, (0, 1), True)
+        return x.astype(np.complex64)
     if isinstance(lam, str):
         from .senselam import choose_sense_lambda
         method = {"auto": "cv+map"}.get(lam, lam.replace("auto-", ""))

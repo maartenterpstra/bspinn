@@ -137,15 +137,15 @@ def grid_solutions(ksp, C, m, lams, device="cpu", iters=60):
     return cg(lt, b, iters).cpu().numpy()
 
 
-def lambda_cv(ksp, C, m, grid, device="cpu", iters=60, holdout=0.1, folds=2, calib=24, seed=0):
-    """k-space cross-validation (see module docstring): (best lam, prediction errors per lam)."""
+def cv_masks(m, holdout=0.1, folds=2, calib=24, seed=0):
+    """Hold-out folds for k-space cross-validation: [(train mask, held-out mask)]. Cartesian line sampling
+    (2-D: every acquired line fully sampled along the readout): whole phase-encode lines outside the
+    calibration region are withheld, so the reconstruction must unfold them as it unfolds the missing lines
+    (withheld single points would be interpolated along the readout and hide the aliasing); otherwise points."""
     sp = m.shape
     box = np.zeros(sp, bool)
     box[tuple(slice(n // 2 - calib // 2, n // 2 - calib // 2 + calib) for n in sp)] = True
     rng = np.random.default_rng(seed)
-    # Cartesian line sampling (2-D: every acquired line fully sampled along the readout): withhold whole
-    # phase-encode lines, so the reconstruction must unfold them as it unfolds the missing lines (withheld
-    # single points would be interpolated along the readout and hide the aliasing); otherwise points.
     ro = [a for a in range(m.ndim) if m.ndim == 2 and bool((m == m.any(axis=a, keepdims=True)).all()) and not m.all()]
     if ro:
         pe = 1 - ro[0]
@@ -156,7 +156,7 @@ def lambda_cv(ksp, C, m, grid, device="cpu", iters=60, holdout=0.1, folds=2, cal
         units = np.flatnonzero(m & ~box)
     rng.shuffle(units)
     nho = max(1, int(holdout * units.size))
-    err = np.zeros(len(grid))
+    out = []
     for f in range(folds):
         sel = units[(f * nho) % max(units.size, 1): (f * nho) % max(units.size, 1) + nho]
         if sel.size == 0:
@@ -166,16 +166,28 @@ def lambda_cv(ksp, C, m, grid, device="cpu", iters=60, holdout=0.1, folds=2, cal
             ho = m & (hl[None, :] if pe == 1 else hl[:, None])
         else:
             ho = np.zeros(m.size, bool); ho[sel] = True; ho = ho.reshape(sp)
-        tr = m & ~ho
+        out.append((m & ~ho, ho))
+    return out
+
+
+def heldout_error(X, C, ksp, ho):
+    """Scale-invariant prediction error of images X (L, ...) on the held-out samples ``ho``: the best global
+    (complex) scale per candidate first, as image metrics compare up to a scale; otherwise the plain
+    shrinkage of a stronger regulariser is penalised as if it were an error."""
+    ax = tuple(range(1, X.ndim))
+    P = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(C[None] * X[:, None], axes=tuple(a + 1 for a in ax)),
+                                    axes=tuple(a + 1 for a in ax), norm="ortho"), axes=tuple(a + 1 for a in ax))
+    Ph = P[:, :, ho].reshape(X.shape[0], -1); yh = ksp[:, ho].reshape(-1)[None]
+    al = (Ph.conj() * yh).sum(1) / np.maximum((np.abs(Ph) ** 2).sum(1), 1e-30)
+    return (np.abs(al[:, None] * Ph - yh) ** 2).sum(1)
+
+
+def lambda_cv(ksp, C, m, grid, device="cpu", iters=60, holdout=0.1, folds=2, calib=24, seed=0):
+    """k-space cross-validation (see module docstring): (best lam, prediction errors per lam)."""
+    err = np.zeros(len(grid))
+    for tr, ho in cv_masks(m, holdout, folds, calib, seed):
         X = grid_solutions(ksp * tr[None], C, tr, grid, device=device, iters=iters)    # (L, ...)
-        ax = tuple(range(1, X.ndim))
-        P = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(C[None] * X[:, None], axes=tuple(a + 1 for a in ax)),
-                                        axes=tuple(a + 1 for a in ax), norm="ortho"), axes=tuple(a + 1 for a in ax))
-        Ph = P[:, :, ho].reshape(len(grid), -1); yh = ksp[:, ho].reshape(-1)[None]
-        # scale-invariant: the best global (complex) scale per lam first, as image metrics compare up to a
-        # scale; otherwise the plain shrinkage of a larger lam is penalised as if it were an error
-        al = (Ph.conj() * yh).sum(1) / np.maximum((np.abs(Ph) ** 2).sum(1), 1e-30)
-        err += (np.abs(al[:, None] * Ph - yh) ** 2).sum(1)
+        err += heldout_error(X, C, ksp, ho)
     return float(grid[int(np.argmin(err))]), err
 
 

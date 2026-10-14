@@ -1257,3 +1257,73 @@ def test_train_recon_script(tmp_path, monkeypatch):
     tr.main()
     rows = [json.loads(l) for l in open(out / "eval.jsonl")]
     assert {r["method"] for r in rows} == {"cg_auto", "net", "net_zs1"} and rows[0]["case"] == "item5_j4"
+
+
+def test_image_priors():
+    """bspinn.prior: orthonormal wavelets / TV adjoints; on a noisy piecewise-constant phantom at R=4 the
+    automatically weighted TV image beats automatic Tikhonov; API hooks (sense_image prior=, net: weights)."""
+    import torch
+    from bspinn.api import sense_image
+    from bspinn.masks import cartesian_mask
+    from bspinn.prior import Wavelet2D, _grad, _grad_adj, prior_image
+    w = Wavelet2D((37, 45), 3, "db4")
+    x = torch.randn(2, 37, 45, dtype=torch.complex64)
+    assert (w.adj(w.fwd(x)) - x).abs().max() < 1e-5
+    z = torch.randn(2, 2, 37, 45, dtype=torch.complex64)
+    assert abs(torch.vdot(_grad(x).flatten(), z.flatten()) - torch.vdot(x.flatten(), _grad_adj(z).flatten())) < 1e-3
+    rng = np.random.default_rng(0)
+    H = W = 96
+    yy, xx = np.mgrid[:H, :W]
+    obj = ((yy - 48) ** 2 / 38 ** 2 + (xx - 48) ** 2 / 30 ** 2 < 1).astype(float)
+    obj += 0.6 * (((yy - 40) ** 2 + (xx - 40) ** 2) < 12 ** 2) - 0.4 * (np.abs(yy - 62) < 6) * (np.abs(xx - 55) < 14)
+    N = 6
+    ang = 2 * np.pi * np.arange(N) / N
+    C = np.stack([np.exp(-(((yy - 48 - 60 * np.sin(a)) ** 2 + (xx - 48 - 60 * np.cos(a)) ** 2) / (2 * 50 ** 2)))
+                  * np.exp(1j * (0.02 * xx * np.cos(a) + 0.02 * yy * np.sin(a))) for a in ang])
+    C = C / np.sqrt((np.abs(C) ** 2).sum(0))
+    F = lambda v: np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(v, axes=(-2, -1)), norm="ortho"), axes=(-2, -1))  # noqa: E731
+    k = F(C * obj) + 0.03 * (rng.normal(size=(N, H, W)) + 1j * rng.normal(size=(N, H, W))) / np.sqrt(2)
+    m = cartesian_mask((H, W), R=4, acs=16, pattern="vd", seed=1)
+    ku = (k * m[None]).astype(np.complex64)
+    err = lambda v: np.linalg.norm(np.abs(v) * (np.abs(v) * obj).sum() / max((np.abs(v) ** 2 * (obj > 0)).sum(), 1e-12) * (obj > 0) - obj) / np.linalg.norm(obj)  # noqa: E731
+    x_t = sense_image(ku, C, "2d", mask=m, lam="auto", lam_options={"calib": 16})
+    rep = {}
+    x_tv = sense_image(ku, C, "2d", mask=m, prior="tv", prior_options={"cv_options": {"calib": 16}, "iters": 40},
+                       report=rep)
+    assert err(x_tv) < 0.8 * err(x_t), (err(x_tv), err(x_t), rep.get("weight"))
+    x_w = prior_image(ku, C, m, "wavelet", "auto", levels=3, iters=30, cv_options={"calib": 16})
+    x_tw = prior_image(ku, C, m, "tv+wavelet", "auto", levels=3, iters=30, cv_options={"calib": 16})
+    assert err(x_w) < err(x_t) and err(x_tw) < err(x_t), (err(x_w), err(x_tw), err(x_t))
+    assert rep["method"] == "cv" and len(rep["cv_error"]) == 10
+
+
+def test_network_prior(tmp_path):
+    """A network from scripts/train_recon.py (weights + split.json with its architecture) as the image prior."""
+    import json
+    from bspinn.api import sense_image
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    from bspinn.unrolled import Unrolled, load_network
+    import torch
+    net = Unrolled(unrolls=2, cg_iters=3, ch=6, blocks=1)
+    torch.save(net.state_dict(), tmp_path / "best.pt")
+    json.dump({"args": {"unrolls": 2, "cg_iters": 3, "ch": 6, "blocks": 1}}, open(tmp_path / "split.json", "w"))
+    assert load_network(str(tmp_path / "best.pt")).T == 2
+    d, C, _ = make_synthetic(4, (64, 64), noise=0.01, seed=0)
+    m = cartesian_mask((64, 64), R=3, acs=16, pattern="vd", seed=1)
+    x = sense_image(d.kspace[0] * m[None], C[0], "2d", mask=m, prior=f"net:{tmp_path / 'best.pt'}")
+    assert x.shape == (64, 64) and np.isfinite(x).all() and np.abs(x).max() > 0
+
+
+def test_estimate_maps_image_prior():
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    d, _, _ = make_synthetic(4, (48, 48), noise=0.01, seed=0)
+    m = cartesian_mask((48, 48), R=3, acs=12, pattern="vd", seed=1)
+    few = dict(calib=12, verbose=False, iters_auto=2, iters_wires=3, iters_pinn=3, iters_joint=3, sense_lambda=1e-2)
+    k = d.kspace[0] * m[None]
+    C, img, info = estimate_maps(k, "2d", mask=m, return_image=True, image_prior="tv", image_prior_weight=1e-2, **few)
+    assert img.shape == (48, 48) and np.isfinite(img).all() and info["image_prior"]["method"] == "manual"
+    C, img, info = estimate_maps(k, "2d", mask=m, solve_image=True, image_prior="tv", image_prior_weight=1e-2, **few)
+    assert not info["image_solved_jointly"] and info["image_tikhonov_joint"].shape == (48, 48)
