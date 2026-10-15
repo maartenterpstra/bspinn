@@ -1388,3 +1388,34 @@ def test_smooth_factor_continuation():
     C, info = estimate_maps(d.kspace[0], "2d", calib=12, verbose=False, iters_auto=2, iters_wires=3, iters_pinn=3,
                             resid_order_final=6)
     assert np.isfinite(C).all() and info["model"].resid.order == 6
+
+
+def test_train_recon_io_retry(tmp_path, monkeypatch):
+    """A data folder that is temporarily unavailable (OSError) is retried, not skipped or fatal."""
+    import argparse
+    import importlib.util
+    import os
+    mod = tmp_path / "flaky_ds.py"
+    mod.write_text(
+        "import numpy as np\n"
+        "from bspinn.data import make_synthetic\n"
+        "CALLS = {'n': 0}\n"
+        "class DS:\n"
+        "    def __len__(self): return 4\n"
+        "    def __getitem__(self, i):\n"
+        "        CALLS['n'] += 1\n"
+        "        if CALLS['n'] <= 2: raise OSError('share unavailable')\n"
+        "        d, C, o = make_synthetic(4, (48, 48), noise=0.01, seed=i)\n"
+        "        return {'kspace': d.kspace[0]}\n"
+        "def get(base=None): return DS()\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    spec = importlib.util.spec_from_file_location("trr2", os.path.join(os.path.dirname(__file__), "..", "scripts", "train_recon.py"))
+    tr = importlib.util.module_from_spec(spec); spec.loader.exec_module(tr)
+    a = argparse.Namespace(loader="flaky_ds:get", base_folder=None, key="kspace", coil_axis=0, io_retries=3, io_wait=0.0,
+                           train_maps="lowres", maps_acs=16, R_min=2.0, R_max=4.0, patterns=["vd"], acs_choices=[16], out=str(tmp_path))
+    s = tr.TrainItems(a, [1])[0]
+    assert s is not None and s["k"].shape == (4, 48, 48)
+    a.io_retries = 0
+    import flaky_ds
+    flaky_ds.CALLS["n"] = 0
+    assert tr.TrainItems(a, [1])[0] is None                  # no retries left: skipped, not fatal

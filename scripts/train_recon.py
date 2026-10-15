@@ -103,12 +103,27 @@ class TrainItems(torch.utils.data.Dataset):
     def __getitem__(self, j):
         from bspinn.masks import cartesian_mask
         a = self.a
-        if self.ds is None:
-            self.ds = _load_dataset(a.loader, a.base_folder)
         i = self.idx[j]
         rng = np.random.default_rng(1000003 * i + 1) if self.fixed else np.random.default_rng(int(torch.randint(2 ** 62, (1,))))
+        k = None
+        for attempt in range(a.io_retries + 1):          # the data folder may be a network share that drops out
+            try:
+                if self.ds is None:
+                    self.ds = _load_dataset(a.loader, a.base_folder)
+                k = _item_kspace(self.ds, i, a.key, a.coil_axis, None if self.fixed else rng)
+                break
+            except OSError as e:
+                if attempt == a.io_retries:
+                    print(f"item {i}: {type(e).__name__}: {e} (gave up after {a.io_retries} retries)", flush=True)
+                    return None
+                print(f"item {i}: {type(e).__name__}: {e}; data unavailable, retrying in {a.io_wait:g}s "
+                      f"({attempt + 1}/{a.io_retries})", flush=True)
+                self.ds = None
+                time.sleep(a.io_wait)
+            except Exception as e:                       # a broken item must not stop a long run
+                print(f"item {i}: {type(e).__name__}: {e}", flush=True)
+                return None
         try:
-            k = _item_kspace(self.ds, i, a.key, a.coil_axis, None if self.fixed else rng)
             if k is None:
                 return None
             cached = a.train_maps.startswith("cache:")
@@ -191,6 +206,31 @@ def loss_step(net, t, a, rng):
                          torch.as_tensor(lam.astype(np.float32), device=t["m"].device))
 
 
+def _val_reference(s):
+    from bspinn import evaluation as ev
+    from scipy.ndimage import binary_fill_holes, binary_opening, uniform_filter
+    k = np.asarray(s["k"]); sm = np.asarray(s["sampled"], bool)
+    rss = np.sqrt((np.abs(ev.ifft2c(k * sm[None])) ** 2).sum(0))
+    r = uniform_filter(rss, 7)
+    return rss, binary_fill_holes(binary_opening(r > 0.1 * np.quantile(r, 0.99), iterations=2))
+
+
+def baselines(val_items, a):
+    """The same validation slices, masks and maps reconstructed by CG-SENSE (automatic Tikhonov) and by TV
+    (automatic weight): what the network has to beat."""
+    from sense_lambda_eval import metrics
+    from bspinn.api import acquired_extent, sense_image
+    out = {"tikhonov": [], "tv": []}
+    for s in val_items:
+        k, m, C = np.asarray(s["k"]), np.asarray(s["mask"], bool), np.asarray(s["maps"])
+        ext = acquired_extent(np.asarray(s["sampled"], bool))
+        rss, obj = _val_reference(s)
+        ku = k * m[None]
+        out["tikhonov"].append(metrics(Z.band_limit(sense_image(ku, C, "2d", mask=m, lam="auto", device=a.device), ext), rss, obj))
+        out["tv"].append(metrics(Z.band_limit(sense_image(ku, C, "2d", mask=m, prior="tv", device=a.device), ext), rss, obj))
+    return {meth: {kk: float(np.median([o[kk] for o in v])) for kk in v[0]} for meth, v in out.items() if v}
+
+
 def validate(net, val_items, a):
     from sense_lambda_eval import metrics
     from bspinn import evaluation as ev
@@ -200,11 +240,7 @@ def validate(net, val_items, a):
         t = prepare(s, a.device)
         with torch.no_grad():
             x = _band(net(Z.Sense(t["C"], t["m"]), t["y"]), t["ext"]) * t["scale"]
-        k = np.asarray(s["k"]); sm = np.asarray(s["sampled"], bool)
-        rss = np.sqrt((np.abs(ev.ifft2c(k * sm[None])) ** 2).sum(0))
-        from scipy.ndimage import binary_fill_holes, binary_opening, uniform_filter
-        r = uniform_filter(rss, 7)
-        obj = binary_fill_holes(binary_opening(r > 0.1 * np.quantile(r, 0.99), iterations=2))
+        rss, obj = _val_reference(s)
         out.append(metrics(x.cpu().numpy(), rss, obj))
     net.train()
     return {kk: float(np.median([o[kk] for o in out])) for kk in out[0]} if out else {}
@@ -221,6 +257,15 @@ def train(a):
           f"(+/- {a.exclude_window} indices excluded around evaluation and validation items)", flush=True)
     val_ds = TrainItems(a, val_idx, fixed_mask=True)
     val_items = [s for s in (val_ds[j] for j in range(len(val_ds))) if s is not None]
+    bpath = os.path.join(a.out, "baselines.json")
+    if os.path.exists(bpath):
+        base = json.load(open(bpath))
+    else:
+        print(f"baselines on the {len(val_items)} validation slices (same masks and maps) ...", flush=True)
+        base = baselines(val_items, a)
+        json.dump(base, open(bpath, "w"), indent=1)
+    base_txt = "  |  baselines: " + "  ".join(f"{m} nrmse {v['nrmse']:.4f} ssim {v['ssim']:.4f}" for m, v in base.items())
+    print("validation" + base_txt, flush=True)
     loader = torch.utils.data.DataLoader(TrainItems(a, tr_idx), batch_size=None, shuffle=True, num_workers=a.workers,
                                          persistent_workers=a.workers > 0, prefetch_factor=4 if a.workers else None)
     net = Z.make_net(a, a.device)
@@ -268,7 +313,8 @@ def train(a):
                 v = validate(net, val_items, a)
                 rec = {"step": step, "train_loss": float(np.mean(run[-a.val_every * a.accum:])), **{f"val_{k}": x for k, x in v.items()}}
                 logf.write(json.dumps(rec) + "\n"); logf.flush()
-                print(f"  validation (R=4 vd, {len(val_items)} slices): " + "  ".join(f"{k} {x:.4f}" for k, x in v.items()), flush=True)
+                print(f"  validation (R=4 vd, {len(val_items)} slices): " + "  ".join(f"{k} {x:.4f}" for k, x in v.items())
+                      + base_txt, flush=True)
                 if v and v["nrmse"] < best:
                     best = v["nrmse"]
                     torch.save(net.state_dict(), os.path.join(a.out, "best.pt"))
@@ -414,6 +460,8 @@ def main():
     g.add_argument("--accum", type=int, default=1, help="gradient accumulation (items per optimiser step)")
     g.add_argument("--clip", type=float, default=1.0)
     g.add_argument("--workers", type=int, default=8)
+    g.add_argument("--io-retries", type=int, default=60, help="retries when the data folder is unavailable (OSError)")
+    g.add_argument("--io-wait", type=float, default=60.0, help="seconds between those retries")
     g.add_argument("--log-every", type=int, default=50)
     g.add_argument("--val-every", type=int, default=2000)
     g.add_argument("--amp", action="store_true")
