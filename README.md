@@ -1383,12 +1383,25 @@ temporal TV + 0.25 x spatial TV, ADMM, weight by k-space CV with withheld lines 
 `select_weight` with `DYN_SCALE` = 1). Metrics vs the fully sampled per-frame RSS: NRMSE / SSIM / PSNR per
 frame and `dyn_nrmse` (frame minus time average: temporal fidelity).
 
-Synthetic cine (static coils, beating blood pool, GRO R = 6, 6 coils): per-frame CG-SENSE NRMSE 0.41,
-spatio-temporal TV 0.043 (oracle weight 0.022). R = 4 with fast PINN fits: TV with pinn_avg maps 0.020, with
-pinn_dyn maps 0.061 (dyn_nrmse 0.08 vs 0.28): per-frame maps from undersampled frames carry frame-to-frame
-errors that look like motion, which temporal TV cannot remove; whether real cine (breath-hold, static array)
-gains anything from per-dynamic maps is what the OCMR run measures. `select_weight` (v49) also accepts an
-upper-edge CV minimum (the dynamic per-frame-map case; unchanged on 159 of 160 2-D cases).
+v50 fixes for the dynamic PINN: (1) the dynamic layout gets the 2-D model (channel coupling, smooth factor
+3 -> 8, L-BFGS polish; `DynamicCoils` now applies the static model's factor and coupling to every frame);
+(2) `dynamic_static='average'` (default): the static part is fitted to the time-averaged k-space and only
+the temporal modes to the frames; the joint fit to GRO frames (no per-frame calibration region) was
+ill-posed (subspace error 0.22 vs 0.045). `select_weight` also accepts an upper-edge CV minimum.
+
+Synthetic OCMR-like cines (8 coils, 48 x 64, 12 frames, beating blood pool; ISMRMRD files through the full
+pipeline), static coils vs anterior elements moving up to 4 px with +-5 % loading; quality fast:
+
+| case | R | maps | lco / floor (R=1) | TV NRMSE (R=4) | dyn_nrmse (TV) | map error in object | true map change captured |
+|---|---|---|---|---|---|---|---|
+| static | 1 | pinn_avg / pinn_dyn | 1.058 / 1.062 | | | 4.7e-4 / 4.9e-4 | (spurious 0.5 %) |
+| static | 4 | pinn_avg / pinn_dyn | | 0.0143 / 0.0139 | 0.046 / 0.046 | 5.7e-4 / 6.7e-4 | (spurious 1.2 %) |
+| moving | 1 | pinn_avg / pinn_dyn | 1.155 / 1.062 | | | 2.2e-3 / 5.0e-4 | 0 / 0.98 |
+| moving | 4 | pinn_avg / pinn_dyn | | 0.0205 / 0.0157 | 0.117 / 0.074 | 2.3e-3 / 8.1e-4 | 0 / 0.88 |
+
+pinn_dyn0 (one static set) equals pinn_avg. Per-frame CG-SENSE at R = 4 GRO: 0.072-0.084 (no per-frame
+calibration region); spatio-temporal TV is 4-5x lower. Static coils: per-dynamic maps cost nothing; moving
+coils: they recover most of the change (+2.3 dB at R = 4).
 
 ```
 BART=bart/bart python scripts/ocmr_eval.py --files /data/ocmr/fs_*.h5 --slices mid --R 1 4 8 \

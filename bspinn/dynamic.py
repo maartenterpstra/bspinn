@@ -76,6 +76,13 @@ class DynamicCoils(nn.Module):
     def sensitivity_frames(self, points, frames, create_graph=True):
         B = self.frame_field(points, frames, create_graph)
         C = (B[..., 0] + 1j * self.handedness * B[..., 1]) * self.static.gain()[None, :, None]
+        res = self.static._modules.get("resid")                                # the static model's smooth factor
+        if res is not None:                                                    # and channel coupling (2-D defaults,
+            C = C * res(points)[None]                                          # v50), shared by all frames
+        mix = self.static._modules.get("mixer")
+        if mix is not None:
+            E = torch.complex(mix.e[..., 0], mix.e[..., 1]) * mix.off
+            C = C + torch.einsum("ij,bjp->bip", E.to(C.dtype), C)
         return C                                                               # (B,N,P)
 
     def physics_loss(self, points):
@@ -131,16 +138,28 @@ class DynConfig:
     max_disp_mm: float = 0.0          # bound on conductor displacement (0 = none)
 
 
-def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print):
-    """Stage 1: static Biot–Savart fit over all frames (per-frame images).
+def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print, static_data=None):
+    """Stage 1: static Biot–Savart fit, over all frames (per-frame images) or, with ``static_data`` (one
+    co-located slice, e.g. the time-averaged k-space), on that.
     Stage 2: low-rank dynamic coils, initialised at the static solution."""
     cfg.validate("dynamic")
     t0 = time.time()
     scfg = copy.deepcopy(cfg)
-    static_model, prob, hist, extra = fit(data, scfg, log=log)
+    if static_data is None:
+        static_model, prob, hist, extra = fit(data, scfg, log=log)
+        m_static = extra["image_lowres"].to(cfg.device) if extra["image_lowres"] is not None else None
+    else:
+        from .fit import Problem
+        static_model, sprob, hist, extra = fit(static_data, scfg, log=log)
+        data.prewhiten()
+        prob = Problem(data, cfg)
+        m_static = None
+        if extra["image_lowres"] is not None:      # per-frame images start at the time-averaged one
+            m1 = extra["image_lowres"].to(cfg.device) * (sprob.scale / prob.scale)
+            m_static = m1.expand(prob.S, *m1.shape[1:]).clone()
+        log(f"dynamic: static stage on the time-averaged k-space, temporal modes from {prob.S} frames")
     snapshot = copy.deepcopy(static_model)
     prob.to(cfg.device); static_model.to(cfg.device)
-    m_static = extra["image_lowres"].to(cfg.device) if extra["image_lowres"] is not None else None
     a0, ev = alpha_from_data(prob, dcfg.rank)
     log(f"temporal modes initialised from data (explained variance of coil-energy PCA: {np.round(ev, 3).tolist()})")
     dyn = DynamicCoils(static_model, prob.S, dcfg.rank, a0, cfg.latent, cfg.width, cfg.depth, dcfg.parts).to(cfg.device)

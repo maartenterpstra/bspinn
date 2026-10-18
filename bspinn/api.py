@@ -33,7 +33,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda="auto", sense_lambda_scale=1.0, sense_lambda_options=None, sense_iters=60, mask_maps=False, support_threshold=0.1,
                   support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout",
-                  image_prior=None, image_prior_weight="auto", image_prior_options=None, **cfg_overrides):
+                  image_prior=None, image_prior_weight="auto", image_prior_options=None, dynamic_static="average",
+                  **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
     Parameters
@@ -61,6 +62,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     physics : 'laplace' (quasi-static, default) | 'helmholtz' (3-D only; wave-aware, for >= 3 T body
         imaging). ``b0_tesla`` sets the Larmor frequency for 'helmholtz'.
     model : 'pinn' (wires + harmonic correction, default) | 'wires' (wires only, faster, cruder).
+    dynamic_static : dynamic only. 'average' (default, v50): the static part of the coil model is fitted to the
+        time-averaged k-space and the temporal modes (rank > 0) to the frames; 'frames': the static part is
+        fitted jointly to all frames (ill-posed when the frames are undersampled without a calibration region).
     rank : dynamic only. Number of temporal motion modes of the coil array; 0 = one static map set
         shared by all frames (frames are then only used as extra data).
     quality : 'fast' | 'default'. Iteration presets (see PRESETS); override with iters_wires=...,
@@ -191,7 +195,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         cfg.calib = int(max(_calib(calib, 24, 1)))
     if layout == "dynamic":
         cfg.slice_batch = min(4, ksp.shape[-1])        # frames per optimisation step (cost ~ frames)
-    if layout == "2d" and model == "pinn":
+    if layout in ("2d", "dynamic") and model == "pinn":     # v50: the dynamic layout too (same static model)
         # v33 defaults from scripts/method_lab.py (real knees/brain + synthetic): learnable complex channel
         # coupling and a smooth per-coil complex factor (Fourier order 3)
         cfg.learn_mixing, cfg.resid_order = True, 3
@@ -239,7 +243,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     elif layout == "3d":
         C, info = _run_3d(ksp, mask, spacing, axes, noise, cfg, log)
     else:
-        C, info = _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log)
+        C, info = _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log, dynamic_static)
 
     # C: data-channel maps, (N, *spatial) or (T, N, X, Y) for dynamic. Pre-whitening made the data
     # channels M @ (original channels): map back to the original channels.
@@ -504,7 +508,7 @@ def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
     return C, info
 
 
-def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log):
+def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log, static="average"):
     from .data import MultiCoilData
     from .geometry import SliceGeometry
     N, X, Y, T = ksp.shape
@@ -519,9 +523,21 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     if mt is None:
         data.mask = (np.abs(kt).sum(1, keepdims=True) > 0)
     pts = geom.grid((X, Y))[0].reshape(-1, 3)
+    avg_data = None
+    if static == "average":
+        # the static part from the time-averaged k-space (sum over frames / frames sampling each point): with
+        # per-frame undersampling (GRO: no per-frame calibration region) a joint fit to the frames is
+        # ill-posed; the average is densely sampled (v50, README 8.11)
+        mt_ = data.mask[:, 0].astype(float)                                 # (T,X,Y)
+        cnt = mt_.sum(0)
+        kav = (kt * mt_[:, None]).sum(0) / np.maximum(cnt, 1)[None]
+        avg_data = MultiCoilData(kav[None], SliceGeometry((X, Y), spacing, np.zeros(1), plane),
+                                 mask=(cnt > 0)[None, None], noise=noise)
+    elif static != "frames":
+        raise ValueError("dynamic_static must be 'average' or 'frames'")
     if rank == 0:
         from .fit import fit
-        model, prob, hist, extra = fit(data, cfg, log=log)
+        model, prob, hist, extra = fit(avg_data if avg_data is not None else data, cfg, log=log)
         model.to(cfg.device)
         C = prob.mixC(model.sensitivity_batched(pts), -2).detach().numpy().reshape(N, X, Y)
         model.cpu()
@@ -530,7 +546,7 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
             "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores}
     from .dynamic import DynConfig, fit_dynamic
     dcfg = DynConfig(rank=rank, iters_dyn=iters_dynamic or max(300, cfg.iters_pinn // 2))
-    dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log)
+    dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log, static_data=avg_data)
     out = []
     dyn.to(cfg.device); pts_d = pts.to(cfg.device)
     with torch.no_grad():

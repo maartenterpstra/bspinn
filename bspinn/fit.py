@@ -534,6 +534,9 @@ def _wrap(primary, prob, cfg, prev=None, free=0):
 
 def _extra_penalty(model, Cs, m, cfg):
     pen = 0.0
+    if isinstance(model, torch.nn.Module) and isinstance(model._modules.get("static"), torch.nn.Module) \
+            and "resid" not in model._modules and "mixer" not in model._modules:
+        model = _ExtraHolder(model._modules["static"])          # dynamic.DynamicCoils: the static model's extras
     res = model._modules.get("resid") if isinstance(model, torch.nn.Module) else None
     if res is not None:
         pen = pen + cfg.lambda_resid * res.penalty()
@@ -550,6 +553,15 @@ def _extra_penalty(model, Cs, m, cfg):
         if m.shape[1] > 1:
             pen = pen + cfg.set_ridge * (m[:, 1:].abs() ** 2).mean() / (m[:, 0].abs() ** 2).mean().detach()
     return pen
+
+
+class _ExtraHolder(torch.nn.Module):
+    """View of a static model's smooth factor / coupling (for the penalty of a model that wraps it)."""
+    def __init__(self, static):
+        super().__init__()
+        for nm in ("resid", "mixer"):
+            if static._modules.get(nm) is not None:
+                self._modules[nm] = static._modules[nm]
 
 
 def _image_param(prob, C0, K, m_prev=None):
