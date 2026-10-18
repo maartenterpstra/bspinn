@@ -1419,3 +1419,128 @@ def test_train_recon_io_retry(tmp_path, monkeypatch):
     import flaky_ds
     flaky_ds.CALLS["n"] = 0
     assert tr.TrainItems(a, [1])[0] is None                  # no retries left: skipped, not fatal
+
+
+def _write_ismrmrd_cine(path, N=4, X=32, Y=40, T=6, slices=2, pf_drop=4, noise_scans=64, seed=0):
+    """Synthetic OCMR-like file: 2x readout oversampling, partial Fourier (last pf_drop PE lines missing,
+    kspace_encoding_step_1.center = Y//2), noise acquisitions; returns the true (coils, X, Y, T) k-space per
+    slice (without noise, oversampling removed) for comparison."""
+    import ismrmrd
+    rng = np.random.default_rng(seed)
+    xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<ismrmrdHeader xmlns="http://www.ismrm.org/ISMRMRD">
+ <acquisitionSystemInformation><systemFieldStrength_T>1.5</systemFieldStrength_T><receiverChannels>{N}</receiverChannels></acquisitionSystemInformation>
+ <experimentalConditions><H1resonanceFrequency_Hz>63600000</H1resonanceFrequency_Hz></experimentalConditions>
+ <encoding>
+  <encodedSpace><matrixSize><x>{2 * X}</x><y>{Y}</y><z>1</z></matrixSize><fieldOfView_mm><x>{2 * X * 2.0}</x><y>{Y * 2.0}</y><z>8</z></fieldOfView_mm></encodedSpace>
+  <reconSpace><matrixSize><x>{X}</x><y>{Y}</y><z>1</z></matrixSize><fieldOfView_mm><x>{X * 2.0}</x><y>{Y * 2.0}</y><z>8</z></fieldOfView_mm></reconSpace>
+  <trajectory>cartesian</trajectory>
+  <encodingLimits>
+   <kspace_encoding_step_1><minimum>0</minimum><maximum>{Y - 1 - pf_drop}</maximum><center>{Y // 2}</center></kspace_encoding_step_1>
+   <phase><minimum>0</minimum><maximum>{T - 1}</maximum><center>0</center></phase>
+   <slice><minimum>0</minimum><maximum>{slices - 1}</maximum><center>0</center></slice>
+  </encodingLimits>
+ </encoding>
+</ismrmrdHeader>"""
+    yy, xx = np.mgrid[:2 * X, :Y]
+    truth = []
+    dset = ismrmrd.Dataset(path, "dataset", create_if_needed=True)
+    dset.write_xml_header(xml)
+    for i in range(noise_scans):
+        acq = ismrmrd.Acquisition.from_array((rng.normal(size=(N, 2 * X)) + 1j * rng.normal(size=(N, 2 * X))).astype(np.complex64))
+        acq.set_flag(ismrmrd.ACQ_IS_NOISE_MEASUREMENT)
+        dset.append_acquisition(acq)
+    ang = 2 * np.pi * np.arange(N) / N
+    C = np.stack([np.exp(-(((yy - Y / 2 - 30 * np.sin(a_)) ** 2 + (xx * 0.5 - X / 2 - 30 * np.cos(a_)) ** 2) / (2 * 30 ** 2)))
+                  for a_ in ang])
+    for s in range(slices):
+        frames = []
+        for t in range(T):
+            r = 5 + 2 * np.sin(2 * np.pi * t / T)
+            o = (((xx - X) / 0.5) ** 2 / 26 ** 2 + (yy - Y / 2) ** 2 / 16 ** 2 < 1) * (0.6 + 0.1 * s)
+            o = o + 0.8 * ((((xx - X) / 0.5) ** 2 + (yy - Y / 2) ** 2) < r ** 2)
+            o = o * (np.abs(xx - X) < X / 2)                                 # object inside the recon FOV along x
+            frames.append(o)
+        img = C[..., None] * np.stack(frames, -1)[None]                       # (N, 2X, Y, T)
+        k = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(img, axes=(1, 2)), axes=(1, 2), norm="ortho"), axes=(1, 2))
+        from bspinn.ocmr import _remove_oversampling
+        tk = np.moveaxis(_remove_oversampling(np.moveaxis(k, -1, 1), X), 1, -1).copy()
+        tk[:, :, Y - pf_drop:] = 0
+        truth.append(tk)
+        for t in range(T):
+            for ky in range(Y - pf_drop):
+                d = k[:, :, ky, t] + 0.01 * (rng.normal(size=(N, 2 * X)) + 1j * rng.normal(size=(N, 2 * X)))
+                acq = ismrmrd.Acquisition.from_array(d.astype(np.complex64))
+                acq.center_sample = X
+                acq.idx.kspace_encode_step_1 = ky
+                acq.idx.phase = t
+                acq.idx.slice = s
+                dset.append_acquisition(acq)
+    dset.close()
+    return truth
+
+
+def test_ocmr_reader_gro_and_eval(tmp_path, monkeypatch):
+    """bspinn.ocmr reads an OCMR-like ISMRMRD cine (oversampling removed, partial Fourier placed, noise scans);
+    GRO masks; spatio-temporal TV beats per-frame CG-SENSE; scripts/ocmr_eval.py end to end (PINN variants)."""
+    import importlib.util
+    import json
+    import os
+    import sys
+    from bspinn.masks import gro_lines, gro_mask
+    from bspinn.ocmr import cine_slices
+    pytest.importorskip("ismrmrd")
+    p = str(tmp_path / "fs_test.h5")
+    truth = _write_ismrmrd_cine(p)
+    sl = list(cine_slices(p, "all"))
+    assert len(sl) == 2 and sl[0][1].shape == (4, 32, 40, 6) and sl[0][2]["noise"].shape == (64 * 64, 4)
+    k = sl[1][1]
+    assert np.abs(k[:, :, 36:]).max() == 0                                   # partial-Fourier lines empty
+    noise_norm = 0.01 * np.sqrt(2 * np.count_nonzero(truth[1]))         # the added acquisition noise
+    assert np.linalg.norm(k - truth[1]) < 1.2 * noise_norm
+    g = gro_lines(160, 64, 12)
+    assert (g.sum(1) == 12).all() and g.any(0).all()
+    assert g[:, 70:90].sum() > 2 * g[:, :20].sum()                            # variable density
+    m = gro_mask((32, 40), 6, 4, extent=np.abs(k).sum((0, 3)) > 0)
+    assert m.shape == (32, 40, 6) and not m[:, 36:].any() and (m[0, :, 0].sum() == 9)
+    spec = importlib.util.spec_from_file_location("ocmr_eval", os.path.join(os.path.dirname(__file__), "..", "scripts", "ocmr_eval.py"))
+    oe = importlib.util.module_from_spec(spec); spec.loader.exec_module(oe)
+    out = tmp_path / "res" / "results.jsonl"
+    monkeypatch.setattr(sys, "argv", ["x", "--files", p, "--slices", "0", "--R", "1", "4", "--maps", "pinn_avg", "pinn_dyn",
+                                      "pinn_dyn0", "--calib", "12", "--device", "cpu", "--tv-iters", "10", "--oracle",
+                                      "--pinn-set", "iters_auto=2", "iters_wires=3", "iters_pinn=3", "iters_dynamic=3",
+                                      "--out", str(out)])
+    oe.main()
+    rows = [json.loads(l) for l in open(out)]
+    got = {(r["R"], r["maps"], r["recon"]) for r in rows}
+    assert {(1, "pinn_avg", "sense1"), (4, "pinn_dyn", "tv"), (4, "pinn_dyn0", "sense")} <= got
+    r1 = [r for r in rows if r["R"] == 1][0]
+    assert np.isfinite(r1["lco_outside_over_floor"]) and len(r1["per_frame_nrmse"]) == 6
+    tv = [r for r in rows if r["R"] == 4 and r["recon"] == "tv"][0]
+    assert len(tv["grid_error"]) == 9 and tv["rule"] in ("interior", "flat", "fallback", "upper")
+
+
+def test_dynamic_tv_beats_per_frame_sense():
+    """Spatio-temporal TV (automatic weight) on a GRO-undersampled synthetic cine: far better than per-frame
+    CG-SENSE (no per-frame calibration region at R = 6)."""
+    from bspinn.api import sense_image
+    from bspinn.masks import gro_mask
+    from bspinn.prior import dynamic_prior_image
+    rng = np.random.default_rng(0)
+    H = W = 64; T = 8; N = 6
+    yy, xx = np.mgrid[:H, :W]
+    obj = np.stack([((yy - 32) ** 2 / 26 ** 2 + (xx - 32) ** 2 / 20 ** 2 < 1) * 0.6
+                    + 0.8 * (((yy - 30) ** 2 + (xx - 31) ** 2) < (7 + 3 * np.sin(2 * np.pi * t / T)) ** 2)
+                    for t in range(T)], -1)
+    ang = 2 * np.pi * np.arange(N) / N
+    C = np.stack([np.exp(-(((yy - 32 - 40 * np.sin(a)) ** 2 + (xx - 32 - 40 * np.cos(a)) ** 2) / (2 * 34 ** 2))) for a in ang])
+    C = C / np.sqrt((np.abs(C) ** 2).sum(0))
+    F = lambda v: np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(v, axes=(1, 2)), axes=(1, 2), norm="ortho"), axes=(1, 2))  # noqa: E731
+    k = F(C[..., None] * obj[None]) + 0.03 * (rng.normal(size=(N, H, W, T)) + 1j * rng.normal(size=(N, H, W, T))) / np.sqrt(2)
+    m = gro_mask((H, W), T, 6)
+    ku = k * m[None]
+    err = lambda x: np.linalg.norm(np.abs(x) * (np.abs(x) * obj).sum() / (np.abs(x) ** 2).sum() - obj) / np.linalg.norm(obj)  # noqa: E731
+    xs = np.stack([sense_image(ku[..., t], C, "2d", mask=m[..., t], lam=1e-2) for t in range(T)], -1)
+    rep = {}
+    xd = dynamic_prior_image(ku, C, m, "auto", report=rep, iters=30)
+    assert err(xd) < 0.5 * err(xs), (err(xd), err(xs), rep["weight"], rep["rule"])

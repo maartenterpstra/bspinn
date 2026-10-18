@@ -1361,6 +1361,40 @@ BART=bart/bart python scripts/prior_eval.py --loader dataloader_v2:get_dataloade
     --oracle --device cuda --out runs/prior_eval_v48.jsonl
 ```
 
+### 8.11 Dynamic (cine) imaging: OCMR, GRO undersampling, time-averaged vs per-dynamic maps
+
+`scripts/ocmr_eval.py` evaluates on OCMR fully sampled 2-D cine (https://www.ocmr.info; ISMRMRD files, read by
+`bspinn/ocmr.py`: noise scans for whitening, 2x readout oversampling removed, partial Fourier placed). For
+R = 1 (fully sampled) and every --R, a GRO mask per frame (`masks.gro_mask` / `gro_lines`: golden-ratio offset
+Cartesian sampling, Joshi, Ahmad et al., arXiv:2206.03630, s = 2.2, alpha = 3; no per-frame calibration
+region, the time average covers every line). Maps:
+
+| maps | from |
+|---|---|
+| espirit, nlinv | BART ecalib / ncalib on the time-averaged k-space (one map set for all frames) |
+| pinn_avg | `estimate_maps` 2-D on the time-averaged k-space |
+| pinn_dyn | `estimate_maps(layout='dynamic', rank=2)`: per-frame maps (temporal modes of the coil array) from the undersampled frames |
+| pinn_dyn0 | the same with rank 0: one static set fitted to all frames jointly |
+| pinn_frame | independent 2-D fits per frame (optional, slow) |
+
+Reconstructions: R = 1 SENSE-1 per frame (+ reference-free map metrics per frame); R > 1 per-frame CG-SENSE
+(automatic Tikhonov from the middle frame) and spatio-temporal TV (`prior.dynamic_prior_image`: cyclic
+temporal TV + 0.25 x spatial TV, ADMM, weight by k-space CV with withheld lines in every frame,
+`select_weight` with `DYN_SCALE` = 1). Metrics vs the fully sampled per-frame RSS: NRMSE / SSIM / PSNR per
+frame and `dyn_nrmse` (frame minus time average: temporal fidelity).
+
+Synthetic cine (static coils, beating blood pool, GRO R = 6, 6 coils): per-frame CG-SENSE NRMSE 0.41,
+spatio-temporal TV 0.043 (oracle weight 0.022). R = 4 with fast PINN fits: TV with pinn_avg maps 0.020, with
+pinn_dyn maps 0.061 (dyn_nrmse 0.08 vs 0.28): per-frame maps from undersampled frames carry frame-to-frame
+errors that look like motion, which temporal TV cannot remove; whether real cine (breath-hold, static array)
+gains anything from per-dynamic maps is what the OCMR run measures. `select_weight` (v49) also accepts an
+upper-edge CV minimum (the dynamic per-frame-map case; unchanged on 159 of 160 2-D cases).
+
+```
+BART=bart/bart python scripts/ocmr_eval.py --files /data/ocmr/fs_*.h5 --slices mid --R 1 4 8 \
+    --maps espirit nlinv pinn_avg pinn_dyn pinn_dyn0 --device cuda --oracle --save-images --out runs/ocmr/results.jsonl
+```
+
 ## 9. Code map
 
 | file | content |
@@ -1374,6 +1408,7 @@ BART=bart/bart python scripts/prior_eval.py --loader dataloader_v2:get_dataloade
 | `encoding.py` | Cartesian masked FFT and exact separable NUDFT operators |
 | `volume.py` | 3-D encoded data: geometry, `Problem3D`, coarse-grid PINN correction, orientation selection, `fit3d`, synthetic volumes |
 | `methods.py` | estimator registry for the comparison (low-res, Walsh, Inati, ESPIRiT, NLINV, Biot–Savart variants) |
+| `ocmr.py` | OCMR / ISMRMRD cine reader (noise scans, oversampling removal, partial Fourier) |
 | `prior.py` | sparsity priors (TV, db4 wavelets) for the image with fixed maps: batched ADMM, weight by k-space CV |
 | `unrolled.py` | unrolled reconstruction network (ResNet + CG data consistency) of scripts/zs_ssl.py / train_recon.py; `load_network` |
 | `evaluation.py` | comparison metrics: combine→expand k-space residual vs noise floor, reference image, SENSE at R, g-factor, map errors |

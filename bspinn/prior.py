@@ -211,12 +211,16 @@ def select_weight(grid, err, scale=AUTO_SCALE, fallback=FALLBACK_WEIGHT, flat=FL
       interior  the lowest interior local minimum, refined by a parabola in log weight, times ``scale``;
                 minima at the grid edges are ignored (the lowest-weight edge was a spurious global minimum
                 in 20 % of the cases, at 1.2-3x the oracle NRMSE);
+      upper     the largest grid weight is the lowest minimum (v49; the CV says: more regularisation) -> it;
       fallback  no interior minimum -> ``fallback``.
     Returns (weight, rule)."""
     grid = np.asarray(grid, float); e = np.asarray(err, float) / max(float(np.min(err)), 1e-30)
     if e.max() < 1 + flat:
         return float(grid[-1]), "flat"
     mins = [i for i in range(1, len(e) - 1) if e[i] <= e[i - 1] and e[i] <= e[i + 1]]
+    up = len(e) - 1
+    if e[up] <= e[up - 1] and (not mins or e[up] < min(e[j] for j in mins)):
+        return float(grid[up]), "upper"        # the strongest weight is best (unscaled: the optimum may lie beyond)
     if not mins:
         return float(fallback), "fallback"
     i = min(mins, key=lambda j: e[j])
@@ -262,3 +266,124 @@ def prior_image(ksp, C, mask, prior="tv", weight="auto", device="cpu", report=No
     with torch.no_grad():
         x = admm(yt, Ct, mt, torch.tensor([float(weight)], device=device), prior, x0=x0, **kw)[0] * s
     return x.cpu().numpy().astype(np.complex64)
+
+
+# ----------------------------------------------------------------------------------- dynamic (x, y, t)
+def _tgrad(x):
+    return torch.roll(x, -1, 0) - x                       # cyclic in time (cine: one cardiac cycle)
+
+
+def _tgrad_adj(z):
+    return torch.roll(z, 1, 0) - z
+
+
+def dynamic_admm(y, C, m, beta_t, beta_s, iters=50, cg_iters=5, rho=0.5, lam=1e-6, x0=None):
+    """min 1/2 sum_t ||M_t F (C_t x_t) - y_t||^2 + beta_t sum |x_{t+1} - x_t| + beta_s sum_t TV(x_t), ADMM.
+    y (T,N,H,W), C (T,N,H,W) or (N,H,W) RSS-normalised maps, m (T,H,W) float masks -> x (T,H,W)."""
+    mm = m[:, None]                                       # (T,1,H,W)
+    r_ = rho * float(m.mean())
+
+    def AHA(v):
+        return (C.conj() * _ifft2c(mm * _fft2c(C * v[:, None]))).sum(-3)
+
+    def lhs(v):
+        out = AHA(v) + lam * v + r_ * _tgrad_adj(_tgrad(v))
+        if beta_s > 0:
+            out = out + r_ * _grad_adj(_grad(v))
+        return out
+
+    AHy = (C.conj() * _ifft2c(mm * y)).sum(-3)
+    x = AHy.clone() if x0 is None else x0.clone()
+    zt, ut = _tgrad(x), None
+    ut = torch.zeros_like(zt)
+    zs = _grad(x) if beta_s > 0 else None
+    us = torch.zeros_like(zs) if zs is not None else None
+    for _ in range(iters):
+        rhs = AHy + r_ * _tgrad_adj(zt - ut)
+        if zs is not None:
+            rhs = rhs + r_ * _grad_adj(zs - us)
+        # one batch of T coupled frames: CG over all of them at once (dims 0..2 summed)
+        x = _bcg(lambda v: lhs(v[0])[None], rhs[None], x[None], cg_iters)[0]
+        v = _tgrad(x) + ut
+        zt = v * torch.clamp(1 - (beta_t / r_) / v.abs().clamp_min(1e-12), min=0)
+        ut = v - zt
+        if zs is not None:
+            v = _grad(x) + us
+            mag = torch.sqrt((v.abs() ** 2).sum(-3, keepdim=True)).clamp_min(1e-12)
+            zs = v * torch.clamp(1 - (beta_s / r_) / mag, min=0)
+            us = v - zs
+    return x
+
+
+def _dyn_setup(ksp, C, mask, device):
+    """ksp (N,H,W,T), C (N,H,W) or (N,H,W,T), mask (H,W,T) -> tensors (T-first), scale, light-Tikhonov start."""
+    k = np.moveaxis(np.asarray(ksp), -1, 0)                                   # (T,N,H,W)
+    m = np.moveaxis(np.asarray(mask, bool), -1, 0)                            # (T,H,W)
+    C = np.asarray(C)
+    C = np.moveaxis(C, -1, 0) if C.ndim == 4 else C                           # (T,N,H,W) | (N,H,W)
+    C = C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(-3, keepdims=True)), 1e-12)
+    Ct = torch.from_numpy(C.astype(np.complex64)).to(device)
+    mt = torch.from_numpy(m.astype(np.float32)).to(device)
+    yt = torch.from_numpy((k * m[:, None]).astype(np.complex64)).to(device)
+    fill = float(mt.mean())
+    AHA = lambda v: (Ct.conj() * _ifft2c(mt[:, None] * _fft2c(Ct * v[:, None]))).sum(-3) + 1e-2 * fill * v  # noqa: E731
+    b = (Ct.conj() * _ifft2c(mt[:, None] * yt)).sum(-3)
+    x0 = _bcg(lambda v: AHA(v[0])[None], b[None], torch.zeros_like(b)[None], 30)[0]
+    s = float(torch.quantile(x0.abs().flatten()[:: max(1, x0.numel() // 2_000_000)], 0.99).clamp_min(1e-12))
+    return k, m, C, Ct, mt, yt / s, x0 / s, s
+
+
+DYN_SCALE = 1.0   # dynamic: the CV interior minimum sat at the oracle weight on a synthetic GRO cine (R = 6);
+#                   the 2-D AUTO_SCALE (0.35) halved the accuracy there. Calibrate with scripts/ocmr_eval.py --oracle
+
+
+def dynamic_prior_image(ksp, C, mask, weight="auto", spatial_ratio=0.25, device="cpu", grid=None, report=None,
+                        holdout=0.1, folds=2, calib=0, seed=0, iters=50, cg_iters=5, scale=DYN_SCALE,
+                        oracle_ref=None, oracle_fn=None):
+    """Cine image series with temporal TV (+ spatial_ratio x the weight of spatial TV). ksp (N,H,W,T)
+    acquired k-space (zeros elsewhere), C static (N,H,W) or per-frame (N,H,W,T) maps, mask (H,W,T).
+    weight 'auto': k-space cross-validation with whole phase-encode lines withheld from every frame,
+    ``select_weight`` rule. ``oracle_fn(x (T,H,W)) -> error`` optionally scores every grid weight (report).
+    Returns x (H,W,T) complex64."""
+    k, m, Cn, Ct, mt, yt, x0, s = _dyn_setup(ksp, C, mask, device)
+    T = k.shape[0]
+    grid = np.asarray(grid if grid is not None else np.logspace(-4, 0, 9))      # dynamic optima reach ~0.1
+    solve = lambda yy, mm, b: dynamic_admm(yy, Ct, mm, b, b * spatial_ratio, iters, cg_iters, x0=x0)  # noqa: E731
+    info = {"spatial_ratio": spatial_ratio}
+    if isinstance(weight, str):
+        err = np.zeros(len(grid))
+        rng_seed = seed
+        tr_all, ho_all = [], []
+        for f in range(folds):
+            tr_t, ho_t = [], []
+            for t in range(T):
+                fm = cv_masks(m[t], holdout, folds, calib, rng_seed + 1000 * t)
+                tr, ho = fm[f % len(fm)] if fm else (m[t], np.zeros_like(m[t]))
+                tr_t.append(tr); ho_t.append(ho)
+            tr_all.append(np.stack(tr_t)); ho_all.append(np.stack(ho_t))
+        for gi, b in enumerate(grid):
+            for tr, ho in zip(tr_all, ho_all):
+                trt = torch.from_numpy(tr.astype(np.float32)).to(device)
+                with torch.no_grad():
+                    X = solve(yt * trt[:, None], trt, float(b)).cpu().numpy()          # (T,H,W)
+                # scale-invariant held-out error over all frames jointly
+                P = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(Cn * X[:, None] if Cn.ndim == 4 else Cn[None] * X[:, None],
+                                                                 axes=(-2, -1)), norm="ortho"), axes=(-2, -1))
+                ph = P.transpose(0, 2, 3, 1)[ho]; yh = (k / s).transpose(0, 2, 3, 1)[ho]
+                al = (ph.conj() * yh).sum() / max((np.abs(ph) ** 2).sum(), 1e-30)
+                err[gi] += float((np.abs(al * ph - yh) ** 2).sum())
+        w, rule = select_weight(grid, err, scale)
+        info.update(grid=grid.tolist(), cv_error=err.tolist(), weight=w, rule=rule, method="cv")
+        if oracle_fn is not None:
+            curve = []
+            for b in grid:
+                with torch.no_grad():
+                    curve.append(float(oracle_fn(np.moveaxis(solve(yt, mt, float(b)).cpu().numpy() * s, 0, -1))))
+            info["grid_error"] = curve
+    else:
+        w = float(weight); info.update(weight=w, method="manual")
+    with torch.no_grad():
+        x = solve(yt, mt, w).cpu().numpy() * s
+    if report is not None:
+        report.update(info)
+    return np.moveaxis(x, 0, -1).astype(np.complex64)

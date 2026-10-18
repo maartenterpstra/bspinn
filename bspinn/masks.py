@@ -213,3 +213,46 @@ def _poisson_disc(shape, R, power, rng, allowed, centre_count=0, iters=12):
         if abs(int(m.sum()) - target) <= max(1, 0.01 * target):
             break
     return best
+
+
+# ----------------------------------------------------------------------------------- GRO (dynamic, Cartesian)
+def gro_lines(n, frames, lines, s=2.2, alpha=3.0, tau=1, n_enc=1, enc=0):
+    """Golden-ratio offset (GRO) Cartesian sampling for dynamic MRI (Joshi, Ahmad et al.; technical report
+    arXiv:2206.03630, MATLAB https://github.com/OSU-CMR/GRO-CAVA). ``lines`` uniformly spaced samples on a
+    shrunk grid of Ns = ceil(n / s) points, offset from frame to frame by the golden ratio times the
+    sample spacing (tau = 1: golden ratio, tau > 1: tiny golden ratios), then stretched to the n-point
+    grid by v - kappa sign(c - v) |c - v|^alpha (variable density, denser in the centre). Returns a
+    (frames, n) bool array (duplicate indices after rounding merge, so a frame can have < ``lines``)."""
+    g = (1 + np.sqrt(5)) / 2
+    g = 1.0 / (g + tau - 1)
+    Ns = int(np.ceil(n / s))
+    kap = (n / 2 - Ns / 2) / ((Ns / 2) ** alpha)
+    v0 = np.arange(lines) * (Ns / lines) + 0.5 + 1e-10                    # (1/2 : Ns/M : Ns+1/2) in MATLAB
+    v0 = v0 + (enc + 1) / n_enc * Ns / lines
+    out = np.zeros((frames, n), bool)
+    for j in range(frames):
+        v = np.remainder(v0 + j * Ns / lines * g - 1, Ns) + 1
+        v = v - Ns * (v >= Ns + 0.5)
+        c = Ns / 2 + 0.5
+        vc = v - kap * np.sign(c - v) * np.abs(c - v) ** alpha + (n - Ns) / 2 + (0.5 if n % 2 == 0 else 0.0)
+        vc = vc - n * (vc >= n + 0.5)
+        idx = np.clip(np.round(np.sort(vc)).astype(int), 1, n) - 1            # 1-based -> 0-based
+        out[j, idx] = True
+    return out
+
+
+def gro_mask(shape, frames, R, pe_axis=1, extent=None, **kw):
+    """(X, Y, T) bool mask: GRO lines along ``pe_axis`` with round(n / R) lines per frame, n = the phase-
+    encode lines inside the acquired extent (partial-Fourier gaps excluded; ``extent`` an (X, Y) bool array
+    of the acquired samples), readout fully sampled. R = 1: every acquired line in every frame."""
+    shape = tuple(int(a) for a in shape)
+    ext = np.ones(shape, bool) if extent is None else np.asarray(extent, bool)
+    prof = ext.any(axis=1 - pe_axis)
+    pos = np.flatnonzero(prof)
+    if R <= 1:
+        lines = np.zeros((frames, shape[pe_axis]), bool); lines[:, pos] = True
+    else:
+        g = gro_lines(pos.size, frames, max(1, int(round(pos.size / R))), **kw)
+        lines = np.zeros((frames, shape[pe_axis]), bool); lines[:, pos] = g
+    m = lines[:, None, :] if pe_axis == 1 else lines[:, :, None]           # (T, X, Y)
+    return np.moveaxis(np.broadcast_to(m, (frames,) + shape) & ext[None], 0, -1).copy()
