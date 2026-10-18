@@ -1399,7 +1399,9 @@ pipeline), static coils vs anterior elements moving up to 4 px with +-5 % loadin
 | moving | 1 | pinn_avg / pinn_dyn | 1.155 / 1.062 | | | 2.2e-3 / 5.0e-4 | 0 / 0.98 |
 | moving | 4 | pinn_avg / pinn_dyn | | 0.0205 / 0.0157 | 0.117 / 0.074 | 2.3e-3 / 8.1e-4 | 0 / 0.88 |
 
-pinn_dyn0 (one static set) equals pinn_avg. Per-frame CG-SENSE at R = 4 GRO: 0.072-0.084 (no per-frame
+Baselines from the time-averaged k-space (BART 1.0 ecalib / ncalib): static R=1 lco 1.073 / 1.083, R=4 TV
+0.0143 / 0.0140; moving R=1 lco 1.181 / 1.184, R=4 TV 0.0204 / 0.0204 (dyn_nrmse 0.119 / 0.118): like
+pinn_avg, they cannot follow the coil changes; only pinn_dyn does. pinn_dyn0 (one static set) equals pinn_avg. Per-frame CG-SENSE at R = 4 GRO: 0.072-0.084 (no per-frame
 calibration region); spatio-temporal TV is 4-5x lower. Static coils: per-dynamic maps cost nothing; moving
 coils: they recover most of the change (+2.3 dB at R = 4).
 
