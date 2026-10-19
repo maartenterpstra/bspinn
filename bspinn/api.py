@@ -549,10 +549,11 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log, static_data=avg_data)
     out = []
     dyn.to(cfg.device); pts_d = pts.to(cfg.device)
+    chunk = 16384                                   # frames x pixels in pieces: bounded memory at full resolution
     with torch.no_grad():
-        for i in range(0, T, 8):
-            fr = list(range(i, min(T, i + 8)))
-            c = dyn.sensitivity_frames(pts_d, fr, create_graph=False).detach().cpu()  # (B,N_model,P)
+        for t in range(T):
+            c = torch.cat([dyn.sensitivity_frames(pts_d[j:j + chunk], [t], create_graph=False).detach().cpu()
+                           for j in range(0, pts_d.shape[0], chunk)], -1)               # (1,N_model,P)
             out.append(prob.mixC(c, -2).numpy())
     dyn.cpu()
     C = np.concatenate(out).reshape(T, N, X, Y)

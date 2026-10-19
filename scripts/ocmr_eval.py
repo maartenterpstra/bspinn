@@ -111,6 +111,9 @@ def main():
     ap.add_argument("--plane", default="auto")
     ap.add_argument("--spatial-ratio", type=float, default=0.25, help="tv: spatial / temporal TV weight")
     ap.add_argument("--tv-iters", type=int, default=50)
+    ap.add_argument("--tv-grid", type=float, nargs=3, default=None, metavar=("LOG10_MIN", "LOG10_MAX", "N"),
+                    help="tv weight grid (default: prior.dynamic_prior_image's, 1e-4..1, 9 values)")
+    ap.add_argument("--tv-folds", type=int, default=2)
     ap.add_argument("--oracle", action="store_true", help="tv: also score every grid weight against the reference")
     ap.add_argument("--rf-every", type=int, default=4, help="R = 1: reference-free map metrics every n-th frame")
     ap.add_argument("--gro-s", type=float, default=2.2)
@@ -235,8 +238,10 @@ def main():
                             ofn = None
                             if a.oracle:
                                 ofn = lambda xx: series_metrics(np.stack([band_limit(xx[..., t], ext) for t in range(T)], -1), ref, obj)["nrmse"]  # noqa: E731
+                            grid = None if a.tv_grid is None else np.logspace(a.tv_grid[0], a.tv_grid[1], int(a.tv_grid[2]))
                             x = dynamic_prior_image(ku, Cn, m, "auto", spatial_ratio=a.spatial_ratio, device=a.device,
-                                                    report=rep, iters=a.tv_iters, oracle_fn=ofn)
+                                                    report=rep, iters=a.tv_iters, oracle_fn=ofn, grid=grid,
+                                                    folds=a.tv_folds)
                             extra.update({kk: rep.get(kk) for kk in ("weight", "rule", "grid", "cv_error", "grid_error")})
                         else:
                             raise SystemExit(f"unknown recon {rc}")

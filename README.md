@@ -1405,6 +1405,24 @@ pinn_avg, they cannot follow the coil changes; only pinn_dyn does. pinn_dyn0 (on
 calibration region); spatio-temporal TV is 4-5x lower. Static coils: per-dynamic maps cost nothing; moving
 coils: they recover most of the change (+2.3 dB at R = 4).
 
+Real case, OCMR fs_0004_1_5T (1.5 T short-axis cine, 18 coils, 256 x 208, 18 frames, no noise scan; CPU, quality
+fast, TV grid 1e-3..1 x 6 weights, 1 CV fold):
+
+| maps | R=1 lco / floor | R=4 per-frame SENSE NRMSE | R=4 TV NRMSE | R=4 TV dyn_nrmse |
+|---|---|---|---|---|
+| ESPIRiT (time average) | 1.710 | 0.1430 | 0.1391 | 0.417 |
+| NLINV (time average) | 1.591 | 0.1267 | 0.1194 | 0.392 |
+| pinn_avg | 1.596 | 0.1267 | 0.1194 | 0.391 |
+| pinn_dyn0 | 1.596 | 0.1266 | 0.1195 | 0.391 |
+| pinn_dyn | 1.597 | 0.1267 | 0.1198 | 0.391 |
+
+The PINN ties NLINV and beats ESPIRiT (which shows intensity shading). Per-dynamic maps give nothing on this
+breath-held cine: the coil-loading changes are below what the data show. The absolute residuals are high for
+every method (no noise scan, body filling 88 % of the FOV and touching the phase-encode edges: noise floor
+uncertain, wrapped anatomy); the NRMSE floor is set by the noisy reference (SENSE-1 vs RSS at R=1: 0.10).
+TV mainly restores temporal fidelity (dyn_nrmse 0.78 -> 0.39). The per-dynamic map output is evaluated frame
+by frame in pixel chunks (it ran out of 7 GB at full resolution before).
+
 ```
 BART=bart/bart python scripts/ocmr_eval.py --files /data/ocmr/fs_*.h5 --slices mid --R 1 4 8 \
     --maps espirit nlinv pinn_avg pinn_dyn pinn_dyn0 --device cuda --oracle --save-images --out runs/ocmr/results.jsonl
