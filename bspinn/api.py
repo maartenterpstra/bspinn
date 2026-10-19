@@ -68,7 +68,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     rank : dynamic only. Number of temporal motion modes of the coil array; 0 = one static map set
         shared by all frames (frames are then only used as extra data).
     quality : 'fast' | 'default'. Iteration presets (see PRESETS); override with iters_wires=...,
-        iters_pinn=..., iters_auto=... . Dynamic data use 4 random frames per step (slice_batch=...).
+        iters_pinn=..., iters_auto=... . Dynamic data use 4 random frames per step (fewer above 20 coils; slice_batch=...).
     normalise : 'rss' (sum_j |C_j|^2 = 1 everywhere, the ESPIRiT/SENSE convention) | 'none' (raw model
         scale; the maps then still extrapolate smoothly to the whole FOV).
     phase_ref : common-phase convention: 'inati' (virtual body coil, default) | 'model' | 'coil'.
@@ -194,7 +194,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     else:
         cfg.calib = int(max(_calib(calib, 24, 1)))
     if layout == "dynamic":
-        cfg.slice_batch = min(4, ksp.shape[-1])        # frames per optimisation step (cost ~ frames)
+        # frames per optimisation step: memory/cost ~ frames x coils; 4 up to 20 coils, 2 at 38 (OCMR fs_0020
+        # OOM'd a 6 GB container with 4); frames are resampled every step
+        cfg.slice_batch = min(4, max(1, 80 // max(1, ksp.shape[0])), ksp.shape[-1])
     if layout in ("2d", "dynamic") and model == "pinn":     # v50: the dynamic layout too (same static model)
         # v33 defaults from scripts/method_lab.py (real knees/brain + synthetic): learnable complex channel
         # coupling and a smooth per-coil complex factor (Fourier order 3)
@@ -549,7 +551,9 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log, static_data=avg_data)
     out = []
     dyn.to(cfg.device); pts_d = pts.to(cfg.device)
-    chunk = 16384                                   # frames x pixels in pieces: bounded memory at full resolution
+    # frames x pixels in pieces: bounded memory at full resolution (the field intermediates scale with
+    # pixels x wire segments x coils; 16384 pixels OOM'd at 38 coils in a 6 GB container, OCMR fs_0020)
+    chunk = max(1024, 4096 * 16 // max(16, prob.N_model))
     with torch.no_grad():
         for t in range(T):
             c = torch.cat([dyn.sensitivity_frames(pts_d[j:j + chunk], [t], create_graph=False).detach().cpu()
