@@ -180,7 +180,6 @@ def main():
             C = np.asarray(C)
             Cn = C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)), 1e-12)
             Ct = (lambda t: Cn[..., t]) if Cn.ndim == 4 else (lambda t: Cn)
-            recs = []
             for rc in a.recon:
                 if (fname, mname, rc) in done:
                     continue
@@ -207,14 +206,12 @@ def main():
                        "maps_seconds": t_maps, "recon_seconds": time.time() - t0, "calib": cal,
                        "heldout": e_ho["all"], "heldout_centre": e_ho["centre"], "heldout_outer": e_ho["outer"],
                        "train": e_tr["all"], **extra}
-                recs.append(rec)
+                with open(a.out, "a") as fh:                              # per row: survives interruptions
+                    fh.write(json.dumps(rec) + "\n")
                 imgs[f"{mname}/{rc}"] = np.abs(x).astype(np.float16)
                 print(f"   {mname:10s} {rc:6s} held-out/noise {e_ho['all']:8.3f}  centre {e_ho['centre']:8.3f}  "
                       f"outer {e_ho['outer']:7.3f}   train/noise {e_tr['all']:.3f}"
                       + (f"  weight {extra['weight']:.2e} ({extra['rule']})" if extra.get("weight") else ""), flush=True)
-            with open(a.out, "a") as fh:
-                for r in recs:
-                    fh.write(json.dumps(r) + "\n")
             if a.save_images and imgs:
                 p = os.path.join(root, f"{fname}_images.npz")
                 old = dict(np.load(p)) if os.path.exists(p) else {}
