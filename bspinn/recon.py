@@ -175,7 +175,7 @@ def virtual_body_coil(C0, sup=None, robust=True, iters=300, restarts=8, seed=0, 
     return best
 
 
-def phase_reference(C, mode="inati", support=None, images=None, d=None):
+def phase_reference(C, mode="inati", support=None, images=None, d=None, unwind=True):
     """Fix the per-pixel phase common to all coils (the gauge that SENSE cannot see).
 
     C: (S,N,H,W) or (S,K,N,H,W) complex maps; images (S,H,W) or (S,K,H,W) are counter-rotated
@@ -188,6 +188,8 @@ def phase_reference(C, mode="inati", support=None, images=None, d=None):
                        (see virtual_body_coil), so no phase singularity is introduced.
     'inati-eig'      : the same with Inati's dominant-eigenvector weights (may be singular).
     'coil'           : reference to the strongest coil (ESPIRiT convention; singular where it is weak).
+    unwind           : 'inati' falling back to the model phase removes the model phase's gauge poles
+                       (remove_gauge_poles; v55). False: v54.
     Returns (C', images', info, Phi) with Phi (S,H,W) the unit-modulus phase removed from the maps
     (None for 'model').
     """
@@ -204,11 +206,23 @@ def phase_reference(C, mode="inati", support=None, images=None, d=None):
             rel0 = T.abs() / (C0.abs() ** 2).sum(1).sqrt().clamp_min(1e-12)
             s0 = float(rel0[sup > 0].min()) if (sup > 0).any() else 1.0
             if s0 < 0.05:
-                # no safe virtual body coil found: keep the physical (model) phase rather than
-                # introducing a reference-induced phase pole
-                return C, images, {"phase_ref": "model", "requested": "inati",
-                                   "note": f"virtual body coil too weak inside the object (min {s0:.3f}); "
-                                           "kept the model phase to avoid a phase singularity"}, None
+                # no safe virtual body coil found (common at 3 T with many small coils): keep the physical
+                # (model) phase rather than introducing a reference-induced phase pole, and remove the gauge
+                # poles the model phase itself may have (v55; exact: a common unit-modulus factor)
+                inf = {"phase_ref": "model", "requested": "inati",
+                       "note": f"virtual body coil too weak inside the object (min {s0:.3f}); "
+                               "kept the model phase to avoid a phase singularity"}
+                if not unwind:
+                    return C, images, inf, None
+                _, n_rm, fac = remove_gauge_poles(C0, sup.cpu().numpy() > 0)
+                inf["gauge_poles_removed"] = int(n_rm)
+                if not n_rm:
+                    return C, images, inf, None
+                f_t = torch.as_tensor(fac, dtype=C.dtype, device=C.device).reshape(S, H, W)
+                Cr = C * (f_t[:, None, None] if sets else f_t[:, None])
+                if images is not None:
+                    images = images * (f_t.conj()[:, None] if images.dim() == 4 else f_t.conj())
+                return Cr, images, inf, f_t.conj()
     elif mode == "coil":
         k = int(((C0.abs() ** 2) * sup[:, None]).sum((0, 2, 3)).argmax())
         T = C0[:, k]
@@ -258,3 +272,59 @@ def phase_vortices(C: torch.Tensor, support: torch.Tensor, rel_mag: float = 0.0)
     net = q.sum((0, 2, 3)).long().tolist()
     return {"total": int(sum(per_coil)), "per_coil": per_coil, "net_winding": net,
             "coils_with_vortices": int(sum(1 for c in per_coil if c > 0))}
+
+
+def gauge_poles(C, support=None, frac: float = 0.5, rel_mag: float = 0.05):
+    """Gauge (common-phase) poles: 2x2 plaquettes where at least ``frac`` of the coils with signal (|C| above
+    ``rel_mag`` x the coil's maximum on all four corners; at least max(2, N/4) of them) wind the same way.
+    A pole of the gauge is not physical (the relative phases C_j C_k^* do not wind there): SENSE ignores it,
+    but it puts a phase vortex into the complex image that spatial regularisers (TV, wavelets) penalise.
+    C: (N,H,W) array/tensor. Returns a list of (row + 0.5, col + 0.5, sign) inside ``support`` (H,W)."""
+    C = np.asarray(C.detach().cpu() if hasattr(C, "detach") else C)
+    N = C.shape[0]
+    a, ph = np.abs(C), np.angle(C)
+
+    def w(d):
+        return (d + np.pi) % (2 * np.pi) - np.pi
+
+    p00, p10, p11, p01 = ph[:, :-1, :-1], ph[:, 1:, :-1], ph[:, 1:, 1:], ph[:, :-1, 1:]
+    wn = np.rint((w(p10 - p00) + w(p11 - p10) + w(p01 - p11) + w(p00 - p01)) / (2 * np.pi)).astype(int)
+    am = np.minimum.reduce([a[:, :-1, :-1], a[:, 1:, :-1], a[:, 1:, 1:], a[:, :-1, 1:]])
+    strong = am > rel_mag * a.reshape(N, -1).max(1)[:, None, None]
+    pos, neg, ns = ((wn > 0) & strong).sum(0), ((wn < 0) & strong).sum(0), strong.sum(0)
+    g = ((pos >= frac * np.maximum(ns, 1)) | (neg >= frac * np.maximum(ns, 1))) & (ns >= max(2, N // 4))
+    if support is not None:
+        s = np.asarray(support, bool)
+        g &= s[:-1, :-1] & s[1:, 1:] & s[1:, :-1] & s[:-1, 1:]
+    return [(x + 0.5, y + 0.5, 1 if pos[x, y] >= neg[x, y] else -1) for x, y in np.argwhere(g)]
+
+
+def remove_gauge_poles(C, support=None, max_rounds: int = 3, **kw):
+    """Multiply all coils by the conjugate vortex exp(-i s atan2(col - c_p, row - r_p)) of every gauge pole p:
+    the common winding is undone, the inter-coil phases and magnitudes are unchanged (the factor is common to
+    all coils and unit-modulus; singular only at the pole, where it cancels the maps' own singularity).
+    C: (N,H,W) or (S,N,H,W) array/tensor (per slice). Returns (C', removed count, the phase factor (S?,H,W))."""
+    is_t = hasattr(C, "detach")
+    X = np.asarray(C.detach().cpu() if is_t else C)
+    one = X.ndim == 3
+    X = X[None] if one else X
+    S, N, H, W = X.shape
+    rr, cc = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    out, facs, n = X.copy(), np.ones((S, H, W), np.complex64), 0
+    for s_ in range(S):
+        sup = None if support is None else np.asarray(support).reshape(-1, H, W)[min(s_, np.asarray(support).reshape(-1, H, W).shape[0] - 1)]
+        for _ in range(max_rounds):
+            ps = gauge_poles(out[s_], sup, **kw)
+            if not ps:
+                break
+            f = np.ones((H, W), np.complex64)
+            for r0, c0, sg in ps:
+                f *= np.exp(-1j * sg * np.arctan2(cc - c0, rr - r0)).astype(np.complex64)
+            out[s_] *= f[None]
+            facs[s_] *= f
+            n += len(ps)
+    out = out[0] if one else out
+    facs = facs[0] if one else facs
+    if is_t:
+        out = torch.as_tensor(out, dtype=C.dtype, device=C.device)
+    return out, n, facs

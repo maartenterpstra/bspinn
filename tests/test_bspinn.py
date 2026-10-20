@@ -1631,3 +1631,51 @@ def test_dynamic_base_plus_corrections(capsys):
     sup = info["support"]
     dev = np.linalg.norm((Cn - Cn.mean(-1, keepdims=True))[:, sup]) / np.linalg.norm(Cn[:, sup])
     assert dev < 0.05
+
+
+def test_gauge_pole_removal():
+    """remove_gauge_poles: a vortex injected into all coils (the gauge) is found and removed; magnitudes and
+    inter-coil phases are unchanged; physical single-coil vortices are not counted as gauge poles."""
+    from bspinn.recon import gauge_poles, remove_gauge_poles
+    rng = np.random.default_rng(0)
+    H = W = 40
+    rr, cc = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    C = np.stack([np.exp(-((rr - 20 - 12 * np.cos(a)) ** 2 + (cc - 20 - 12 * np.sin(a)) ** 2) / 400)
+                  * np.exp(1j * (0.05 * rr * np.cos(a) + 0.05 * cc * np.sin(a))) for a in np.linspace(0, 2 * np.pi, 8, endpoint=False)])
+    assert gauge_poles(C) == []
+    v = np.exp(1j * np.arctan2(cc - 14.5, rr - 22.5)) * np.exp(-1j * np.arctan2(cc - 27.5, rr - 15.5))
+    Cg = C * v[None]
+    ps = gauge_poles(Cg)
+    assert sorted(p[2] for p in ps) == [-1, 1]
+    Cr, n, f = remove_gauge_poles(Cg)
+    assert n == 2 and gauge_poles(Cr) == []
+    assert np.allclose(np.abs(Cr), np.abs(Cg), atol=1e-5)
+    rel = lambda X: X[:, None] * X[None].conj()                                    # noqa: E731
+    assert np.allclose(rel(Cr), rel(Cg), atol=1e-5)
+    C1 = C.copy(); C1[0] *= np.exp(1j * np.arctan2(cc - 20.5, rr - 20.5))       # one coil only: not a gauge pole
+    assert gauge_poles(C1) == []
+
+
+def test_phase_reference_fallback_unwinds_gauge_poles():
+    """phase_reference('inati') without a usable virtual body coil keeps the model phase but removes its gauge
+    poles (exact: SENSE images and relative phases unchanged)."""
+    import torch
+    from bspinn.recon import gauge_poles, phase_reference
+    H = W = 40
+    rr, cc = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    angs = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+    # coils with rapidly rotating phases: no linear combination is strong everywhere (forces the fallback)
+    C = np.stack([np.exp(-((rr - 20 - 14 * np.cos(a)) ** 2 + (cc - 20 - 14 * np.sin(a)) ** 2) / 300)
+                  * np.exp(1j * 1.5 * (rr * np.cos(a) + cc * np.sin(a))) for a in angs])
+    C = C * np.exp(1j * np.arctan2(cc - 19.5, rr - 21.5))[None]                  # a gauge pole
+    C = C / np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True))
+    sup = np.ones((H, W), bool); sup[:3] = sup[-3:] = False; sup[:, :3] = sup[:, -3:] = False
+    assert len(gauge_poles(C, sup)) >= 1
+    Ct = torch.as_tensor(C, dtype=torch.complex64)[None]
+    m = torch.ones(1, H, W, dtype=torch.complex64)
+    Cr, mr, inf, _ = phase_reference(Ct, "inati", torch.as_tensor(sup)[None], m)
+    assert inf["phase_ref"] == "model"
+    assert inf.get("gauge_poles_removed", 0) >= 1 and gauge_poles(Cr[0].numpy(), sup) == []
+    assert torch.allclose(Cr * mr[:, None], Ct * m[:, None], atol=1e-4)
+    Cv, _, inf0, _ = phase_reference(Ct, "inati", torch.as_tensor(sup)[None], None, unwind=False)
+    assert torch.equal(Cv, Ct)

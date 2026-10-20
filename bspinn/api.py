@@ -775,6 +775,13 @@ def _fold_correct(C, fold_maps, ksp, mask, calib, log, ridge=1e-3, min_gain=0.3,
     return out.astype(np.complex64), rep
 
 
+def _unwind_series(C, sup):
+    """(T,N,X,Y) maps: remove the gauge poles of the time-mean maps with ONE common factor for every frame."""
+    from .recon import remove_gauge_poles
+    _, n, fac = remove_gauge_poles(C.mean(0), sup)
+    return C * fac[None, None].astype(C.dtype) if n else C
+
+
 FINISH_CHUNK_ELEMENTS = 20_000_000          # dynamic maps above this size: phase reference in chunks of frames
 
 
@@ -797,7 +804,7 @@ def _finish(C, sup, layout, phase_ref, normalise, device=None):
             Ct = torch.from_numpy(np.ascontiguousarray(C[t0:t0 + 8])).to(torch.complex64)
             S = torch.from_numpy(sup)[None].expand(Ct.shape[0], -1, -1)
             if phase_ref not in ("model", "none"):
-                Ct, _, inf, _ = phase_reference(Ct, phase_ref, S, None, d)
+                Ct, _, inf, _ = phase_reference(Ct, phase_ref, S, None, d, unwind=False)
                 modes.add(str(inf.get("phase_ref")))
             if normalise == "rss":
                 Ct = Ct / (Ct.abs() ** 2).sum(1, keepdim=True).sqrt().clamp_min(1e-12)
@@ -806,6 +813,8 @@ def _finish(C, sup, layout, phase_ref, normalise, device=None):
             out[t0:t0 + 8] = Ct.numpy()
         if len(modes) > 1:
             warnings.warn(f"phase reference differed between frame chunks ({sorted(modes)})")
+        if "model" in modes and phase_ref == "inati":
+            out = _unwind_series(out, sup)
         return out
     Ct = torch.from_numpy(np.ascontiguousarray(C)).to(torch.complex64)
     if layout == "2d":
@@ -818,7 +827,12 @@ def _finish(C, sup, layout, phase_ref, normalise, device=None):
         d = None
         if phase_ref in ("inati", "inati-eig"):
             d = virtual_body_coil(Cs, S.float(), robust=(phase_ref == "inati"), device=device)
-        Cs, _, _, _ = phase_reference(Cs, phase_ref, S, None, d)
+        # 2-D: gauge poles of a model-phase fallback removed in place; dynamic: one factor for all frames (from
+        # the time-mean maps, so the gauge does not jump in time); 3-D: per-slice removal would be
+        # inconsistent between slices, so not done
+        Cs, _, inf, _ = phase_reference(Cs, phase_ref, S, None, d, unwind=(layout == "2d"))
+        if layout == "dynamic" and inf.get("phase_ref") == "model" and phase_ref == "inati":
+            Cs = torch.from_numpy(_unwind_series(Cs.numpy(), sup))
     if normalise == "rss":
         Cs = Cs / (Cs.abs() ** 2).sum(1, keepdim=True).sqrt().clamp_min(1e-12)
     elif normalise != "none":
