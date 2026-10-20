@@ -1482,6 +1482,33 @@ Memory (for small machines): the dynamic layout uses fewer frames per step above
 series frame by frame, and selects the B0 plane on the time average; the OCMR reader removes the readout
 oversampling plane by plane in complex64 (us_0001 load: >5 GB -> 2.3 GB).
 
+### 8.12 Phase poles and small calibration regions (Blumenthal & Uecker, arXiv 2508.04685)
+
+Gauge (common-phase) poles: `bspinn.recon.gauge_poles` (per-coil winding numbers on 2x2 plaquettes and, by
+Stokes, on loops of radius 6 -- NLINV's poles are spread over ~10 px), `remove_gauge_poles` (point-like poles;
+exact: one unit-modulus factor for all coils). `phase_ref='inati'` falling back to the model phase (no usable
+virtual body coil: 3 T, many coils) now removes the model phase's poles (`unwind=False`: v54).
+
+OCMR (cine, Cartesian): ESPIRiT has gauge poles in every case, NLINV none, the PINN only at 3 T (model-phase
+fallback). Swapping the gauge (pole removal, another method's gauge, NLINV into ESPIRiT's) changes neither
+spatio-temporal TV nor 2-D TV (|dNRMSE| <= 2e-4 at three weights): SENSE / Tikhonov are gauge-invariant and TV
+pays little for a vortex. The poles mark where maps are worse (leave-coil-out within 8 px of a pole: ESPIRiT 3.5-3.9,
+NLINV 1.5-1.8, PINN 1.8-2.5) and matter for phase applications.
+
+Brain MPRAGE planes of the paper (3 T, 20 -> 12 virtual coils, 2x2 + ACS 3 / 7 / 15): uncorrected `bart nlinv` has
+a gauge pole in the head in 4 of 9 cases (with the dark 'black hole'), `--phase-pole 0` in none, and the
+correction improves NLINV's image in 8 of 9. ACS 7, slice 189 (lco object / near pole, R=4 SENSE NRMSE): ESPIRiT
+fails (kernel 5), NLINV 1.39 / 6.81, 0.109; NLINV corrected 1.21 / 1.15, 0.097; PINN (v54, maps only) 1.16 / 1.09,
+0.093. ACS 3: PINN 9.8 vs NLINV corrected 2.1 -- an undersampled calibration box gives an aliased image whose
+support is inflated (0.96 / 0.73 of the FOV at ACS 3 / 7 vs 0.42): v55 restricts it to the alias-free block's
+(`init_from_acs`), and the joint stage (`solve_image=True`) uses all samples as NLINV does.
+
+```
+BART=bart/bart python scripts/phase_pole_eval.py --files data/ksp_2D data/ksp_2D2 data/ksp_2D3 --acs 3 7 15 \
+    --maps espirit nlinv nlinv_pp pinn_v54 pinn_v55 --device cuda --out runs/poles/results.jsonl
+```
+(BART >= 1.0 for `--phase-pole`; inputs: BART cfl bases of one 2-D plane each, or .npy (coils, x, y).)
+
 ## 9. Code map
 
 | file | content |
