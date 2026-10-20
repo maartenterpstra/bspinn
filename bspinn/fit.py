@@ -173,6 +173,9 @@ class FitConfig:
                                      #   the same optimiser: simultaneous steps on maps and image)
     joint_freeze_extra: bool = False # joint full-resolution stage: keep the smooth factor and the coupling
                                      #   fixed (True: better on exact Biot–Savart phantoms, worse on real knees)
+    joint_extra_penalty: bool = True # joint stage: keep the smooth factor's Sobolev and the coupling's ridge penalty
+                                     #   (lambda_resid / lambda_mix, as in the calibration stages; False: v53 and
+                                     #   earlier, where both were trained unregularised at full resolution)
     seed: int = 0
     log_every: int = 100
     threads: int = 0
@@ -996,6 +999,11 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             d = (M * _fft2c_t(C * x[:, None]) - y).abs().pow(2).sum() / ynorm
             rest = d
         rest = rest + cfg.lambda_phys * _physics(model, prob, cfg, gen, wires) + cfg.lambda_norm * prob.norm_loss(Cg)
+        if cfg.joint_extra_penalty:                         # same regularisers as the calibration stages
+            if res_f is not None and id(next(res_f.parameters())) not in frozen:
+                rest = rest + cfg.lambda_resid * res_f.penalty()
+            if mix_f is not None and id(next(mix_f.parameters())) not in frozen:
+                rest = rest + cfg.lambda_mix * mix_f.penalty()
         if grad_img:                                        # the image's own Tikhonov term
             rest = rest + lam * x.abs().pow(2).sum() / ynorm
         if cfg.lambda_joint_prox:
