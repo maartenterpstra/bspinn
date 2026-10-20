@@ -148,6 +148,13 @@ class FitConfig:
                                      #   (fixed collocation set of polish_colloc points); Adam alone stalls well
                                      #   above the noise floor on high-SNR calibration data
     polish_colloc: int = 4096
+    joint_lbfgs: int = 60            # optimizer 'adam+lbfgs': L-BFGS iterations finishing the joint full-resolution
+                                     #   stage (maps by L-BFGS on a fixed collocation set, image by exact CG /
+                                     #   prior updates in between, alternating every lbfgs_inner); 0: Adam only (v54)
+    resid_zero_mean: bool = True     # smooth factor without a common (coil-averaged) component (v55; False: v54)
+    init_from_acs: bool = True       # Cartesian, calibration box not fully sampled: the object support (keep-out,
+                                     #   collocation) restricted to that of the largest fully sampled centred block
+                                     #   (alias-free; the undersampled box image is aliased and inflates it)
     resid_order: int = 0             # >0: per-coil smooth complex factor exp(u_j) of this Fourier order
                                      #   multiplying the physics maps (PINN stage on; see models.SmoothFactor)
     lambda_resid: float = 1e-3       # Sobolev ridge on that factor's coefficients
@@ -308,6 +315,7 @@ class Problem:
             mask = torch.from_numpy(data.mask)
             yk = crop_center(ks, (h, w))
             mk = crop_center(mask, (h, w)).to(torch.float32)
+            box_full = bool(mk.min() > 0)                        # before the zero padding of the oversampled grid
             f = int(cfg.calib_oversample)
             if f > 1:
                 fh, fw = min(f * h, H), min(f * w, W)
@@ -321,6 +329,14 @@ class Problem:
                 h, w = fh, fw
             self.op = CartesianOp(mk)
             I0 = ifft2c(yk * mk)
+            self.init_block = None
+            I_lr = None
+            if getattr(cfg, "init_from_acs", True) and not box_full:
+                blk = _centred_full_block(mk)                   # (rows, cols) fully sampled around the centre
+                if blk is not None and min(blk) >= 3:
+                    w_ = _block_window(mk.shape[-2:], blk).to(yk.dtype)
+                    I_lr = ifft2c(yk * mk * w_)                  # alias-free, low resolution (block only)
+                    self.init_block = blk
             self.mask_full = mask
         rss = (I0.abs() ** 2).sum(1).sqrt()
         self.scale = float(torch.quantile(rss.flatten(), 0.99))
@@ -330,6 +346,17 @@ class Problem:
         rss = rss / self.scale
         self.noise_sigma = self._estimate_noise(data) / self.scale
         self.support = self.object_support(rss)
+        if not self.noncart and getattr(self, "init_block", None) is not None and I_lr is not None:
+            # undersampled box: its image is aliased (copies of the object at FOV/R shifts), which inflates the
+            # support (brain, 2x2, ACS 7: 0.73 of the FOV vs 0.42). The support is the aliased one (sharp edges)
+            # restricted to the alias-free block's (which rejects the shifted copies). The coil images stay the
+            # box's: their maps agree with the fully sampled ones better than the block's or one SENSE unfolding
+            # with the block's maps (measured: 0.975 vs 0.90 at ACS 7).
+            rl = (I_lr.abs() ** 2).sum(1).sqrt()
+            g_ = float(torch.quantile(rss.flatten(), 0.99)) / max(float(torch.quantile(rl.flatten(), 0.99)), 1e-30)
+            sup_lr = self.object_support(rl / self.scale * g_)
+            both = self.support * sup_lr
+            self.support = both if bool((both > 0).any()) else sup_lr
         self.S, self.N = S, N
         # channel mixing (whitening / compression): data channel v = sum_n mix[v,n] * physical coil n
         mix = data.meta.get("mix")
@@ -533,6 +560,39 @@ def _wrap(primary, prob, cfg, prev=None, free=0):
         with torch.no_grad():
             w.shifts.copy_(prev.shifts)
     return w
+
+
+def _centred_full_block(mk):
+    """Largest centred rectangle (rows, cols) sampled in every slice/channel of mask mk (..., h, w); None if
+    the centre itself is not sampled."""
+    full = (mk.reshape(-1, *mk.shape[-2:]) > 0).all(0).cpu().numpy()
+    h, w = full.shape
+    if not full[h // 2, w // 2]:
+        return None
+    best, area = None, 0
+    for ch in range(1, h + 1):
+        r0 = h // 2 - ch // 2
+        rows = full[r0:r0 + ch]
+        if not rows[:, w // 2].all():
+            break
+        cw = 1
+        while cw + 1 <= w and rows[:, w // 2 - (cw + 1) // 2: w // 2 - (cw + 1) // 2 + cw + 1].all():
+            cw += 1
+        if ch * cw > area:
+            best, area = (ch, cw), ch * cw
+    return best
+
+
+def _block_window(shape, blk):
+    """Separable Hann window over the centred block blk (rows, cols) inside an array of ``shape``; 0 outside."""
+    out = torch.zeros(*shape)
+    h, w = shape
+    (ch, cw) = blk
+    wr = torch.hann_window(ch + 2, periodic=False)[1:-1]
+    wc = torch.hann_window(cw + 2, periodic=False)[1:-1]
+    r0, c0 = h // 2 - ch // 2, w // 2 - cw // 2
+    out[r0:r0 + ch, c0:c0 + cw] = wr[:, None] * wc[None, :]
+    return out
 
 
 def _extra_penalty(model, Cs, m, cfg):
@@ -998,7 +1058,9 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         else:
             d = (M * _fft2c_t(C * x[:, None]) - y).abs().pow(2).sum() / ynorm
             rest = d
-        rest = rest + cfg.lambda_phys * _physics(model, prob, cfg, gen, wires) + cfg.lambda_norm * prob.norm_loss(Cg)
+        phys = (_physics_at(model, cfg, *state["colloc"]) if state.get("colloc") is not None
+                else _physics(model, prob, cfg, gen, wires))
+        rest = rest + cfg.lambda_phys * phys + cfg.lambda_norm * prob.norm_loss(Cg)
         if cfg.joint_extra_penalty:                         # same regularisers as the calibration stages
             if res_f is not None and id(next(res_f.parameters())) not in frozen:
                 rest = rest + cfg.lambda_resid * res_f.penalty()
@@ -1063,6 +1125,36 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             o[0].backward(); opt.step(); sched.step()
             post()
             after(it, o)
+    if getattr(cfg, "optimizer", "adam") == "adam+lbfgs" and int(getattr(cfg, "joint_lbfgs", 0)) > 0:
+        # second-order finish (v55): Adam leaves first-order error on the full-resolution objective. Maps by
+        # L-BFGS (strong Wolfe) on a FIXED collocation set -- a deterministic objective --, the image updated
+        # exactly in between (alternating every lbfgs_inner iterations)
+        c2 = copy.copy(cfg); c2.n_colloc = cfg.polish_colloc
+        state["colloc"] = _colloc(prob, c2, gen, wires)
+        flat = [q for g_ in (params if isinstance(params[0], dict) else [{"params": params}]) for q in g_["params"]]
+        inner = max(1, min(int(cfg.lbfgs_inner), int(cfg.joint_lbfgs)))
+        optl = torch.optim.LBFGS(flat, lr=1.0, max_iter=inner, history_size=50, tolerance_grad=1e-12,
+                                 tolerance_change=1e-15, line_search_fn="strong_wolfe")
+
+        def closure_l():
+            optl.zero_grad(set_to_none=True)
+            rest, d = step()
+            if torch.is_tensor(rest) and rest.requires_grad:
+                rest.backward()
+            total = (rest.detach() if torch.is_tensor(rest) else torch.tensor(float(rest), device=dev))
+            if not state.get("d_in_rest", True):
+                total = total + d.detach()
+            state["o"] = (total, d)
+            return total
+        closure_l(); d_a = float(state["o"][1])
+        done_ = 0
+        while done_ < int(cfg.joint_lbfgs):
+            optl.step(closure_l)
+            post()
+            done_ += inner
+        state["colloc"] = None
+        log(f"[joint full-res] L-BFGS finish {cfg.joint_lbfgs} it: data {d_a:.4e} -> {float(state['o'][1]):.4e}")
+        _log(hist, cfg.iters_joint + done_, data=float(state["o"][1]))
     with torch.no_grad():
         C, _ = maps(False)
         if jp is not None:
@@ -1343,7 +1435,8 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
             pinn = make_pinn(prob, cfg, wires, h)
             if cfg.resid_order > 0:
                 from .models import SmoothFactor
-                pinn.resid = SmoothFactor(pinn.n_coils, prob.keep.comp, cfg.resid_order).to(prob.device)
+                pinn.resid = SmoothFactor(pinn.n_coils, prob.keep.comp, cfg.resid_order,
+                                          zero_mean=cfg.resid_zero_mean).to(prob.device)
             if wires is not None and wires._modules.get("mixer") is not None:
                 pinn.mixer = wires._modules["mixer"]               # continue from the wire stage's coupling
             elif cfg.learn_mixing:

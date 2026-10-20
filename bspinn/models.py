@@ -62,9 +62,13 @@ class SmoothFactor(nn.Module):
     the extrapolation. Starts at exp(0) = 1; ``penalty`` is a Sobolev-type ridge (weight
     (1 + |k|^2 / k0^2)^sobolev; default 1 + |k|^2)."""
 
-    def __init__(self, n_coils, comps, order=2, k0=1.0, sobolev=1.0):
+    def __init__(self, n_coils, comps, order=2, k0=1.0, sobolev=1.0, zero_mean=False):
         super().__init__()
         self.comps, self.order = tuple(int(c) for c in comps), int(order)
+        # zero_mean: u_j minus its coil average (v55). A modulation common to all coils is invisible to the data
+        # after RSS normalisation (it trades with the image); removing it fixes that gauge exactly. The ridge
+        # stays on the raw coefficients, so the (now ineffective) common part is driven to zero.
+        self.zero_mean = bool(zero_mean)
         self.k0, self.sobolev = float(k0), float(sobolev)
         ks = []
         for kx in range(-order, order + 1):
@@ -77,7 +81,8 @@ class SmoothFactor(nn.Module):
         """The same factor at a higher order (new coefficients 0: identical values), optionally with a new
         penalty shape: continuation from a low order (physics-dominated PINN stage) to a high one."""
         new = SmoothFactor(self.a.shape[0], self.comps, order, self.k0 if k0 is None else k0,
-                           self.sobolev if sobolev is None else sobolev).to(self.a.device)
+                           self.sobolev if sobolev is None else sobolev,
+                           getattr(self, "zero_mean", False)).to(self.a.device)
         n_old, n_new = 2 * self.order + 1, 2 * order + 1
         with torch.no_grad():
             for i, (kx, ky) in enumerate(self.kk.long().tolist()):
@@ -97,7 +102,8 @@ class SmoothFactor(nn.Module):
         x = p[:, self.comps[0]][:, None].clamp(-1, 1)
         y = p[:, self.comps[1]][:, None].clamp(-1, 1)
         phi = self._phi1(x, self.kk[None, :, 0]) * self._phi1(y, self.kk[None, :, 1])   # (P, B)
-        u = torch.complex(phi @ self.a[..., 0].T, phi @ self.a[..., 1].T).T              # (N, P)
+        a = self.a - self.a.mean(0, keepdim=True) if getattr(self, "zero_mean", False) else self.a
+        u = torch.complex(phi @ a[..., 0].T, phi @ a[..., 1].T).T                        # (N, P)
         return torch.exp(u)
 
     def penalty(self):

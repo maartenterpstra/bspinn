@@ -274,12 +274,18 @@ def phase_vortices(C: torch.Tensor, support: torch.Tensor, rel_mag: float = 0.0)
             "coils_with_vortices": int(sum(1 for c in per_coil if c > 0))}
 
 
-def gauge_poles(C, support=None, frac: float = 0.5, rel_mag: float = 0.05):
-    """Gauge (common-phase) poles: 2x2 plaquettes where at least ``frac`` of the coils with signal (|C| above
-    ``rel_mag`` x the coil's maximum on all four corners; at least max(2, N/4) of them) wind the same way.
+def gauge_poles(C, support=None, frac: float = 0.5, rel_mag: float = 0.05, radius: int = 6):
+    """Gauge (common-phase) poles: points around which at least ``frac`` of the coils wind the same way.
     A pole of the gauge is not physical (the relative phases C_j C_k^* do not wind there): SENSE ignores it,
-    but it puts a phase vortex into the complex image that spatial regularisers (TV, wavelets) penalise.
-    C: (N,H,W) array/tensor. Returns a list of (row + 0.5, col + 0.5, sign) inside ``support`` (H,W)."""
+    but it puts a phase vortex into the complex image (and NLINV's local minimum carries it as a dark spot).
+
+    Two scales: (a) 2x2 plaquettes, counting the coils with |C| above ``rel_mag`` x their maximum on all four
+    corners (at least max(2, N/4) of them); (b) square loops of half-size ``radius`` (winding around a loop = sum
+    of the plaquette windings inside it, Stokes), counting all coils: the individual coils' vortices of a gauge
+    pole need not coincide (NLINV's poles are spread over ~10 px, with weak coils), so no single plaquette
+    has a majority. Flagged cells are grouped (connected components) into one pole each, at the centroid.
+    C: (N,H,W) array/tensor. Returns a list of (row, col, sign) inside ``support`` (H,W)."""
+    from scipy.ndimage import label, uniform_filter
     C = np.asarray(C.detach().cpu() if hasattr(C, "detach") else C)
     N = C.shape[0]
     a, ph = np.abs(C), np.angle(C)
@@ -292,11 +298,28 @@ def gauge_poles(C, support=None, frac: float = 0.5, rel_mag: float = 0.05):
     am = np.minimum.reduce([a[:, :-1, :-1], a[:, 1:, :-1], a[:, 1:, 1:], a[:, :-1, 1:]])
     strong = am > rel_mag * a.reshape(N, -1).max(1)[:, None, None]
     pos, neg, ns = ((wn > 0) & strong).sum(0), ((wn < 0) & strong).sum(0), strong.sum(0)
-    g = ((pos >= frac * np.maximum(ns, 1)) | (neg >= frac * np.maximum(ns, 1))) & (ns >= max(2, N // 4))
+    g1 = ((pos >= frac * np.maximum(ns, 1)) | (neg >= frac * np.maximum(ns, 1))) & (ns >= max(2, N // 4))
+    sgn = np.where(pos >= neg, 1, -1)
+    g = g1.copy()
+    if radius and radius > 0:
+        L = 2 * radius
+        net = np.rint(uniform_filter(wn.astype(float), size=(1, L, L), mode="constant") * L * L).astype(int)
+        p2, n2 = (net > 0).sum(0), (net < 0).sum(0)
+        g2 = (p2 >= frac * N) | (n2 >= frac * N)
+        sgn = np.where(g1, sgn, np.where(p2 >= n2, 1, -1))
+        g = g1 | g2
     if support is not None:
-        s = np.asarray(support, bool)
-        g &= s[:-1, :-1] & s[1:, 1:] & s[1:, :-1] & s[:-1, 1:]
-    return [(x + 0.5, y + 0.5, 1 if pos[x, y] >= neg[x, y] else -1) for x, y in np.argwhere(g)]
+        s_ = np.asarray(support, bool)
+        g &= s_[:-1, :-1] & s_[1:, 1:] & s_[1:, :-1] & s_[:-1, 1:]
+    out = []
+    for sg in (1, -1):
+        lab, n = label(g & (sgn == sg))
+        for c in range(1, n + 1):
+            rr, cc = np.nonzero(lab == c)
+            if g1[rr, cc].any():                      # a plaquette-level pole: its exact cell(s)
+                k = np.argmax(g1[rr, cc]); rr, cc = rr[g1[rr, cc]], cc[g1[rr, cc]]
+            out.append((float(rr.mean()) + 0.5, float(cc.mean()) + 0.5, sg))
+    return out
 
 
 def remove_gauge_poles(C, support=None, max_rounds: int = 3, **kw):
@@ -314,7 +337,9 @@ def remove_gauge_poles(C, support=None, max_rounds: int = 3, **kw):
     for s_ in range(S):
         sup = None if support is None else np.asarray(support).reshape(-1, H, W)[min(s_, np.asarray(support).reshape(-1, H, W).shape[0] - 1)]
         for _ in range(max_rounds):
-            ps = gauge_poles(out[s_], sup, **kw)
+            # point-like (plaquette-level) poles only: a spread pole (coils' vortices at different points) cannot
+            # be undone by one point vortex -- every coil would get a vortex-antivortex pair
+            ps = gauge_poles(out[s_], sup, **{"radius": 0, **kw})
             if not ps:
                 break
             f = np.ones((H, W), np.complex64)

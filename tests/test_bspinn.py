@@ -1679,3 +1679,81 @@ def test_phase_reference_fallback_unwinds_gauge_poles():
     assert torch.allclose(Cr * mr[:, None], Ct * m[:, None], atol=1e-4)
     Cv, _, inf0, _ = phase_reference(Ct, "inati", torch.as_tensor(sup)[None], None, unwind=False)
     assert torch.equal(Cv, Ct)
+
+
+def test_gauge_poles_spread():
+    """gauge_poles finds a gauge pole whose per-coil vortices are spread over several pixels (as NLINV's local
+    minimum), which no single plaquette shows, and not a single coil's vortex."""
+    from bspinn.recon import gauge_poles
+    H = W = 48
+    rr, cc = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    angs = np.linspace(0, 2 * np.pi, 8, endpoint=False)
+    C = np.stack([np.exp(-((rr - 24 - 14 * np.cos(a)) ** 2 + (cc - 24 - 14 * np.sin(a)) ** 2) / 600)
+                  * np.exp(1j * np.arctan2(cc - 24.5 - 4 * np.sin(a), rr - 24.5 - 4 * np.cos(a))) for a in angs])
+    assert gauge_poles(C, radius=0) == []
+    p = gauge_poles(C)
+    assert len(p) == 1 and p[0][2] == 1 and abs(p[0][0] - 24.5) < 4 and abs(p[0][1] - 24.5) < 4
+    C1 = np.stack([np.exp(-((rr - 24 - 14 * np.cos(a)) ** 2 + (cc - 24 - 14 * np.sin(a)) ** 2) / 600) + 0j for a in angs])
+    C1[0] *= np.exp(1j * np.arctan2(cc - 20.5, rr - 20.5))
+    assert gauge_poles(C1) == []
+
+
+def test_init_from_acs_block_and_support():
+    """Calibration box not fully sampled (2x2 + ACS): the initial images come from the fully sampled centred
+    block (alias-free), so the support matches the fully sampled one far better than the aliased box image."""
+    import torch
+    from bspinn.data import MultiCoilData, make_synthetic
+    from bspinn.fit import FitConfig, Problem, _centred_full_block
+    m = torch.zeros(1, 1, 24, 24); m[..., ::2, ::2] = 1; m[..., 9:16, 9:16] = 1
+    assert _centred_full_block(m) == (7, 7)
+    d, _, _ = make_synthetic(6, (64, 64), noise=0.005)
+    k = d.kspace[0]
+    full = Problem(MultiCoilData(k[None], d.geom), FitConfig(calib=24)).support[0].numpy() > 0
+    mk = np.zeros((64, 64), bool); mk[::2, ::2] = True; mk[29:36, 29:36] = True
+    sub = MultiCoilData((k * mk[None])[None].astype(np.complex64), d.geom, mask=mk[None, None])
+    p_new = Problem(sub, FitConfig(calib=24))
+    p_old = Problem(MultiCoilData((k * mk[None])[None].astype(np.complex64), d.geom, mask=mk[None, None]),
+                    FitConfig(calib=24, init_from_acs=False))
+    assert p_new.init_block == (7, 7) and p_old.init_block is None
+    iou = lambda a, b: (a & b).sum() / max((a | b).sum(), 1)                     # noqa: E731
+    s_new, s_old = p_new.support[0].numpy() > 0, p_old.support[0].numpy() > 0
+    assert iou(s_new, full) >= iou(s_old, full) - 0.01                         # small object: copies do not overlap
+    # an object filling more of the FOV: the aliased copies overlap it and inflate the support
+    yy, xx = np.mgrid[:64, :64]
+    obj2 = (((yy - 32) / 26) ** 2 + ((xx - 32) / 24) ** 2) < 1
+    C2 = np.stack([np.exp(-((yy - 32 - 30 * np.cos(a)) ** 2 + (xx - 32 - 30 * np.sin(a)) ** 2) / 800) for a in np.linspace(0, 2 * np.pi, 6, endpoint=False)])
+    k2 = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(C2 * obj2[None], axes=(1, 2)), axes=(1, 2), norm="ortho"), axes=(1, 2))
+    f2 = Problem(MultiCoilData(k2[None].astype(np.complex64), d.geom), FitConfig(calib=24)).support[0].numpy() > 0
+    sub2 = lambda f: Problem(MultiCoilData((k2 * mk[None])[None].astype(np.complex64), d.geom, mask=mk[None, None]),  # noqa: E731
+                             FitConfig(calib=24, init_from_acs=f)).support[0].numpy() > 0
+    sn, so = sub2(True), sub2(False)
+    assert sn.sum() <= so.sum() and iou(sn, f2) >= iou(so, f2) - 0.01           # restricted, never worse
+    assert Problem(MultiCoilData(k[None], d.geom), FitConfig(calib=24)).init_block is None   # full box: unchanged
+
+
+def test_smooth_factor_zero_mean_and_joint_lbfgs_finish(capsys):
+    """SmoothFactor(zero_mean): no common (coil-averaged) log-modulation; the joint stage with
+    optimizer='adam+lbfgs' ends with an L-BFGS finish that does not increase the data term."""
+    import torch
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.models import SmoothFactor
+    f = SmoothFactor(5, (0, 1), 3, zero_mean=True)
+    with torch.no_grad():
+        f.a.normal_()
+    with torch.no_grad():
+        f.a.mul_(0.3)
+    v = f(torch.rand(50, 3) * 2 - 1)
+    assert (v.prod(0) - 1).abs().max() < 1e-4                                      # exp(sum_j u_j) = 1
+    g = f.grown(5)
+    assert g.zero_mean
+    d, _, _ = make_synthetic(4, (32, 32), noise=0.01)
+    k = d.kspace[0]
+    m = np.zeros((32, 32), bool); m[:, ::2] = True; m[:, 12:20] = True
+    estimate_maps(k * m[None], "2d", mask=m, calib=12, iters_auto=2, iters_wires=20, iters_pinn=20, iters_joint=10,
+                  solve_image=True, optimizer="adam+lbfgs", joint_lbfgs=10, verbose=True)
+    out = capsys.readouterr().out
+    line = [l for l in out.splitlines() if "L-BFGS finish" in l]
+    assert line, out[-2000:]
+    a, b = [float(v) for v in line[-1].split("data ")[1].split(" -> ")]
+    assert b <= a * 1.001
