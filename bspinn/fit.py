@@ -151,6 +151,8 @@ class FitConfig:
     joint_lbfgs: int = 60            # optimizer 'adam+lbfgs': L-BFGS iterations finishing the joint full-resolution
                                      #   stage (maps by L-BFGS on a fixed collocation set, image by exact CG /
                                      #   prior updates in between, alternating every lbfgs_inner); 0: Adam only (v54)
+    joint_lbfgs_cg: int = 5          # joint_lbfgs: warm-started CG steps on the image inside every L-BFGS evaluation
+                                     #   (variable projection, v55b; 0: image fixed for lbfgs_inner steps, v55)
     resid_zero_mean: bool = True     # smooth factor without a common (coil-averaged) component (v55; False: v54)
     init_from_acs: bool = True       # Cartesian, calibration box not fully sampled: the object support (keep-out,
                                      #   collocation) restricted to that of the largest fully sampled centred block
@@ -1136,21 +1138,40 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         optl = torch.optim.LBFGS(flat, lr=1.0, max_iter=inner, history_size=50, tolerance_grad=1e-12,
                                  tolerance_change=1e-15, line_search_fn="strong_wolfe")
 
+        # variable projection (v55b): with the CG image update, every evaluation first solves for the image
+        # (joint_lbfgs_cg warm-started CG steps from the image at the start of this outer step: a deterministic
+        # function of the map parameters, as the line search needs), and the value includes the image's Tikhonov
+        # term. By the envelope theorem the map gradient with the image held fixed is then the gradient of the
+        # reduced functional min_x L(C(theta), x): L-BFGS sees one consistent objective, not L(C, x_stale).
+        vp = (not grad_img) and jp is None and int(getattr(cfg, "joint_lbfgs_cg", 0)) > 0
+        x_start = x.detach().clone()
+
         def closure_l():
             optl.zero_grad(set_to_none=True)
+            if vp:
+                with torch.no_grad():
+                    C_now, _ = maps(False)
+                    x.copy_(_cg_image(C_now, y, M, box, lam, x_start, int(cfg.joint_lbfgs_cg)))
             rest, d = step()
             if torch.is_tensor(rest) and rest.requires_grad:
                 rest.backward()
             total = (rest.detach() if torch.is_tensor(rest) else torch.tensor(float(rest), device=dev))
             if not state.get("d_in_rest", True):
                 total = total + d.detach()
+            if vp:
+                total = total + lam * x.detach().abs().pow(2).sum() / ynorm
             state["o"] = (total, d)
             return total
         closure_l(); d_a = float(state["o"][1])
         done_ = 0
         while done_ < int(cfg.joint_lbfgs):
+            x_start = x.detach().clone()
             optl.step(closure_l)
-            post()
+            if not vp:
+                post()
+            else:                                       # the history belongs to one objective: restart it
+                optl = torch.optim.LBFGS(flat, lr=1.0, max_iter=inner, history_size=50, tolerance_grad=1e-12,
+                                         tolerance_change=1e-15, line_search_fn="strong_wolfe")
             done_ += inner
         state["colloc"] = None
         log(f"[joint full-res] L-BFGS finish {cfg.joint_lbfgs} it: data {d_a:.4e} -> {float(state['o'][1]):.4e}")
