@@ -1090,7 +1090,9 @@ v33 as first released ignored the smooth factor and the coupling inside the join
 applied them to the returned maps (k19870 joint: 2.45 / 0.142); fixed in v34 (`fit_joint_full` applies both).
 `joint_freeze_extra=True` keeps them at their calibration values in the joint stage: better on an exact
 Biot–Savart phantom (subspace error 7.1e-5 vs 3.0e-4), worse on the real knees (k19870 1.056 vs 1.048,
-knee A 1.130 vs 1.112), so off by default. On exact Biot–Savart phantoms the joint stage itself raises the
+knee A 1.130 vs 1.112), so off by default. Until v53 they were trained there without their Sobolev / ridge
+penalties (`lambda_resid`, `lambda_mix`, applied in every other stage); v54 adds them (`joint_extra_penalty=True`,
+default; False restores v53) -- not yet re-evaluated on the knees. On exact Biot–Savart phantoms the joint stage itself raises the
 map error (v32: 7.6e-5 -> 1.1e-4), as before.
 
 **Not adopted:** `field_mode='complex'` (no gain on one slice), `shift_sets=1` (worse), coupling from the
@@ -1427,6 +1429,58 @@ by frame in pixel chunks (it ran out of 7 GB at full resolution before).
 BART=bart/bart python scripts/ocmr_eval.py --files /data/ocmr/fs_*.h5 --slices mid --R 1 4 8 \
     --maps espirit nlinv pinn_avg pinn_dyn pinn_dyn0 --device cuda --oracle --save-images --out runs/ocmr/results.jsonl
 ```
+
+fs_0004 at R = 8 (26 of 208 lines per frame), TV: ESPIRiT 0.1466, NLINV 0.1279, pinn_avg 0.1274, pinn_dyn0
+0.1278, pinn_dyn 0.1296 (per-frame SENSE: ESPIRiT 0.264 is best there; its zeroed background limits the
+noise amplification, which TV makes irrelevant).
+
+Second real case, OCMR fs_0020_3T (3 T short-axis, 38 coils, 192 x 144, 22 frames; same settings; the K=2 fits
+at R = 4 / 8 used 1 frame per step to fit a 6 GB machine, the R = 1 fit 2):
+
+| maps | R=1 lco / floor | R=4 SENSE | R=4 TV | R=8 SENSE | R=8 TV |
+|---|---|---|---|---|---|
+| ESPIRiT | 2.085 | 0.0665 | 0.0475 | 0.1130 | 0.0515 |
+| NLINV | 1.638 | 0.0612 | 0.0291 | 0.1349 | 0.0370 |
+| pinn_avg | 1.734 | 0.0517 | 0.0318 | 0.1281 | 0.0372 |
+| pinn_dyn0 | 1.741 | 0.0517 | 0.0338 | 0.1290 | 0.0372 |
+| pinn_dyn (K=2) | 1.786 | 0.0584 | 0.0426 | 0.1599 | 0.0522 |
+
+With TV the time-averaged PINN maps tie NLINV at R = 8 on both cases and trail it by 0.8 dB at R = 4 on fs_0020;
+both are 1-3 dB ahead of ESPIRiT. Per-dynamic maps lose up to 3 dB on fs_0020. Their temporal change
+(per-frame deviation from the mean maps, relative) is 1.5 % (fs_0004) / 8 % (fs_0020) fully sampled but 2-6 % /
+18 % undersampled: with 18-36 lines per frame the temporal modes fit aliasing and noise rather than coil loading.
+
+Prospective case, OCMR us_0001_3T (3 T short-axis, 34 coils, 192 x 144, pseudo-random 16 of 144 lines per frame,
+R = 9, asymmetric echo, noise scan; first 48 of 65 frames to fit a 6 GB machine). No reference: scored by held-out
+k-space prediction (`scripts/ocmr_prospective.py`): 2 acquired lines per frame withheld from maps and images,
+mean residual on them over the noise level (1 = noise only; the level is estimated from k-space corners, an
+upper bound, so training residuals come out below 1 -- the same for every map set):
+
+| maps | SENSE held-out | TV held-out | TV centre lines | TV outer lines | TV train |
+|---|---|---|---|---|---|
+| ESPIRiT | 59.4 | 2.24 | 5.29 | 1.17 | 0.93 |
+| NLINV | 86.4 | 1.24 | 1.83 | 1.03 | 0.68 |
+| pinn_avg | 77.4 | 1.26 | 1.87 | 1.05 | 0.71 |
+| pinn_dyn (K=2) | 93.2 | 5.09 | 11.8 | 2.73 | 2.77 |
+
+(TV weight: the fallback 2e-3 for all, the CV curve on the 1e-3..1e-1 grid had no interior minimum.) Again the
+time-averaged PINN ties NLINV and both are far ahead of ESPIRiT in central k-space. The per-dynamic fit fails
+here: it explains even the training samples worse than the static maps (a rank-2 model contains the static one),
+and its time-mean maps drift from pinn_avg by 0.125 (1 - |overlap|; NLINV vs pinn_avg: 0.085). With pseudo-random
+sampling there is no per-frame calibration region (about 3 lines per frame inside the 24-line box), and the
+dynamic stage keeps training the static model on single frames. Candidate fixes (not yet run): freeze the static
+part in the dynamic stage when it comes from the time average, take the B0 plane from the 2-D held-out decision
+(the dynamic path picked 'coronal' from a near tie), and initialise the temporal modes from a sampling-
+independent signal (the coil-energy PCA sees which lines each frame sampled).
+
+```
+BART=bart/bart python scripts/ocmr_prospective.py --files /data/ocmr/us_0001_3T.h5 \
+    --maps espirit nlinv pinn_avg pinn_dyn --device cuda --save-images --out runs/ocmr_us/results.jsonl
+```
+
+Memory (for small machines): the dynamic layout uses fewer frames per step above 20 coils, post-processes long
+series frame by frame, and selects the B0 plane on the time average; the OCMR reader removes the readout
+oversampling plane by plane in complex64 (us_0001 load: >5 GB -> 2.3 GB).
 
 ## 9. Code map
 
