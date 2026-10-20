@@ -521,26 +521,36 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     kt = np.ascontiguousarray(np.moveaxis(ksp, -1, 0))                      # (T,N,X,Y)
     mt = None if mask is None else np.moveaxis(mask, -1, 0)[:, None]        # (T,1,X,Y)
     scores = None
-    if plane == "auto":
-        mt_ = mt if mt is not None else (np.abs(kt).sum(1, keepdims=True) > 0)
-        plane, scores, _ = _select_plane(kt, mt_, spacing, noise, cfg, log, meta={"dynamic": True})
-    geom = SliceGeometry((X, Y), spacing, np.zeros(T), plane)               # frames = co-located slices
-    data = MultiCoilData(kt, geom, mask=mt, noise=noise, meta={"dynamic": True})
-    if mt is None:
-        data.mask = (np.abs(kt).sum(1, keepdims=True) > 0)
-    pts = geom.grid((X, Y))[0].reshape(-1, 3)
-    avg_data = None
+    m_all = mt if mt is not None else (np.abs(kt).sum(1, keepdims=True) > 0)  # (T,1,X,Y)
+    kav = cnt = None
     if static == "average":
         # the static part from the time-averaged k-space (sum over frames / frames sampling each point): with
         # per-frame undersampling (GRO: no per-frame calibration region) a joint fit to the frames is
-        # ill-posed; the average is densely sampled (v50, README 8.11)
-        mt_ = data.mask[:, 0].astype(float)                                 # (T,X,Y)
-        cnt = mt_.sum(0)
-        kav = (kt * mt_[:, None]).sum(0) / np.maximum(cnt, 1)[None]
-        avg_data = MultiCoilData(kav[None], SliceGeometry((X, Y), spacing, np.zeros(1), plane),
-                                 mask=(cnt > 0)[None, None], noise=noise)
+        # ill-posed; the average is densely sampled (v50, README 8.11). Frame by frame: bounded memory.
+        cnt = m_all[:, 0].sum(0).astype(np.float32)
+        kav = np.zeros((N, X, Y), np.complex64)
+        for t in range(T):
+            kav += kt[t] * m_all[t]
+        kav /= np.maximum(cnt, 1)[None]
     elif static != "frames":
         raise ValueError("dynamic_static must be 'average' or 'frames'")
+    if plane == "auto":
+        # with the static part from the average, select the B0 plane on it too (the data of the static fit;
+        # on all frames the wire fits scale with the number of frames: us_0001, 48 frames, OOM'd 6 GB)
+        if kav is not None:
+            plane, scores, _ = _select_plane(kav[None], (cnt > 0)[None, None], spacing, noise, cfg, log,
+                                             meta={"dynamic": True})
+        else:
+            plane, scores, _ = _select_plane(kt, m_all, spacing, noise, cfg, log, meta={"dynamic": True})
+    geom = SliceGeometry((X, Y), spacing, np.zeros(T), plane)               # frames = co-located slices
+    data = MultiCoilData(kt, geom, mask=mt, noise=noise, meta={"dynamic": True})
+    if mt is None:
+        data.mask = m_all
+    pts = geom.grid((X, Y))[0].reshape(-1, 3)
+    avg_data = None
+    if kav is not None:
+        avg_data = MultiCoilData(kav[None], SliceGeometry((X, Y), spacing, np.zeros(1), plane),
+                                 mask=(cnt > 0)[None, None], noise=noise)
     if rank == 0:
         from .fit import fit
         model, prob, hist, extra = fit(avg_data if avg_data is not None else data, cfg, log=log)
