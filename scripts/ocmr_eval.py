@@ -107,6 +107,8 @@ def main():
     ap.add_argument("--rank", type=int, default=2, help="pinn_dyn temporal modes")
     ap.add_argument("--noise", default="scan", choices=["scan", "data"])
     ap.add_argument("--quality", default="default", choices=["fast", "default"])
+    ap.add_argument("--dyn-set", nargs="*", default=[], help="pinn_dyn: bspinn.dynamic.DynConfig fields key=value "
+                    "(e.g. lambda_corr=0.01 freeze_static=False alpha_init=data)")
     ap.add_argument("--pinn-set", nargs="*", default=[], help="extra estimate_maps / FitConfig options key=value")
     ap.add_argument("--plane", default="auto")
     ap.add_argument("--spatial-ratio", type=float, default=0.25, help="tv: spatial / temporal TV weight")
@@ -136,6 +138,7 @@ def main():
         print("CUDA not available: using the CPU (slow)"); a.device = "cpu"
     files = sorted({f for p in a.files for f in (glob.glob(p) or [p])})
     pset = parse_set(a.pinn_set)
+    dset = parse_set(a.dyn_set)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     root = os.path.dirname(os.path.abspath(a.out))
     done = set()
@@ -192,7 +195,7 @@ def main():
                                 C = estimate_maps(kavg * mavg[None], "2d", mask=mavg, readout_axis=0, **common)[0]
                             elif mname in ("pinn_dyn", "pinn_dyn0"):
                                 C = estimate_maps(ku, "dynamic", mask=m, rank=0 if mname == "pinn_dyn0" else a.rank,
-                                                  **common)[0]                                     # (N,X,Y,T)
+                                                  dynamic_options=dset or None, **common)[0]                                     # (N,X,Y,T)
                                 if mname == "pinn_dyn0":
                                     C = C[..., 0]
                             elif mname == "pinn_frame":

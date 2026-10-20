@@ -1605,3 +1605,29 @@ def test_finish_dynamic_chunked_matches(monkeypatch):
     r = ch * full.conj()
     ph = r.sum() / np.abs(r.sum())
     assert np.allclose(r, ph * np.abs(r), atol=1e-4)
+
+
+def test_dynamic_base_plus_corrections(capsys):
+    """layout='dynamic' (v55): the time-averaged model is the fixed base, per-frame corrections start at zero and are
+    shrunk towards it; with no calibration line shared by all frames the temporal modes start as smooth cosines;
+    static coils give per-frame maps close to the base."""
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.dynamic import alpha_dct
+    from bspinn.masks import gro_mask
+    a = alpha_dct(8, 2).numpy()
+    assert np.allclose((a ** 2).mean(0), 1, atol=1e-6) and abs((a[:, 0] * a[:, 1]).mean()) < 1e-6
+    d, _, _ = make_synthetic(4, (32, 32), noise=0.01)
+    T = 6
+    m = gro_mask((32, 32), T, 4, pe_axis=1)
+    kd = np.stack([d.kspace[0]] * T, -1) * m[None]
+    C, info = estimate_maps(kd, "dynamic", mask=m, rank=2, calib=12, iters_auto=2, iters_wires=20, iters_pinn=20,
+                            iters_dynamic=30, verbose=True, dynamic_options={"lambda_corr": 1e-1})
+    dyn = info["model"]
+    assert not any(q.requires_grad for q in dyn.static.parameters())
+    txt = capsys.readouterr().out
+    assert "smooth cosines" in txt and "fixed" in txt
+    Cn = C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)), 1e-12)
+    sup = info["support"]
+    dev = np.linalg.norm((Cn - Cn.mean(-1, keepdims=True))[:, sup]) / np.linalg.norm(Cn[:, sup])
+    assert dev < 0.05

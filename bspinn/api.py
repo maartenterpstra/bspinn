@@ -35,6 +35,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda="auto", sense_lambda_scale=1.0, sense_lambda_options=None, sense_iters=60, mask_maps=False, support_threshold=0.1,
                   support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout",
                   image_prior=None, image_prior_weight="auto", image_prior_options=None, dynamic_static="average",
+                  dynamic_options=None,
                   **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
@@ -66,6 +67,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     dynamic_static : dynamic only. 'average' (default, v50): the static part of the coil model is fitted to the
         time-averaged k-space and the temporal modes (rank > 0) to the frames; 'frames': the static part is
         fitted jointly to all frames (ill-posed when the frames are undersampled without a calibration region).
+        With 'average' the time-averaged model is the FIXED base and only low-rank per-frame corrections are
+        learned (v55), started at zero and shrunk towards the base.
+    dynamic_options : dynamic only. dict of bspinn.dynamic.DynConfig fields, e.g. {'lambda_corr': 1e-2,
+        'freeze_static': True, 'alpha_init': 'auto' | 'dct' | 'data', 'parts': 'both' | 'wires' | 'fields'}.
     rank : dynamic only. Number of temporal motion modes of the coil array; 0 = one static map set
         shared by all frames (frames are then only used as extra data).
     quality : 'fast' | 'default'. Iteration presets (see PRESETS); override with iters_wires=...,
@@ -246,7 +251,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     elif layout == "3d":
         C, info = _run_3d(ksp, mask, spacing, axes, noise, cfg, log)
     else:
-        C, info = _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log, dynamic_static)
+        C, info = _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log, dynamic_static,
+                               dynamic_options)
 
     # C: data-channel maps, (N, *spatial) or (T, N, X, Y) for dynamic. Pre-whitening made the data
     # channels M @ (original channels): map back to the original channels.
@@ -514,7 +520,7 @@ def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
     return C, info
 
 
-def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log, static="average"):
+def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log, static="average", options=None):
     from .data import MultiCoilData
     from .geometry import SliceGeometry
     N, X, Y, T = ksp.shape
@@ -561,7 +567,7 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
             "handedness": extra["handedness"], "data_loss": _last(hist), "rank": 0, "model": model, "problem": prob,
             "_m": extra["image_lowres"], "_xfull": extra.get("image_full"), "plane": plane, "plane_scores": scores}
     from .dynamic import DynConfig, fit_dynamic
-    dcfg = DynConfig(rank=rank, iters_dyn=iters_dynamic or max(300, cfg.iters_pinn // 2))
+    dcfg = DynConfig(rank=rank, iters_dyn=iters_dynamic or max(300, cfg.iters_pinn // 2), **(options or {}))
     dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log, static_data=avg_data)
     out = []
     dyn.to(cfg.device); pts_d = pts.to(cfg.device)

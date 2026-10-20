@@ -112,6 +112,20 @@ class DynamicCoils(nn.Module):
         return smooth, unit, outside
 
 
+def alpha_dct(T: int, K: int):
+    """K smooth temporal modes (cosines of periods 2T, T, ...) at unit RMS: a sampling-independent start."""
+    t = (np.arange(T) + 0.5) / T
+    a = np.stack([np.cos(np.pi * (k + 1) * t) for k in range(K)], 1) * np.sqrt(2)
+    return torch.as_tensor(a, dtype=torch.float32)
+
+
+def shared_calibration_lines(prob: Problem) -> int:
+    """Phase-encode lines inside the calibration box sampled in every frame."""
+    mk = prob.mk                                                             # (S,1|N,h,w) on the model grid
+    m = (mk.reshape(mk.shape[0], -1, *mk.shape[-2:]).amax(1) > 0)            # (S,h,w)
+    return int(m.all(0).any(0).sum())
+
+
 def alpha_from_data(prob: Problem, K: int, smooth: int = 3):
     """Self-gating initialisation: leading temporal principal components of the per-frame
     distribution of energy over coils (insensitive to global contrast changes)."""
@@ -136,6 +150,14 @@ class DynConfig:
     lr_verts: float = 3e-3
     parts: str = "both"
     max_disp_mm: float = 0.0          # bound on conductor displacement (0 = none)
+    # base + corrections (v55): with the static part from the time average, keep it FIXED and learn only the
+    # low-rank per-frame corrections (conductor motion, rank-K harmonic fields), started at zero, shrunk
+    # towards the base by lambda_corr * sum_t ||C_t - C_base||^2 / ||C_base||^2 (per frame, mean over frames)
+    freeze_static: bool | None = None  # None: True when the static stage used the time average
+    lambda_corr: float = 1e-2
+    alpha_init: str = "auto"          # 'data' (coil-energy PCA) | 'dct' (smooth cosines) | 'auto': 'dct' when
+                                      #   the frames share no calibration lines (pseudo-random / GRO sampling:
+                                      #   the coil-energy PCA then sees the sampling pattern, not the coils)
 
 
 def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print, static_data=None):
@@ -160,11 +182,26 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print,
         log(f"dynamic: static stage on the time-averaged k-space, temporal modes from {prob.S} frames")
     snapshot = copy.deepcopy(static_model)
     prob.to(cfg.device); static_model.to(cfg.device)
-    a0, ev = alpha_from_data(prob, dcfg.rank)
-    log(f"temporal modes initialised from data (explained variance of coil-energy PCA: {np.round(ev, 3).tolist()})")
+    freeze = dcfg.freeze_static if dcfg.freeze_static is not None else static_data is not None
+    init = dcfg.alpha_init
+    if init == "auto":
+        init = "dct" if shared_calibration_lines(prob) < 2 else "data"
+    if init == "dct":
+        a0, ev = alpha_dct(prob.S, dcfg.rank), []
+        log(f"temporal modes initialised as {dcfg.rank} smooth cosines (frames share "
+            f"{shared_calibration_lines(prob)} calibration lines)")
+    elif init == "data":
+        a0, ev = alpha_from_data(prob, dcfg.rank)
+        log(f"temporal modes initialised from data (explained variance of coil-energy PCA: {np.round(ev, 3).tolist()})")
+    else:
+        raise ValueError("alpha_init must be 'auto', 'data' or 'dct'")
     dyn = DynamicCoils(static_model, prob.S, dcfg.rank, a0, cfg.latent, cfg.width, cfg.depth, dcfg.parts).to(cfg.device)
+    if freeze:                                     # the time-averaged base is fixed: only corrections are learned
+        for q in dyn.static.parameters():
+            q.requires_grad_(False)
+        log("dynamic: static (time-averaged) model fixed; learning per-frame corrections")
     m = torch.nn.Parameter(m_static.clone()) if m_static is not None else None
-    params = [{"params": dyn.static.parameters(), "lr": cfg.lr_pinn},
+    params = ([] if freeze else [{"params": dyn.static.parameters(), "lr": cfg.lr_pinn}]) + [
               {"params": dyn.dyn.parameters() if dyn.dyn is not None else [], "lr": cfg.lr_pinn},
               {"params": [dyn.V], "lr": dcfg.lr_verts},
               {"params": [dyn.alpha], "lr": dcfg.lr_alpha}]
@@ -180,16 +217,21 @@ def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print,
     max_disp = dcfg.max_disp_mm / prob.data.geom.half_fov if dcfg.max_disp_mm else None
     B = cfg.slice_batch or prob.S
     wires = [dyn.static.base] if dyn.static.base is not None else []
+    with torch.no_grad():                         # the base maps on the model grid (corrections start at zero)
+        C_base = dyn.sensitivity_frames(pts, [0], create_graph=False)[0].detach()
+    base_energy = float((C_base.abs() ** 2).sum())
 
     def step_loss(fr, pin, pair):
         C = dyn.sensitivity_frames(pts, fr)                        # (B,N,P)
         Cflat = C.permute(1, 0, 2).reshape(prob.N_model, -1)
         d = prob.data_loss(Cflat, m, fr)
-        phys = _physics_at(dyn, cfg, pin, pair)
+        phys = (_physics_at(dyn.dyn, cfg, pin, pair) if (freeze and dyn.dyn is not None)
+                else _physics_at(dyn, cfg, pin, pair) if not freeze else d * 0)
         smooth, unit, outside = dyn.regularisers(fr, prob.keep, cfg.outside_margin, max_disp)
+        corr = (C - C_base[None]).abs().pow(2).sum() / (base_energy * C.shape[0])
         loss = (d + cfg.lambda_phys * phys + cfg.lambda_norm * prob.norm_loss(Cflat, fr)
                 + dcfg.lambda_smooth * smooth + dcfg.lambda_unit * unit + cfg.lambda_outside * outside
-                + _extra_penalty(dyn, C, m, cfg))
+                + dcfg.lambda_corr * corr + _extra_penalty(dyn, C, m, cfg))
         return loss, d, phys, smooth
 
     def after(it, o):
