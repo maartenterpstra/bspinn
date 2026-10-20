@@ -20,7 +20,7 @@ than eager because of recompilation and per-call overhead, and it was removed.)
 """
 import torch
 
-STATS = {"captured": 0, "fallback": 0, "last_error": None}     # CUDA-graph stages (for diagnostics)
+STATS = {"captured": 0, "fallback": 0, "last_error": None, "broken": False}     # CUDA-graph stages (for diagnostics)
 TIMES = {}                                                     # wall time per phase of the last estimate_maps
 
 
@@ -93,7 +93,9 @@ def adam(params, device=None, **kw):
 def graph_mode(cfg, device, iters, warmup=3):
     """cfg.cuda_graph on a CUDA device, and enough iterations to warm up, capture and replay."""
     on_dev = torch.device(device).type == "cuda" or getattr(cfg, "_graph_emulate", False)   # (test hook: CPU)
-    return bool(getattr(cfg, "cuda_graph", False)) and on_dev and iters >= warmup + 2
+    # after a failed capture the caching allocator can be left mid-capture ('captures_underway.empty()' asserts
+    # on every later capture): graphs stay off for the rest of the process
+    return bool(getattr(cfg, "cuda_graph", False)) and on_dev and iters >= warmup + 2 and not STATS["broken"]
 
 
 def capturable_adam(groups, device, default_lr=1e-3, betas=(0.9, 0.999)):
@@ -209,6 +211,7 @@ def _abort_capture(g, gens, clean):
             except Exception:
                 pass
     torch.cuda.synchronize()
+    STATS["broken"] = True
 
 
 def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, after=None, warmup=3, log=print,

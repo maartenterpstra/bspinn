@@ -1406,7 +1406,8 @@ def _fit_free(prob, cfg, history, t0, log):
         loss.backward(); opt.step()
     log(f"[free] distilled to low-res division maps: {loss.item():.3e}")
     # the ablation's smoothness term acts on the object only (as defined), not on the air collocation
-    c2 = FitConfig(**{**cfg.__dict__, "lambda_phys": cfg.lambda_sobolev, "air_colloc": 0.0})
+    # (eager: its PINN stage failed to capture as a CUDA graph on torch 2.14, which then broke every later capture)
+    c2 = FitConfig(**{**cfg.__dict__, "lambda_phys": cfg.lambda_sobolev, "air_colloc": 0.0, "cuda_graph": False})
     m, history["pinn"] = fit_pinn(prob, c2, model, None, log=log)
     log(f"fit done in {time.time() - t0:.1f}s")
     model.cpu(); prob.to("cpu")
