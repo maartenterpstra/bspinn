@@ -16,6 +16,8 @@ Maps from the undersampled data (--maps):
   pinn      estimate_maps 2-D, maps only (the --box calibration box), v54 options
   pinn_v54  estimate_maps with the joint full-resolution stage (solve_image=True, all samples), v54 options
   pinn_v55  the same with the v55 defaults (init_from_acs, resid_zero_mean, joint_lbfgs)
+  <pinn*>@key=value[@key=value...]   a variant with extra estimate_maps / FitConfig options, its own cache and
+            rows, for ablations, e.g. pinn_v55@init_from_acs=False  pinn_v55@joint_lbfgs=0  pinn_v54@seed=1
 Scored against the fully sampled plane: gauge poles inside the object (bspinn.recon.gauge_poles); leave-coil-out
 residual / noise floor (gauge-invariant) over the object and within 8 px of any method's pole; CG-SENSE NRMSE at
 the same undersampling (object, near poles). One JSON line per (file, acs, maps) in --out (resume-safe); maps cached
@@ -151,14 +153,16 @@ def main():
                         own[name] = im
                         os.makedirs(os.path.dirname(cp), exist_ok=True)
                         np.save(cp.replace(".npy", "_img.npy"), im.astype(np.complex64))
-                    elif name in ("pinn", "pinn_v54", "pinn_v55"):
+                    elif name.split("@")[0] in ("pinn", "pinn_v54", "pinn_v55"):
+                        base, *opts = name.split("@")             # e.g. pinn_v55@resid_zero_mean=False@seed=1
                         kw = dict(mask=m, calib=a.box, spacing=sp, quality=a.quality, verbose=False, device=a.device,
                                   readout_axis=0)
-                        if name != "pinn":
+                        if base != "pinn":
                             kw.update(solve_image=True, optimizer="adam+lbfgs")
-                        if name != "pinn_v55":
+                        if base != "pinn_v55":
                             kw.update(V54)
                         kw.update(pset)
+                        kw.update(parse_set(opts))
                         C = estimate_maps(ku, "2d", **kw)[0]
                     else:
                         raise SystemExit(f"unknown maps {name}")
