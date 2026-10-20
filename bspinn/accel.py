@@ -191,6 +191,26 @@ def cosine_lr(base, eta_min, it, T, sched=("cosine", 0.0)):
     return eta_min + (base - eta_min) * (1 + math.cos(math.pi * t / TT)) / 2
 
 
+def _abort_capture(g, gens, clean):
+    """After a failed capture: release the graph and give every registered generator back a clean state (an
+    aborted capture leaves its state in capture mode: the next eager draw would fail with 'Offset increment outside
+    graph capture encountered unexpectedly')."""
+    try:
+        if g is not None:
+            g.reset()
+    except Exception:
+        pass
+    for gen, c in zip(gens, clean):
+        try:
+            gen.graphsafe_set_state(c)
+        except Exception:
+            try:
+                gen.set_state(c.get_state())
+            except Exception:
+                pass
+    torch.cuda.synchronize()
+
+
 def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, after=None, warmup=3, log=print,
                   post=None):
     """Run ``iters`` iterations of  out = step(); out[0].backward(); opt.step()  with the iterations after
@@ -233,6 +253,8 @@ def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, aft
         for it in range(warmup):
             out = eager(it)
     torch.cuda.current_stream().wait_stream(s)
+    g = None
+    clean = [gen.clone_state() for gen in gens]          # clean copies, restored if the capture fails
     try:
         g = torch.cuda.CUDAGraph()
         for gen in gens:
@@ -251,7 +273,7 @@ def train_graphed(step, opt, base_lrs, eta_min, iters, gens=(), before=None, aft
         STATS["fallback"] += 1
         STATS["last_error"] = f"{type(e).__name__}: {str(e)[:300]}"
         log(f"CUDA graph capture failed ({type(e).__name__}: {str(e)[:200]}); continuing eagerly")
-        torch.cuda.synchronize()
+        _abort_capture(g, gens, clean)
         for it in range(warmup, iters):
             out = eager(it)
         return out
@@ -299,6 +321,8 @@ def train_graphed_many(jobs, warmup=3, log=print):
         with torch.cuda.stream(s):
             for it in range(min(warmup, iters)):
                 st["out"] = eager(it)
+        g = None
+        clean = [gen.clone_state() for gen in gens]
         try:
             g = torch.cuda.CUDAGraph()
             for gen in gens:
@@ -318,7 +342,7 @@ def train_graphed_many(jobs, warmup=3, log=print):
             STATS["fallback"] += 1
             STATS["last_error"] = f"{type(e).__name__}: {str(e)[:300]}"
             log(f"CUDA graph capture failed ({type(e).__name__}: {str(e)[:200]}); this stage continues eagerly")
-            torch.cuda.synchronize()
+            _abort_capture(g, gens, clean)
             st["graph"] = None
         state.append(st)
     for it in range(warmup, max(st["iters"] for st in state)):
