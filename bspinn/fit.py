@@ -1202,7 +1202,8 @@ def _joint_chunk(cfg, model, n_coils, dev, n_points):
         return int(cfg.joint_chunk)
     if dev.type != "cuda":
         return max(256, 65536 // max(1, n_coils))
-    free, _ = torch.cuda.mem_get_info(dev)
+    # 'cuda' without an index: the current device (mem_get_info needs an index)
+    free, _ = torch.cuda.mem_get_info(dev if dev.index is not None else torch.cuda.current_device())
     width, depth = getattr(cfg, "width", 64), getattr(cfg, "depth", 4)
     # saved activations per point-coil: value + 3 tangents per layer (fp32), x3 for backward temporaries,
     # plus the wire terms (vertices x ~12 floats)
