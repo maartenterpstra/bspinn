@@ -1587,3 +1587,21 @@ def test_ocmr_prospective_heldout(tmp_path, monkeypatch):
     assert {r["recon"] for r in rows} == {"sense", "tv"}
     assert all(np.isfinite(r["heldout"]) and r["heldout"] > 0.5 and r["train"] > 0 for r in rows)
     assert (tmp_path / "res" / "us_test_images.npz").exists()
+
+
+def test_finish_dynamic_chunked_matches(monkeypatch):
+    """api._finish on long dynamic series (chunks of frames, body-coil weights from a frame subset) equals the
+    one-shot result up to a global phase."""
+    from bspinn import api
+    rng = np.random.default_rng(0)
+    N, X, Y, T = 4, 16, 18, 12
+    C1 = rng.normal(size=(N, X, Y)) + 1j * rng.normal(size=(N, X, Y)) + 3
+    C = np.broadcast_to(C1[None], (T, N, X, Y)).astype(np.complex64).copy()
+    sup = np.ones((X, Y), bool)
+    full = api._finish(C, sup, "dynamic", "inati-eig", "rss")
+    monkeypatch.setattr(api, "FINISH_CHUNK_ELEMENTS", 0)
+    ch = api._finish(C, sup, "dynamic", "inati-eig", "rss")
+    assert np.allclose(np.abs(ch), np.abs(full), atol=1e-5)
+    r = ch * full.conj()
+    ph = r.sum() / np.abs(r.sum())
+    assert np.allclose(r, ph * np.abs(r), atol=1e-4)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -254,8 +255,11 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     fold_maps = info.pop("_fold_maps", None) or {}
     if M is not None:
         Minv = np.linalg.inv(np.asarray(M))
-        C = (np.einsum("ij,tj...->ti...", Minv, C) if layout == "dynamic"
-             else np.einsum("ij,j...->i...", Minv, C))
+        if layout == "dynamic":                  # frame by frame in complex64: bounded memory for long series
+            Minv64 = Minv.astype(np.complex64)
+            C = np.stack([np.einsum("ij,j...->i...", Minv64, C[t]) for t in range(C.shape[0])])
+        else:
+            C = np.einsum("ij,j...->i...", Minv, C)
         fold_maps = {kk: np.einsum("ij,j...->i...", Minv, v) for kk, v in fold_maps.items()}
     C_raw = C
     if fold_maps and layout == "2d":
@@ -755,8 +759,38 @@ def _fold_correct(C, fold_maps, ksp, mask, calib, log, ridge=1e-3, min_gain=0.3,
     return out.astype(np.complex64), rep
 
 
+FINISH_CHUNK_ELEMENTS = 20_000_000          # dynamic maps above this size: phase reference in chunks of frames
+
+
 def _finish(C, sup, layout, phase_ref, normalise, device=None):
     from .recon import phase_reference, virtual_body_coil
+    if layout == "dynamic" and C.size > FINISH_CHUNK_ELEMENTS and C.shape[0] > 8:
+        # long series (OCMR us_0001: 48 frames x 34 coils OOM'd 6 GB): the virtual body coil weights from <= 8
+        # evenly spaced frames (one weight vector for the series, as before), then frames in chunks of 8
+        T = C.shape[0]
+        d = None
+        if phase_ref in ("inati", "inati-eig"):
+            idx = np.unique(np.linspace(0, T - 1, 8).round().astype(int))
+            Cs = torch.from_numpy(np.ascontiguousarray(C[idx])).to(torch.complex64)
+            d = virtual_body_coil(Cs, torch.from_numpy(sup)[None].expand(len(idx), -1, -1).float(),
+                                  robust=(phase_ref == "inati"), device=device).cpu()
+            del Cs
+        out = np.empty(C.shape, np.complex64)
+        modes = set()
+        for t0 in range(0, T, 8):
+            Ct = torch.from_numpy(np.ascontiguousarray(C[t0:t0 + 8])).to(torch.complex64)
+            S = torch.from_numpy(sup)[None].expand(Ct.shape[0], -1, -1)
+            if phase_ref not in ("model", "none"):
+                Ct, _, inf, _ = phase_reference(Ct, phase_ref, S, None, d)
+                modes.add(str(inf.get("phase_ref")))
+            if normalise == "rss":
+                Ct = Ct / (Ct.abs() ** 2).sum(1, keepdim=True).sqrt().clamp_min(1e-12)
+            elif normalise != "none":
+                raise ValueError("normalise must be 'rss' or 'none'")
+            out[t0:t0 + 8] = Ct.numpy()
+        if len(modes) > 1:
+            warnings.warn(f"phase reference differed between frame chunks ({sorted(modes)})")
+        return out
     Ct = torch.from_numpy(np.ascontiguousarray(C)).to(torch.complex64)
     if layout == "2d":
         Cs, S = Ct[None], torch.from_numpy(sup)[None]                    # (1,N,X,Y)
@@ -820,8 +854,9 @@ def _joint_image(m, prob, C_raw, C_out, layout):
     elif layout == "3d":
         f = f[0]
         g = (C_raw.conj() * C_out).sum(0) / np.maximum((np.abs(C_raw) ** 2).sum(0), 1e-30)
-    else:
-        g = (C_raw.conj() * C_out).sum(1) / np.maximum((np.abs(C_raw) ** 2).sum(1), 1e-30)
+    else:                                        # frame by frame: bounded memory for long series
+        g = np.stack([(C_raw[t].conj() * C_out[t]).sum(0) / np.maximum((np.abs(C_raw[t]) ** 2).sum(0), 1e-30)
+                      for t in range(C_out.shape[0])])
     return (f / np.where(np.abs(g) > 0, g, 1)).astype(np.complex64)
 
 
