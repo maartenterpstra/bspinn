@@ -1757,3 +1757,19 @@ def test_smooth_factor_zero_mean_and_joint_lbfgs_finish(capsys):
     assert line, out[-2000:]
     a, b = [float(v) for v in line[-1].split("data ")[1].split(" -> ")]
     assert b <= a * 1.001
+
+
+def test_joint_lbfgs_finish_gradient_image(capsys):
+    """The L-BFGS finish after a joint_image='gradient' Adam stage optimises the maps only (variable projection)
+    and does not increase the data term."""
+    from bspinn.api import estimate_maps
+    from bspinn.data import make_synthetic
+    d, _, _ = make_synthetic(4, (32, 32), noise=0.01)
+    k = d.kspace[0]
+    m = np.zeros((32, 32), bool); m[:, ::2] = True; m[:, 12:20] = True
+    estimate_maps(k * m[None], "2d", mask=m, calib=12, iters_auto=2, iters_wires=20, iters_pinn=20, iters_joint=10,
+                  solve_image=True, optimizer="adam+lbfgs", joint_image="gradient", joint_lbfgs=10, verbose=True)
+    line = [l for l in capsys.readouterr().out.splitlines() if "L-BFGS finish" in l]
+    assert line
+    a, b = [float(v) for v in line[-1].split("data ")[1].split(" -> ")]
+    assert b <= a * 1.001

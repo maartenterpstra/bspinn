@@ -1134,6 +1134,8 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         c2 = copy.copy(cfg); c2.n_colloc = cfg.polish_colloc
         state["colloc"] = _colloc(prob, c2, gen, wires)
         flat = [q for g_ in (params if isinstance(params[0], dict) else [{"params": params}]) for q in g_["params"]]
+        if int(getattr(cfg, "joint_lbfgs_cg", 0)) > 0 and jp is None:
+            flat = [q for q in flat if q is not x]       # maps only: the image is projected out (never in L-BFGS)
         inner = max(1, min(int(cfg.lbfgs_inner), int(cfg.joint_lbfgs)))
         optl = torch.optim.LBFGS(flat, lr=1.0, max_iter=inner, history_size=50, tolerance_grad=1e-12,
                                  tolerance_change=1e-15, line_search_fn="strong_wolfe")
@@ -1143,7 +1145,9 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
         # function of the map parameters, as the line search needs), and the value includes the image's Tikhonov
         # term. By the envelope theorem the map gradient with the image held fixed is then the gradient of the
         # reduced functional min_x L(C(theta), x): L-BFGS sees one consistent objective, not L(C, x_stale).
-        vp = (not grad_img) and jp is None and int(getattr(cfg, "joint_lbfgs_cg", 0)) > 0
+        # also after a joint_image='gradient' Adam stage: L-BFGS over ~1e5 pixels plus the map parameters would
+        # spend its 50 history pairs on the image
+        vp = jp is None and int(getattr(cfg, "joint_lbfgs_cg", 0)) > 0
         x_start = x.detach().clone()
 
         def closure_l():
@@ -1158,7 +1162,7 @@ def fit_joint_full(prob: Problem, cfg: FitConfig, model, log=print):
             total = (rest.detach() if torch.is_tensor(rest) else torch.tensor(float(rest), device=dev))
             if not state.get("d_in_rest", True):
                 total = total + d.detach()
-            if vp:
+            if vp and not grad_img:                     # (with grad_img step() already includes it)
                 total = total + lam * x.detach().abs().pow(2).sum() / ynorm
             state["o"] = (total, d)
             return total
