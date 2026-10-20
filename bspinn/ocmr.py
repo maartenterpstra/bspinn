@@ -81,12 +81,17 @@ def _remove_oversampling(k, n_recon):
 
 def cine_slices(path, slices="all", set_=0, rep=0):
     """Yields (slice index, k (coils, x, y, frames) complex64, info) with info: noise (n, coils) or None,
-    pixel_spacing_mm (x, y), field_T, file. x = readout (oversampling removed), y = phase encoding."""
+    pixel_spacing_mm (x, y), field_T, file, kx_range (first, last acquired readout index after the oversampling
+    removal). x = readout (oversampling removed), y = phase encoding."""
     d = read_ocmr(path)
     k = d["kspace"]                                                # (kx, ky, kz, coil, phase, set, slice, rep, avg)
     ns = k.shape[6]
     sel = range(ns) if slices == "all" else ([ns // 2] if slices == "mid" else [int(s) for s in slices])
     rx = int(d["recon_matrix"][0]) if d["recon_matrix"][0] else k.shape[0]
+    nz = np.where(np.abs(k).reshape(k.shape[0], -1).max(1) > 0)[0]
+    # acquired readout range on the decimated grid (raw index i <-> i * rx / nx): an asymmetric echo leaves the
+    # start empty; after the image-domain crop that region only holds leakage
+    kx_range = (int(np.ceil(nz[0] * rx / k.shape[0])), int(np.floor(nz[-1] * rx / k.shape[0]))) if nz.size else (0, rx - 1)
     for s in sel:
         ks = k[:, :, 0, :, :, set_, s, rep, :].sum(-1)            # (kx, ky, coil, frames), averages summed
         ks = np.transpose(ks, (2, 0, 1, 3))                        # (coil, kx, ky, frames)
@@ -94,4 +99,4 @@ def cine_slices(path, slices="all", set_=0, rep=0):
         fov_x = d["recon_fov_mm"][0] or d["fov_mm"][0] / 2
         sp = (fov_x / ks.shape[1], d["fov_mm"][1] / ks.shape[2])
         yield s, ks.astype(np.complex64), {"noise": d["noise"], "pixel_spacing_mm": sp, "field_T": d["field_T"],
-                                           "file": str(path), "n_slices": ns}
+                                           "file": str(path), "n_slices": ns, "kx_range": kx_range}

@@ -1544,3 +1544,46 @@ def test_dynamic_tv_beats_per_frame_sense():
     rep = {}
     xd = dynamic_prior_image(ku, C, m, "auto", report=rep, iters=30)
     assert err(xd) < 0.5 * err(xs), (err(xd), err(xs), rep["weight"], rep["rule"])
+
+
+def test_ocmr_prospective_heldout(tmp_path, monkeypatch):
+    """scripts/ocmr_prospective.py: held-out split (n lines per frame, disjoint), the held-out prediction error
+    is ~1 (noise level) for the true maps and image and larger for wrong maps; end to end on an ISMRMRD cine."""
+    import importlib.util
+    import json
+    import os
+    import sys
+    pytest.importorskip("ismrmrd")
+    spec = importlib.util.spec_from_file_location("ocmr_prospective", os.path.join(os.path.dirname(__file__), "..", "scripts", "ocmr_prospective.py"))
+    op = importlib.util.module_from_spec(spec); spec.loader.exec_module(op)
+    rng = np.random.default_rng(0)
+    N, X, Y, T = 4, 24, 28, 5
+    yy, xx = np.mgrid[:X, :Y]
+    C = np.stack([np.exp(-((xx - Y / 2 - 9 * np.cos(a)) ** 2 + (yy - X / 2 - 9 * np.sin(a)) ** 2) / 200) * np.exp(1j * a)
+                  for a in 2 * np.pi * np.arange(N) / N])
+    C = C / np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True))
+    x = (10 * (((xx - Y / 2) ** 2 + (yy - X / 2) ** 2) < 64))[..., None] * (1 + 0.1 * np.arange(T))[None, None]
+    lines = np.zeros((Y, T), bool)
+    for t in range(T):
+        lines[rng.choice(Y, 8, replace=False), t] = True
+    acq = np.ones(X, bool)[:, None, None] & lines[None]
+    acq[:3] = False                                                            # asymmetric echo
+    assert (op.acquisition_mask(np.where(acq[None], 1.0, 0.0) * np.ones((N, 1, 1, 1)), (3, X - 1)) == acq).all()
+    k = np.stack([op.fft2c(C * x[None, ..., t]) for t in range(T)], -1)
+    k = (k + (rng.normal(size=k.shape) + 1j * rng.normal(size=k.shape)) / np.sqrt(2)) * acq[None]
+    tr, ho = op.heldout_split(acq, 2, seed=1)
+    assert not (tr & ho).any() and ((tr | ho) == acq).all() and (ho.any(0).sum(0) == 2).all()
+    e = op.prediction_error(k, C, x, ho, 6)["all"]
+    assert 0.8 < e < 1.25
+    assert op.prediction_error(k, np.roll(C, 1, axis=0), x, ho, 6)["all"] > 2 * e
+    p = str(tmp_path / "us_test.h5")
+    _write_ismrmrd_cine(p, slices=1)
+    out = tmp_path / "res" / "results.jsonl"
+    monkeypatch.setattr(sys, "argv", ["x", "--files", p, "--maps", "pinn_avg", "--calib", "12", "--device", "cpu",
+                                      "--tv-iters", "5", "--tv-grid", "-3", "-1", "3", "--tv-folds", "1", "--save-images",
+                                      "--pinn-set", "iters_auto=2", "iters_wires=3", "iters_pinn=3", "--out", str(out)])
+    op.main()
+    rows = [json.loads(l) for l in open(out)]
+    assert {r["recon"] for r in rows} == {"sense", "tv"}
+    assert all(np.isfinite(r["heldout"]) and r["heldout"] > 0.5 and r["train"] > 0 for r in rows)
+    assert (tmp_path / "res" / "us_test_images.npz").exists()
