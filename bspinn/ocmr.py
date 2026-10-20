@@ -73,10 +73,13 @@ def _remove_oversampling(k, n_recon):
     nx = k.shape[-2]
     if n_recon >= nx:
         return k
-    img = np.fft.fftshift(np.fft.ifft(np.fft.ifftshift(k, axes=-2), axis=-2, norm="ortho"), axes=-2)
     c0 = nx // 2 - n_recon // 2
-    img = img[..., c0:c0 + n_recon, :]
-    return np.fft.fftshift(np.fft.fft(np.fft.ifftshift(img, axes=-2), axis=-2, norm="ortho"), axes=-2)
+    out = np.empty(k.shape[:-2] + (n_recon, k.shape[-1]), np.complex64)
+    for i in np.ndindex(*k.shape[:-2]):         # one (kx, ky) plane at a time, complex64, no copy of k
+        img = np.fft.fftshift(np.fft.ifft(np.fft.ifftshift(k[i], axes=0), axis=0, norm="ortho"), axes=0)
+        out[i] = np.fft.fftshift(np.fft.fft(np.fft.ifftshift(img[c0:c0 + n_recon], axes=0), axis=0,
+                                            norm="ortho"), axes=0)
+    return out
 
 
 def cine_slices(path, slices="all", set_=0, rep=0):

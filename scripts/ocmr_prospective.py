@@ -140,6 +140,14 @@ def main():
         del k_raw
         tr, ho = heldout_split(acq, a.holdout, a.seed)
         ktr = (k * tr[None]).astype(np.complex64)
+        # memory-mapped copies (long series on small machines): pages are read when used, so the map fits
+        # below get the RAM; deleted at the end
+        cache = os.path.join(root, f"_{fname}_cache")
+        os.makedirs(cache, exist_ok=True)
+        np.save(os.path.join(cache, "k.npy"), k); np.save(os.path.join(cache, "ktr.npy"), ktr)
+        del k, ktr
+        k = np.load(os.path.join(cache, "k.npy"), mmap_mode="r")
+        ktr = np.load(os.path.join(cache, "ktr.npy"), mmap_mode="r")
         sp = tuple(float(v) for v in info["pixel_spacing_mm"])
         cnt = tr.sum(-1); mavg = cnt > 0
         kavg = (ktr.sum(-1) / np.maximum(cnt, 1)[None]).astype(np.complex64)
@@ -217,6 +225,9 @@ def main():
                 old = dict(np.load(p)) if os.path.exists(p) else {}
                 np.savez_compressed(p, **{**old, **imgs})
                 imgs = {}
+        del k, ktr
+        import shutil
+        shutil.rmtree(cache, ignore_errors=True)
     rows = [json.loads(l) for l in open(a.out) if l.strip()] if os.path.exists(a.out) else []
     if rows:
         print("\nheld-out k-space prediction error / noise level (lower is better; 1 = noise only):")
