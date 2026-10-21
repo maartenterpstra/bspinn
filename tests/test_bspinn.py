@@ -1708,10 +1708,10 @@ def test_init_from_acs_block_and_support():
     assert _centred_full_block(m) == (7, 7)
     d, _, _ = make_synthetic(6, (64, 64), noise=0.005)
     k = d.kspace[0]
-    full = Problem(MultiCoilData(k[None], d.geom), FitConfig(calib=24)).support[0].numpy() > 0
+    full = Problem(MultiCoilData(k[None], d.geom), FitConfig(calib=24, init_from_acs=True)).support[0].numpy() > 0
     mk = np.zeros((64, 64), bool); mk[::2, ::2] = True; mk[29:36, 29:36] = True
     sub = MultiCoilData((k * mk[None])[None].astype(np.complex64), d.geom, mask=mk[None, None])
-    p_new = Problem(sub, FitConfig(calib=24))
+    p_new = Problem(sub, FitConfig(calib=24, init_from_acs=True))
     p_old = Problem(MultiCoilData((k * mk[None])[None].astype(np.complex64), d.geom, mask=mk[None, None]),
                     FitConfig(calib=24, init_from_acs=False))
     assert p_new.init_block == (7, 7) and p_old.init_block is None
@@ -1723,12 +1723,12 @@ def test_init_from_acs_block_and_support():
     obj2 = (((yy - 32) / 26) ** 2 + ((xx - 32) / 24) ** 2) < 1
     C2 = np.stack([np.exp(-((yy - 32 - 30 * np.cos(a)) ** 2 + (xx - 32 - 30 * np.sin(a)) ** 2) / 800) for a in np.linspace(0, 2 * np.pi, 6, endpoint=False)])
     k2 = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(C2 * obj2[None], axes=(1, 2)), axes=(1, 2), norm="ortho"), axes=(1, 2))
-    f2 = Problem(MultiCoilData(k2[None].astype(np.complex64), d.geom), FitConfig(calib=24)).support[0].numpy() > 0
+    f2 = Problem(MultiCoilData(k2[None].astype(np.complex64), d.geom), FitConfig(calib=24, init_from_acs=True)).support[0].numpy() > 0
     sub2 = lambda f: Problem(MultiCoilData((k2 * mk[None])[None].astype(np.complex64), d.geom, mask=mk[None, None]),  # noqa: E731
                              FitConfig(calib=24, init_from_acs=f)).support[0].numpy() > 0
     sn, so = sub2(True), sub2(False)
     assert sn.sum() <= so.sum() and iou(sn, f2) >= iou(so, f2) - 0.01           # restricted, never worse
-    assert Problem(MultiCoilData(k[None], d.geom), FitConfig(calib=24)).init_block is None   # full box: unchanged
+    assert Problem(MultiCoilData(k[None], d.geom), FitConfig(calib=24, init_from_acs=True)).init_block is None   # full box: unchanged
 
 
 def test_smooth_factor_zero_mean_and_joint_lbfgs_finish(capsys):

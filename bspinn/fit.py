@@ -148,13 +148,16 @@ class FitConfig:
                                      #   (fixed collocation set of polish_colloc points); Adam alone stalls well
                                      #   above the noise floor on high-SNR calibration data
     polish_colloc: int = 4096
-    joint_lbfgs: int = 60            # optimizer 'adam+lbfgs': L-BFGS iterations finishing the joint full-resolution
+    joint_lbfgs: int = 0             # (off by default since v56b: the brain ablation, ACS 7, was worse and less
+                                     #   seed-stable with it) optimizer 'adam+lbfgs': L-BFGS iterations finishing the joint full-resolution
                                      #   stage (maps by L-BFGS on a fixed collocation set, image by exact CG /
                                      #   prior updates in between, alternating every lbfgs_inner); 0: Adam only (v54)
     joint_lbfgs_cg: int = 5          # joint_lbfgs: warm-started CG steps on the image inside every L-BFGS evaluation
                                      #   (variable projection, v55b; 0: image fixed for lbfgs_inner steps, v55)
-    resid_zero_mean: bool = True     # smooth factor without a common (coil-averaged) component (v55; False: v54)
-    init_from_acs: bool = True       # Cartesian, calibration box not fully sampled: the object support (keep-out,
+    resid_zero_mean: bool = False    # smooth factor without a common (coil-averaged) component (v55; off by default
+                                     #   since v56b: no gain in the brain ablation)
+    init_from_acs: bool = False      # (off by default since v56b: worse at ACS 7 in the brain ablation)
+                                     # Cartesian, calibration box not fully sampled: the object support (keep-out,
                                      #   collocation) restricted to that of the largest fully sampled centred block
                                      #   (alias-free; the undersampled box image is aliased and inflates it)
     resid_order: int = 0             # >0: per-coil smooth complex factor exp(u_j) of this Fourier order
@@ -1494,7 +1497,16 @@ def fit(data: MultiCoilData, cfg: FitConfig, log=print):
             cj = cfg
             if cfg.joint_start == "wires" and cfg.model == "pinn":
                 cj = copy.copy(cfg); cj.iters_joint = cfg.iters_joint + cfg.iters_pinn
+            snap = copy.deepcopy(model.state_dict())
             image_full, history["joint"] = fit_joint_full(prob, cj, model, log=log)
+            ok = all(bool(torch.isfinite(t).all()) for t in model.state_dict().values() if torch.is_tensor(t))
+            if not ok or (image_full is not None and not bool(torch.isfinite(image_full).all())):
+                # a diverged joint stage (seen once: fastMRI item41106, L-BFGS finish without projection) must not
+                # return NaN maps: keep the calibration-stage model, the image is then recomputed from it
+                model.load_state_dict(snap)
+                image_full = None
+                history["joint_failed"] = True
+                log("joint full-resolution stage diverged (non-finite values): kept the calibration-stage maps")
     log(f"fit done in {time.time() - t0:.1f}s")
     wires = wires_model.primary if isinstance(wires_model, MultiSetCoils) else wires_model
     # evaluation runs on CPU

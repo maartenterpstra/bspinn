@@ -30,7 +30,10 @@ step() {                                   # step NAME command...
 
 V53="solve_image=true optimizer=adam+lbfgs joint_extra_penalty=false resid_zero_mean=false joint_lbfgs=0 init_from_acs=false"
 V54="solve_image=true optimizer=adam+lbfgs resid_zero_mean=false joint_lbfgs=0 init_from_acs=false"
-V56="solve_image=true optimizer=adam+lbfgs"
+# v56: the v55 options switched on explicitly (since v56b they are off by default; explicit flags keep the cached
+# maps of these names meaning the same thing)
+V56="solve_image=true optimizer=adam+lbfgs init_from_acs=true resid_zero_mean=true joint_lbfgs=60 joint_lbfgs_cg=5"
+VARIANTS=(--pinn-variant v53 $V53 --pinn-variant v54 $V54 --pinn-variant v56 $V56)
 
 static() {
     [ -n "$BASE" ] || { echo "BASE (dataloader base folder) not set"; return 1; }
@@ -48,9 +51,13 @@ static() {
 
 prior() {
     [ -n "$BASE" ] || { echo "BASE not set"; return 1; }
-    $PY $S/prior_eval.py --loader "$LOADER" --base-folder "$BASE" --n "$N" --R 4 \
+    $PY $S/prior_eval.py --loader "$LOADER" --base-folder "$BASE" --n "$N" --R 4 "${VARIANTS[@]}" \
         --maps nlinv espirit pinn_v53 pinn_v54 pinn_v56 --maps-cache runs/eval_v56 \
         --methods tikhonov tv tvw --oracle --device "$DEVICE" --out runs/prior_v56.jsonl
+}
+
+need_ismrmrd() {
+    $PY -c "import ismrmrd" 2>/dev/null || { echo "the OCMR reader needs ismrmrd: run 'uv add ismrmrd' (or 'uv pip install ismrmrd')"; return 1; }
 }
 
 ocmr_download() {
@@ -68,6 +75,7 @@ ocmr_download() {
 }
 
 ocmr() {
+    need_ismrmrd || return 1
     ocmr_download || return 1
     $PY $S/ocmr_eval.py --files "$OCMR"/fs_*.h5 --slices mid --R 1 4 8 \
         --maps espirit nlinv pinn_avg pinn_dyn0 pinn_dyn --device "$DEVICE" --oracle --save-images \
@@ -75,6 +83,7 @@ ocmr() {
 }
 
 ocmr54() {
+    need_ismrmrd || return 1
     ocmr_download || return 1
     $PY $S/ocmr_eval.py --files "$OCMR"/fs_*.h5 --slices mid --R 1 4 8 \
         --maps pinn_avg pinn_dyn --device "$DEVICE" --save-images \
@@ -83,6 +92,7 @@ ocmr54() {
 }
 
 ocmr_us() {
+    need_ismrmrd || return 1
     ocmr_download || return 1
     $PY $S/ocmr_prospective.py --files "$OCMR"/us_*.h5 \
         --maps espirit nlinv pinn_avg pinn_dyn --device "$DEVICE" --save-images --out runs/ocmr_us/results.jsonl

@@ -187,6 +187,8 @@ def run_case(case: EvalCase, methods, out, Rs=(2, 3, 4, 5, 6), threads=1, log=pr
             maps.update(m_); secs.update(s_)
         except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as e:
             log(f"  [{case.name}] skipping {mth}: {e}")
+        except (RuntimeError, ArithmeticError) as e:    # a numerical failure (e.g. linalg) skips that method only
+            log(f"  [{case.name}] {mth} failed ({type(e).__name__}: {str(e)[:160]}); skipped")
     from scipy.ndimage import binary_dilation
     sup = binary_dilation(obj, iterations=3)          # common SENSE support (same for every method)
     res = {"case": {"name": case.name, "n_coils": case.N, "shape": list(case.shape), "acs": list(case.acs),
