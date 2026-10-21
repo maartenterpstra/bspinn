@@ -133,7 +133,7 @@ def alpha_from_data(prob: Problem, K: int, smooth: int = 3):
     e = e / e.sum(1, keepdim=True)
     e = e - e.mean(0, keepdim=True)
     if smooth > 1:
-        ker = torch.ones(1, 1, smooth) / smooth
+        ker = torch.ones(1, 1, smooth, device=e.device, dtype=e.dtype) / smooth
         e = torch.nn.functional.conv1d(e.T[:, None], ker, padding=smooth // 2)[:, 0].T[: prob.S]
     U, Sv, _ = torch.linalg.svd(e, full_matrices=False)
     a = U[:, :K] * np.sqrt(prob.S)
