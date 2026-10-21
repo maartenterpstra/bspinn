@@ -36,9 +36,15 @@ def jsonl(paths):
             continue
         tag = os.path.basename(os.path.dirname(os.path.abspath(p))) if os.path.basename(p) == "results.jsonl" \
             else os.path.splitext(os.path.basename(p))[0]
-        for l in open(p):
+        bad = 0
+        for n_, l in enumerate(open(p), 1):
             if l.strip():
-                r = json.loads(l)
+                try:
+                    r = json.loads(l)
+                except json.JSONDecodeError:              # a line cut off by a crash / two writers
+                    bad += 1
+                    print(f"{p}: line {n_} is not valid JSON, skipped")
+                    continue
                 r.pop("per_frame_nrmse", None); r.pop("per_frame_ssim", None)          # keep the bundle small
                 r.pop("cv_error", None); r.pop("grid_error", None)
                 r["run"] = tag
