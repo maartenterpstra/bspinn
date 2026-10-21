@@ -1298,6 +1298,41 @@ def test_image_priors():
     assert rep["method"] == "cv" and len(rep["cv_error"]) == 10
 
 
+def test_image_prior_extras():
+    """r2-image opt-ins: TGV adjoints; on a phantom with a smooth phase (fixed weight) TGV + the soft
+    low-resolution phase constraint beats plain TV; the options pass through sense_image."""
+    import torch
+    from bspinn.api import sense_image
+    from bspinn.masks import cartesian_mask
+    from bspinn.prior import _sym_grad, _sym_grad_adj, smooth_phase
+    v = torch.randn(2, 2, 17, 23, dtype=torch.complex64); z = torch.randn(2, 3, 17, 23, dtype=torch.complex64)
+    assert abs(torch.vdot(_sym_grad(v).flatten(), z.flatten()) - torch.vdot(v.flatten(), _sym_grad_adj(z).flatten())) < 1e-3
+    rng = np.random.default_rng(0)
+    H = W = 96
+    yy, xx = np.mgrid[:H, :W]
+    obj = ((yy - 48) ** 2 / 38 ** 2 + (xx - 48) ** 2 / 30 ** 2 < 1) * (1 + 0.004 * (xx - 48))      # a ramp: TGV's case
+    obj = obj + 0.6 * (((yy - 40) ** 2 + (xx - 40) ** 2) < 12 ** 2)
+    obj_c = obj * np.exp(1j * (0.03 * (xx - 48) + 0.02 * (yy - 48)))
+    N = 6
+    ang = 2 * np.pi * np.arange(N) / N
+    C = np.stack([np.exp(-(((yy - 48 - 60 * np.sin(a)) ** 2 + (xx - 48 - 60 * np.cos(a)) ** 2) / (2 * 50 ** 2)))
+                  * np.exp(1j * (0.02 * xx * np.cos(a) + 0.02 * yy * np.sin(a))) for a in ang])
+    C = C / np.sqrt((np.abs(C) ** 2).sum(0))
+    F = lambda v: np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(v, axes=(-2, -1)), norm="ortho"), axes=(-2, -1))  # noqa: E731
+    k = F(C * obj_c) + 0.05 * (rng.normal(size=(N, H, W)) + 1j * rng.normal(size=(N, H, W))) / np.sqrt(2)
+    m = cartesian_mask((H, W), R=4, acs=16, pattern="vd", seed=1)
+    ku = (k * m[None]).astype(np.complex64)
+    sup = obj > 0
+    err = lambda v: np.linalg.norm(np.abs(v)[sup] * (np.abs(v)[sup] * obj[sup]).sum() / (np.abs(v)[sup] ** 2).sum() - obj[sup]) / np.linalg.norm(obj[sup])  # noqa: E731
+    po = {"iters": 30, "cv_options": {"calib": 16}}
+    e_tv = err(sense_image(ku, C, "2d", mask=m, prior="tv", prior_weight=3e-3, prior_options=po))
+    e_tgv = err(sense_image(ku, C, "2d", mask=m, prior="tgv", prior_weight=3e-3, prior_options=po))
+    e_tp = err(sense_image(ku, C, "2d", mask=m, prior="tgv", prior_weight=3e-3,
+                           prior_options={**po, "phase": "lowres", "phase_weight": 0.3}))
+    assert e_tgv < 1.02 * e_tv and e_tp < 0.99 * e_tv, (e_tv, e_tgv, e_tp)
+    assert smooth_phase(torch.ones(8, 8, dtype=torch.complex64), 4).abs().max() < 1e-5
+
+
 def test_network_prior(tmp_path):
     """A network from scripts/train_recon.py (weights + split.json with its architecture) as the image prior."""
     import json

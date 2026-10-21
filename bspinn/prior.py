@@ -167,16 +167,252 @@ class ADMM:
         return x
 
 
-def admm(y, C, m, beta, prior="tv", ratio=1.0, iters=50, cg_iters=5, rho=0.5, lam=1e-6, levels=4, wave="db4", x0=None):
+def admm(y, C, m, beta, prior="tv", ratio=1.0, iters=50, cg_iters=5, rho=0.5, lam=1e-6, levels=4, wave="db4", x0=None,
+         **ext):
     """y (N,H,W) complex tensor (zero outside m), C (N,H,W) RSS-normalised maps, m (H,W) float mask,
-    beta (L,) weights -> images (L,H,W)."""
+    beta (L,) weights -> images (L,H,W). ``prior`` also takes the opt-in EXTRA_PRIORS (r2-image): 'tgv'
+    (second-order total generalised variation, ext ``tgv_ratio`` = alpha0 / alpha1, default 2), 'pnp:bm3d' /
+    'pnp:nlm' (plug-and-play ADMM, beta = denoiser sigma^2 / rho). ``ext`` (opt-in): phase (H,W) +
+    phase_weight (soft real-valued image after removing a smooth phase), w_map (H,W spatial TV weight),
+    bregman (int, outer Bregman / add-back-the-residual iterations); see ADMMx, tgv_admm, pnp_admm."""
     L = beta.numel()
-    solver = ADMM(m.shape, beta, prior, ratio, rho, lam, levels, wave, float(m.mean()), y.device)
     if x0 is None:
         x = (C.conj() * _ifft2c(m * y)).sum(0)[None].expand(L, -1, -1).clone()
     else:
         x = x0.expand(L, -1, -1).clone()
-    return solver.run(x, C, m, y, iters, cg_iters)
+    nb = int(ext.pop("bregman", 0) or 0)
+    yk = y
+    for b in range(nb + 1):
+        if prior == "tgv":
+            e = dict(ext); tr = float(e.pop("tgv_ratio", 2.0))
+            x = tgv_admm(yk, C, m, beta, ratio=tr, iters=iters, cg_iters=cg_iters, rho=rho, lam=lam, x0=x, **e)
+        elif prior.startswith("pnp"):
+            if torch.is_tensor(ext.get("phase")):
+                ext["phase"] = ext["phase"].cpu().numpy()
+            x = pnp_admm(yk, C, m, beta, denoiser=prior.split(":")[1] if ":" in prior else "bm3d", iters=iters,
+                         cg_iters=cg_iters, rho=rho, lam=lam, x0=x, **ext)
+        elif ext:
+            solver = ADMMx(m.shape, beta, prior, ratio, rho, lam, levels, wave, float(m.mean()), y.device, **ext)
+            x = solver.run(x, C, m, yk, iters, cg_iters)
+        else:
+            solver = ADMM(m.shape, beta, prior, ratio, rho, lam, levels, wave, float(m.mean()), y.device)
+            x = solver.run(x, C, m, yk, iters, cg_iters)
+        if b < nb:                      # Bregman: add the data residual back (debiasing; contrast restored)
+            yk = yk + m * (y - _fft2c(C * x[:, None])) if yk.dim() == 4 else \
+                yk[None] + m * (y[None] - _fft2c(C * x[:, None]))
+    return x
+
+
+# ----------------------------------------------------------------------------- r2-image: opt-in extensions
+EXTRA_PRIORS = ("tgv", "pnp:bm3d", "pnp:nlm")
+
+
+def _shrink_iso(v, t, dim=-3):
+    mag = torch.sqrt((v.abs() ** 2).sum(dim, keepdim=True)).clamp_min(1e-12)
+    return v * torch.clamp(1 - t / mag, min=0)
+
+
+def _dfb(x, ax):           # backward difference (periodic) = -(forward difference)^H
+    return x - torch.roll(x, 1, ax)
+
+
+def _dfb_adj(z, ax):
+    return z - torch.roll(z, -1, ax)
+
+
+_S2 = 2 ** -0.5
+
+
+def _sym_grad(v):
+    """Symmetrised gradient of a vector field v (...,2,H,W) -> (...,3,H,W), the off-diagonal scaled by sqrt 2 so
+    the Frobenius norm is the plain 2-norm over the 3 components (backward differences: TGV convention)."""
+    a, b = v[..., 0, :, :], v[..., 1, :, :]
+    return torch.stack([_dfb(a, -2), _dfb(b, -1), _S2 * (_dfb(a, -1) + _dfb(b, -2))], -3)
+
+
+def _sym_grad_adj(z):
+    e0, e1, e2 = z[..., 0, :, :], z[..., 1, :, :], z[..., 2, :, :]
+    return torch.stack([_dfb_adj(e0, -2) + _S2 * _dfb_adj(e2, -1), _dfb_adj(e1, -1) + _S2 * _dfb_adj(e2, -2)], -3)
+
+
+def tgv_admm(y, C, m, beta, ratio=2.0, iters=50, cg_iters=8, rho=0.5, lam=1e-6, x0=None, w_map=None, phase=None,
+             phase_weight=0.0):
+    """TGV^2: min_x,v 1/2||M F C x - y||^2 + beta ||grad x - v||_{2,1} + ratio beta ||E v||_{2,1} (isotropic),
+    ADMM with splits z1 = grad x - v, z2 = E v; the (x, v) update is a joint CG (packed (L,3,H,W)).
+    beta (L,) -> x (L,H,W). w_map: optional (H,W) spatial weight on both terms; phase / phase_weight as ADMMx."""
+    L = beta.numel()
+    r_ = rho * float(m.mean())
+    ph = None
+    if phase is not None and phase_weight > 0:
+        ph = torch.exp(1j * torch.as_tensor(phase, device=y.device).float()).to(torch.complex64)
+        g = float(phase_weight) * float(m.mean())
+    a1 = beta.view(L, 1, 1, 1).to(y.device)
+    a0 = a1 * ratio
+    if w_map is not None:
+        a1 = a1 * w_map; a0 = a0 * w_map
+
+    def AHA(v):
+        return (C.conj() * _ifft2c(m * _fft2c(C * v[:, None]))).sum(-3)
+
+    def lhs(w):
+        x, v = w[:, 0], w[:, 1:]
+        gx = _grad(x) - v
+        ox = AHA(x) + lam * x + r_ * _grad_adj(gx)
+        if ph is not None:
+            ox = ox + g * ph * (1j * (ph.conj() * x).imag)
+        ov = -r_ * gx + r_ * _sym_grad_adj(_sym_grad(v)) + lam * v
+        return torch.cat([ox[:, None], ov], 1)
+
+    AHy = (C.conj() * _ifft2c(m * y)).sum(-3)
+    if AHy.dim() == 2:
+        AHy = AHy[None].expand(L, -1, -1)
+    x = x0.clone() if x0 is not None else AHy.clone()
+    w = torch.cat([x[:, None], torch.zeros(L, 2, *x.shape[-2:], dtype=x.dtype, device=x.device)], 1)
+    z1 = _grad(x); u1 = torch.zeros_like(z1)
+    z2 = torch.zeros(L, 3, *x.shape[-2:], dtype=x.dtype, device=x.device); u2 = torch.zeros_like(z2)
+    for _ in range(iters):
+        rx = AHy + r_ * _grad_adj(z1 - u1)
+        rv = -r_ * (z1 - u1) + r_ * _sym_grad_adj(z2 - u2)
+        w = _bcg(lhs, torch.cat([rx[:, None], rv], 1), w, cg_iters)
+        x, v = w[:, 0], w[:, 1:]
+        q = _grad(x) - v + u1
+        z1 = _shrink_iso(q, a1 / r_); u1 = q - z1
+        q = _sym_grad(v) + u2
+        z2 = _shrink_iso(q, a0 / r_); u2 = q - z2
+    return w[:, 0]
+
+
+class ADMMx(ADMM):
+    """ADMM with opt-in extras (r2-image):
+      w_map      (H,W) spatial multiplier of the TV weight (e.g. the g-factor map, see noise_map);
+      phase      (H,W) real tensor phi: + phase_weight/2 ||Im(e^{-i phi} x)||^2 (a soft real-valued image
+                 after removing a smooth phase; 'virtual conjugate coils'); phase_weight relative to fill."""
+
+    def __init__(self, shape, beta, prior="tv", ratio=1.0, rho=0.5, lam=1e-6, levels=4, wave="db4", fill=1.0,
+                 device="cpu", w_map=None, phase=None, phase_weight=0.0):
+        super().__init__(shape, beta, prior, ratio, rho, lam, levels, wave, fill, device)
+        self.fill = float(fill)
+        if w_map is not None and self.b_tv is not None:     # (L,1,H,W) for the (L,2,H,W) shrink
+            self.b_tv = self.b_tv.view(-1, 1, 1, 1) * torch.as_tensor(w_map, device=device).float()
+        self.ph = None
+        if phase is not None and phase_weight > 0:
+            self.ph = torch.exp(1j * torch.as_tensor(phase, device=device).float()).to(torch.complex64)
+            self.g = float(phase_weight) * self.fill
+
+    def run(self, x, C, m, y, iters=50, cg_iters=5):
+        r_ = self.r_
+        ph = self.ph
+
+        def AHA(v):
+            return (C.conj() * _ifft2c(m * _fft2c(C * v[:, None]))).sum(-3)
+
+        def lhs(v):
+            out = AHA(v) + self.lam * v
+            if ph is not None:            # real-linear, self-adjoint in Re<.,.>: CG with real inner products
+                out = out + self.g * ph * (1j * (ph.conj() * v).imag)
+            if self.b_tv is not None:
+                out = out + r_ * _grad_adj(_grad(v))
+            if self.Wt is not None:
+                out = out + r_ * v
+            return out
+
+        AHy = (C.conj() * _ifft2c(m * y)).sum(-3)
+        if AHy.dim() == 2:
+            AHy = AHy[None].expand(x.shape[0], -1, -1)
+        if self.b_tv is not None and self.z1 is None:
+            self.z1 = _grad(x); self.u1 = torch.zeros_like(self.z1)
+        if self.Wt is not None and self.z2 is None:
+            self.z2 = self.Wt.fwd(x); self.u2 = torch.zeros_like(self.z2)
+        bt = self.b_tv if self.b_tv is None or self.b_tv.dim() == 4 else self.b_tv[:, None]
+        for _ in range(iters):
+            rhs = AHy.clone()
+            if self.z1 is not None:
+                rhs = rhs + r_ * _grad_adj(self.z1 - self.u1)
+            if self.z2 is not None:
+                rhs = rhs + r_ * self.Wt.adj(self.z2 - self.u2)
+            x = _bcg(lhs, rhs, x, cg_iters)
+            if self.z1 is not None:
+                v = _grad(x) + self.u1
+                self.z1 = _shrink_iso(v, bt / r_); self.u1 = v - self.z1
+            if self.z2 is not None:
+                v = self.Wt.fwd(x) + self.u2
+                shr = torch.clamp(1 - (self.b_w / r_) / v.abs().clamp_min(1e-12), min=0)
+                self.z2 = torch.where(self.Wt.detail, v * shr, v)
+                self.u2 = v - self.z2
+        return x
+
+
+def _denoise(v, sigma, kind, phase=None):
+    """Complex image denoiser for PnP: real and imaginary parts (after removing ``phase``) separately."""
+    import numpy as _np
+    z = v.cpu().numpy()
+    if phase is not None:
+        z = z * _np.exp(-1j * phase)
+    out = _np.empty_like(z)
+    for i in range(z.shape[0]):
+        parts = []
+        for p in (z[i].real, z[i].imag):
+            if kind == "bm3d":
+                import bm3d
+                parts.append(bm3d.bm3d(p.astype(_np.float64), float(sigma[i]),
+                                       stage_arg=bm3d.BM3DStages.HARD_THRESHOLDING))
+            else:
+                from skimage.restoration import denoise_nl_means
+                parts.append(denoise_nl_means(p, h=0.8 * float(sigma[i]), sigma=float(sigma[i]), fast_mode=True,
+                                              patch_size=5, patch_distance=6))
+        out[i] = parts[0] + 1j * parts[1]
+    if phase is not None:
+        out = out * _np.exp(1j * phase)
+    return torch.from_numpy(out.astype(_np.complex64)).to(v.device)
+
+
+def pnp_admm(y, C, m, beta, denoiser="bm3d", iters=30, cg_iters=5, rho=0.5, lam=1e-6, x0=None, phase=None):
+    """Plug-and-play ADMM: x-step CG on (A^H A + r) x = A^H y + r (z - u), z = D(x + u; sigma = sqrt(beta / r)).
+    beta (L,) relative weights as for TV (data scaled to p99 magnitude 1)."""
+    L = beta.numel()
+    r_ = rho * float(m.mean())
+    sig = torch.sqrt(beta / r_).cpu().numpy()
+
+    def lhs(v):
+        return (C.conj() * _ifft2c(m * _fft2c(C * v[:, None]))).sum(-3) + (lam + r_) * v
+
+    AHy = (C.conj() * _ifft2c(m * y)).sum(-3)
+    if AHy.dim() == 2:
+        AHy = AHy[None].expand(L, -1, -1)
+    x = x0.clone() if x0 is not None else AHy.clone()
+    z = x.clone(); u = torch.zeros_like(x)
+    for _ in range(iters):
+        x = _bcg(lhs, AHy + r_ * (z - u), x, cg_iters)
+        z = _denoise(x + u, sig, denoiser, phase)
+        u = u + x - z
+    return x
+
+
+def smooth_phase(x, width=24):
+    """Low-resolution phase of x (H,W) or (L,H,W): Hann window of ``width`` k-space lines in both directions."""
+    xx = x if x.dim() == 2 else x[0]
+    H, W = xx.shape
+    wh = torch.zeros(H); wh[H // 2 - width // 2:H // 2 + width // 2] = torch.hann_window(width, periodic=False)
+    ww = torch.zeros(W); ww[W // 2 - width // 2:W // 2 + width // 2] = torch.hann_window(width, periodic=False)
+    k = _fft2c(xx) * (wh[:, None] * ww[None]).to(xx.device)
+    return torch.angle(_ifft2c(k)).float()
+
+
+def noise_map(C, m, lam=1e-2, probes=4, smooth=9, seed=0):
+    """Relative noise standard deviation of the lightly regularised SENSE image (Monte Carlo, white k-space
+    noise), smoothed and normalised to median 1 where |C| > 0: a g-factor-like map for spatial TV weights."""
+    g = torch.Generator().manual_seed(seed)
+    fill = float(m.mean())
+    AHA = lambda v: (C.conj() * _ifft2c(m * _fft2c(C * v[:, None]))).sum(-3) + lam * fill * v  # noqa: E731
+    n = (torch.randn((probes,) + tuple(C.shape), generator=g) + 1j * torch.randn((probes,) + tuple(C.shape), generator=g)).to(C.dtype)
+    b = (C.conj() * _ifft2c(m * n)).sum(-3)
+    xn = _bcg(AHA, b, torch.zeros_like(b), 30)
+    v = (xn.abs() ** 2).mean(0)
+    k = torch.ones(1, 1, smooth, smooth) / smooth ** 2
+    v = torch.nn.functional.conv2d(v[None, None].float(), k, padding=smooth // 2)[0, 0]
+    sd = v.sqrt()
+    sup = (C.abs() ** 2).sum(0) > 0.5
+    return (sd / sd[sup].median().clamp_min(1e-12)).clamp(0.25, 4.0)
 
 
 def _setup(ksp, C, mask, device):
@@ -238,6 +474,7 @@ def choose_weight(ksp, C, mask, prior="tv", grid=None, device="cpu", holdout=0.1
     """k-space cross-validation over ``grid`` (relative weights), weight by ``select_weight``: (weight, info)."""
     grid = np.asarray(grid if grid is not None else np.logspace(-4, -1, 10))
     C, m, Ct, mt, yt, x0, s = _setup(ksp, C, mask, device)
+    kw = resolve_options(kw, Ct, mt, x0, calib)
     err = np.zeros(len(grid))
     for tr, ho in cv_masks(m, holdout, folds, calib, seed):
         trt = torch.from_numpy(tr.astype(np.float32)).to(device)
@@ -263,6 +500,7 @@ def prior_image(ksp, C, mask, prior="tv", weight="auto", device="cpu", report=No
     elif report is not None:
         report.update(method="manual", weight=float(weight))
     _, _, Ct, mt, yt, x0, s = _setup(ksp, C, mask, device)
+    kw = resolve_options(kw, Ct, mt, x0, int((cv_options or {}).get("calib", 24)))
     with torch.no_grad():
         x = admm(yt, Ct, mt, torch.tensor([float(weight)], device=device), prior, x0=x0, **kw)[0] * s
     return x.cpu().numpy().astype(np.complex64)
@@ -387,3 +625,18 @@ def dynamic_prior_image(ksp, C, mask, weight="auto", spatial_ratio=0.25, device=
     if report is not None:
         report.update(info)
     return np.moveaxis(x, 0, -1).astype(np.complex64)
+
+
+def resolve_options(kw, Ct, mt, x0, calib=24):
+    """Turn string options into tensors: phase='lowres' -> smooth_phase of the SENSE start (Hann, ``calib`` lines),
+    w_map='noise' -> noise_map (g-factor-like) ** w_power (default 1)."""
+    kw = dict(kw)
+    if isinstance(kw.get("phase"), str):
+        kw["phase"] = smooth_phase(x0, int(kw.pop("phase_width", calib)))
+    else:
+        kw.pop("phase_width", None)
+    if isinstance(kw.get("w_map"), str):
+        kw["w_map"] = noise_map(Ct, mt) ** float(kw.pop("w_power", 1.0))
+    else:
+        kw.pop("w_power", None)
+    return kw

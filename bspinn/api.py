@@ -953,7 +953,13 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
     'auto' (k-space cross-validation on withheld phase-encode lines, as for lam; the choice and the CV curve
     go into ``report``); or 'net:<weights.pt>' for a network trained by scripts/train_recon.py or
     scripts/zs_ssl.py (bspinn.unrolled). ``prior_options``: ratio (wavelet / TV weight), iters, cg_iters,
-    rho, levels, wave, grid, cv_options (holdout, folds, calib, seed); for 'net:' architecture overrides."""
+    rho, levels, wave, grid, cv_options (holdout, folds, calib, seed); for 'net:' architecture overrides.
+    Opt-in (r2-image, bspinn.prior.EXTRA_PRIORS / admm): ``prior='tgv'`` (second-order total generalised
+    variation; option tgv_ratio, default 2), 'pnp:bm3d' / 'pnp:nlm' (plug-and-play; slow, not recommended);
+    options phase='lowres' + phase_weight (recommended 0.3: soft real-valued image after removing the
+    low-resolution phase, Hann window of phase_width = calib lines), w_map='noise' (g-factor-weighted TV),
+    bregman=k (outer Bregman iterations). Recommended: prior='tgv', prior_options={'phase': 'lowres',
+    'phase_weight': 0.3}."""
     ksp = np.moveaxis(np.asarray(ksp), coil_axis, 0).astype(np.complex64)
     C = np.moveaxis(np.asarray(maps), coil_axis, 0).astype(np.complex64)
     if noise is not None:
