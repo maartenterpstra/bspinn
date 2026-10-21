@@ -660,7 +660,24 @@ def fit_wires_many(items, cfg: FitConfig, iters: int, log=None):
     cfg.compile = False        # short probes on different geometries: compiling each would cost far more
     specs = [_wires_setup(p, cfg, h, iters, quiet, "wires") for p, h in items]
     if len(specs) > 1 and all(_graph_ok(sp["stage"]) for sp in specs):
-        outs = accel.train_graphed_many([_graph_job(*sp["stage"]) for sp in specs], log=quiet)
+        # concurrent replays only for stages on DIFFERENT problems: two stages on one Problem (e.g. the two
+        # handednesses) share its per-iteration input buffers, and interleaved streams then race on them
+        # (CUDA 'illegal memory access', seen on OCMR us_0001). Rounds with distinct problems, one after another.
+        rounds = []
+        for i, (p, _) in enumerate(items):
+            for r in rounds:
+                if all(items[j][0] is not p for j in r):
+                    r.append(i); break
+            else:
+                rounds.append([i])
+        outs = [None] * len(specs)
+        for r in rounds:
+            if len(r) > 1:
+                res = accel.train_graphed_many([_graph_job(*specs[i]["stage"]) for i in r], log=quiet)
+            else:
+                res = [_run_stage(*specs[r[0]]["stage"])]
+            for i, o in zip(r, res):
+                outs[i] = o
     else:
         outs = [_run_stage(*sp["stage"]) for sp in specs]
     return [sp["finish"](o) for sp, o in zip(specs, outs)]
