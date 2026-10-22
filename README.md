@@ -1509,6 +1509,45 @@ BART=bart/bart python scripts/phase_pole_eval.py --files data/ksp_2D data/ksp_2D
 ```
 (BART >= 1.0 for `--phase-pole`; inputs: BART cfl bases of one 2-D plane each, or .npy (coils, x, y).)
 
+### 8.13 Dynamic layout on the 2-D base, safe per-frame corrections, and a reference-difference cine prior (v57)
+
+**Dynamic layout = the 2-D fit of the time average (`dynamic_base='2d'`, new default).** `estimate_maps(..., 'dynamic')`
+with `dynamic_static='average'` now runs the complete 2-D path on the time-averaged k-space (B0 plane by held-out
+prediction when the probe is ambiguous, handedness from the probe, fold-over correction, joint stage with
+`solve_image`). Rank 0 returns those maps for every frame, so `pinn_dyn0 == pinn_avg` exactly (bit-identical,
+`tests::test_dynamic_rank0_is_the_2d_time_average_fit`). Rank > 0 learns the low-rank corrections of that fixed model
+on the frames; the returned frame maps are g (C_raw + s Delta_t), RSS-normalised, with g the 2-D path's per-pixel
+gauge/normalisation, so s = 0 gives the 2-D maps. `dynamic_base='legacy'` restores v50-v56.
+Cause of the old pinn_dyn0 failures: the legacy path took the B0 plane from the wire probe alone. On OCMR short-axis
+cines the in-plane orientation is a near tie (fs_0020: coronal 0.145 vs coronal_t 0.151; fs_0004: 0.161 vs 0.142 --
+both flagged ambiguous), where the 2-D path decides by held-out k-space instead.
+
+**Validated corrections (`dynamic_validate='auto'` = on).** 10 % of every frame's acquired lines (>= 1) are withheld
+from the correction fit; the series is scored on them (spatio-temporal TV image of the other lines, fixed weight) with
+the corrections scaled by 0, 0.25, 0.5, 1; the corrections are kept (scaled) only if they beat the base by 2 %.
+`info['dynamic_validation']`, `dynamic_options`: holdout, shrink_grid, min_gain, val_weight, val_iters. By
+construction the dynamic layout can then only return the base (= pinn_avg) or something better on held-out lines.
+
+**Cine prior: spatial TV of the difference from the time average** (`dynamic_prior_image(..., spatial_on='difference')`,
+`--spatial-on difference` in scripts/ocmr_eval.py and ocmr_prospective.py): temporal TV w + 0.25 w TV(x_t - x_ref),
+x_ref the CG-SENSE image of the time-averaged k-space (of the samples in use, so CV folds stay clean). The
+stationary anatomy is no longer smoothed frame by frame; only the moving part is. CPU lab (scripts/dyn_image_lab.py;
+central 96-pixel readout crop, which is an exact sub-problem for phase-encode undersampling, 8 virtual coils, NLINV
+maps of the time average, GRO masks), frame-mean NRMSE at the oracle weight (CV weight):
+
+| case | R | temporal TV + 0.25 spatial TV (v56) | + TV of the difference instead | 
+|---|---|---|---|
+| fs_0004 | 4 | 0.0902 (0.0911) | 0.0888 (0.0893) |
+| fs_0004 | 8 | 0.1042 | 0.1032 |
+| fs_0020 | 4 | 0.0337 | 0.0323 |
+| fs_0020 | 8 | 0.0402 (0.0411) | 0.0370 (0.0377) |
+
+Other priors (same setup; fs_0004 R4 / fs_0020 R8 oracle): temporal Fourier L1 + TV 0.0896 / 0.0389, l1 of the
+difference from the reference 0.0895 / 0.0389, temporal TGV 0.0902 / 0.0398, view-sharing start 0.0901 / 0.0397,
+locally low rank 0.0908, global low rank 0.0907, L+S 0.0948, spatial/temporal ratio 0 / 0.1 / 0.5 / 1: 0.0945 / 0.0912
+/ 0.0908 / 0.0924 (0.25: 0.0902). Also: `dynamic_admm` uses unshifted FFTs internally (same result, ~3x faster on a
+CPU).
+
 ## 9. Code map
 
 | file | content |
