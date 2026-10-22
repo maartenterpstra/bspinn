@@ -1773,3 +1773,24 @@ def test_joint_lbfgs_finish_gradient_image(capsys):
     assert line
     a, b = [float(v) for v in line[-1].split("data ")[1].split(" -> ")]
     assert b <= a * 1.001
+
+
+def test_dynamic_rank0_is_the_2d_time_average_fit():
+    """v57: layout='dynamic' (dynamic_base='2d') fits the time average by the 2-D path, so rank 0 returns exactly
+    the 2-D maps for every frame; spatial_on='difference' runs and differs from the default."""
+    from bspinn.api import _time_average, estimate_maps
+    from bspinn.data import make_synthetic
+    from bspinn.masks import gro_mask
+    from bspinn.prior import dynamic_prior_image
+    d, _, _ = make_synthetic(4, (24, 24), noise=0.01)
+    T = 4
+    m = gro_mask((24, 24), T, 3, pe_axis=1)
+    kd = np.stack([d.kspace[0]] * T, -1) * m[None]
+    kw = dict(calib=8, verbose=False, plane="axial", iters_auto=2, iters_wires=10, iters_pinn=10)
+    C0, info0 = estimate_maps(kd, "dynamic", mask=m, rank=0, **kw)
+    kav, mavg = _time_average(kd, m)
+    C2, _ = estimate_maps(kav, "2d", mask=mavg, **kw)
+    assert C0.shape == kd.shape and np.array_equal(C0[..., 2], C2)
+    a = dynamic_prior_image(kd, C2, m, 1e-2, iters=5)
+    b = dynamic_prior_image(kd, C2, m, 1e-2, iters=5, spatial_on="difference")
+    assert np.isfinite(b).all() and not np.allclose(a, b)
