@@ -16,6 +16,8 @@ Maps from the undersampled data (--maps):
   pinn      estimate_maps 2-D, maps only (the --box calibration box), v54 options
   pinn_v54  estimate_maps with the joint full-resolution stage (solve_image=True, all samples), v54 options
   pinn_v55  the same with the v55 defaults (init_from_acs, resid_zero_mean, joint_lbfgs)
+  <maps>+irgnm[@key=value...]  IRGNM refinement (bspinn.irgnm, held-out step choice) of the cached <maps>
+            (list <maps> first), e.g. pinn_v54+irgnm  pinn_v54+irgnm@steps=8@holdout=0
   <pinn*>@key=value[@key=value...]   a variant with extra estimate_maps / FitConfig options, its own cache and
             rows, for ablations, e.g. pinn_v55@init_from_acs=False  pinn_v55@joint_lbfgs=0  pinn_v54@seed=1
 Scored against the fully sampled plane: gauge poles inside the object (bspinn.recon.gauge_poles); leave-coil-out
@@ -153,6 +155,14 @@ def main():
                         own[name] = im
                         os.makedirs(os.path.dirname(cp), exist_ok=True)
                         np.save(cp.replace(".npy", "_img.npy"), im.astype(np.complex64))
+                    elif "+irgnm" in name:                         # IRGNM refinement of another map set's cache
+                        from bspinn.irgnm import irgnm_refine
+                        base, rest = name.split("+irgnm", 1)
+                        C0 = np.load(os.path.join(root, "maps", f"{fname}_acs{cal}_{base}.npy"))
+                        ro = {"holdout": 0.1, **parse_set([o for o in rest.split("@") if o])}
+                        C, _, rinfo = irgnm_refine(ku, C0, m, device=a.device, **ro)
+                        print(f"   ACS {cal:2d} {name}: {rinfo['steps']} steps, held-out {rinfo.get('heldout_err')}",
+                              flush=True)
                     elif name.split("@")[0] in ("pinn", "pinn_v54", "pinn_v55"):
                         base, *opts = name.split("@")             # e.g. pinn_v55@resid_zero_mean=False@seed=1
                         kw = dict(mask=m, calib=a.box, spacing=sp, quality=a.quality, verbose=False, device=a.device,
