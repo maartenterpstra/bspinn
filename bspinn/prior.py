@@ -280,11 +280,18 @@ def _tgrad_adj(z):
 def dynamic_admm(y, C, m, beta_t, beta_s, iters=50, cg_iters=5, rho=0.5, lam=1e-6, x0=None):
     """min 1/2 sum_t ||M_t F (C_t x_t) - y_t||^2 + beta_t sum |x_{t+1} - x_t| + beta_s sum_t TV(x_t), ADMM.
     y (T,N,H,W), C (T,N,H,W) or (N,H,W) RSS-normalised maps, m (T,H,W) float masks -> x (T,H,W)."""
+    # v57: everything ifftshifted once, plain FFTs inside (the centred FFT's shifts cost ~5x the transform on a
+    # CPU); temporal and spatial TV are cyclic, so the solution is the same, shifted back at the end
+    sh = lambda a: torch.fft.ifftshift(a, dim=(-2, -1))  # noqa: E731
+    y, C, m = sh(y), sh(C), sh(m)
+    x0 = None if x0 is None else sh(x0)
     mm = m[:, None]                                       # (T,1,H,W)
     r_ = rho * float(m.mean())
+    F = lambda a: torch.fft.fft2(a, norm="ortho")  # noqa: E731
+    Fi = lambda a: torch.fft.ifft2(a, norm="ortho")  # noqa: E731
 
     def AHA(v):
-        return (C.conj() * _ifft2c(mm * _fft2c(C * v[:, None]))).sum(-3)
+        return (C.conj() * Fi(mm * F(C * v[:, None]))).sum(-3)
 
     def lhs(v):
         out = AHA(v) + lam * v + r_ * _tgrad_adj(_tgrad(v))
@@ -292,7 +299,7 @@ def dynamic_admm(y, C, m, beta_t, beta_s, iters=50, cg_iters=5, rho=0.5, lam=1e-
             out = out + r_ * _grad_adj(_grad(v))
         return out
 
-    AHy = (C.conj() * _ifft2c(mm * y)).sum(-3)
+    AHy = (C.conj() * Fi(mm * y)).sum(-3)
     x = AHy.clone() if x0 is None else x0.clone()
     zt, ut = _tgrad(x), None
     ut = torch.zeros_like(zt)
@@ -312,7 +319,7 @@ def dynamic_admm(y, C, m, beta_t, beta_s, iters=50, cg_iters=5, rho=0.5, lam=1e-
             mag = torch.sqrt((v.abs() ** 2).sum(-3, keepdim=True)).clamp_min(1e-12)
             zs = v * torch.clamp(1 - (beta_s / r_) / mag, min=0)
             us = v - zs
-    return x
+    return torch.fft.fftshift(x, dim=(-2, -1))
 
 
 def _dyn_setup(ksp, C, mask, device):

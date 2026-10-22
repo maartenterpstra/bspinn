@@ -16,7 +16,21 @@ def setup_threads():
     torch.set_num_threads(1)
 
 
-def load(name, R=1, max_frames=0, calib=24):
+def compress(c, C, nv):
+    """Prototype speed-up: SVD coil compression of data (k, ku, kavg) and maps C to nv virtual coils (same matrix)."""
+    if not nv or nv >= c["N"]:
+        return c, C
+    X = c["kavg"].reshape(c["N"], -1)
+    U, _, _ = np.linalg.svd(X, full_matrices=False)
+    A = U[:, :nv].conj().T.astype(np.complex64)
+    c = dict(c)
+    for key in ("k", "ku", "kavg"):
+        c[key] = np.einsum("vn,n...->v...", A, c[key]).astype(np.complex64)
+    c["N"] = nv
+    return c, np.einsum("vn,n...->v...", A, C).astype(np.complex64)
+
+
+def load(name, R=1, max_frames=0, calib=24, crop_x=0):
     """Fully sampled cine: dict k (N,X,Y,T) whitened, m (X,Y,T) GRO mask, ku, kavg, mavg, cal, sp, sampled, ref, obj."""
     from ocmr_eval import central_lines, ifft2c
     from bspinn import evaluation as ev
@@ -26,6 +40,14 @@ def load(name, R=1, max_frames=0, calib=24):
     k = d["k"]
     if max_frames:
         k = k[..., :max_frames]
+    if crop_x and crop_x < k.shape[1]:
+        # readout (x) is fully sampled: cropping x in the image domain keeps the per-line sampling exact
+        X0 = k.shape[1]
+        img = np.fft.fftshift(np.fft.ifft(np.fft.ifftshift(k, axes=1), axis=1, norm="ortho"), axes=1)
+        img = img[:, X0 // 2 - crop_x // 2: X0 // 2 - crop_x // 2 + crop_x]
+        k = (np.fft.fftshift(np.fft.fft(np.fft.ifftshift(img, axes=1), axis=1, norm="ortho"), axes=1)
+             * (np.abs(k).sum((0, 1, 3)) > 0)[None, None, :, None]).astype(np.complex64)
+        name = f"{name}_cx{crop_x}"
     N, X, Y, T = k.shape
     sampled = np.abs(k).sum((0, 3)) > 0
     sp = tuple(float(v) for v in d["spacing"])

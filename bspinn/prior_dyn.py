@@ -16,24 +16,51 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .prior import _bcg, _dyn_setup, _fft2c, _grad, _grad_adj, _ifft2c, _tgrad, _tgrad_adj
+from .prior import _bcg, _dyn_setup, _grad, _grad_adj, _tgrad, _tgrad_adj
 from .senselam import cv_masks
 
 
+def _sh(x):
+    return torch.fft.ifftshift(x, dim=(-2, -1))
+
+
+def _ush(x):
+    return torch.fft.fftshift(x, dim=(-2, -1))
+
+
+def _F(x):
+    return torch.fft.fft2(x, norm="ortho")
+
+
+def _Fi(x):
+    return torch.fft.ifft2(x, norm="ortho")
+
+
 class DynProblem:
-    """ksp (N,H,W,T), C (N,H,W) or (N,H,W,T), mask (H,W,T) -> T-first tensors, scaled data."""
+    """ksp (N,H,W,T), C (N,H,W) or (N,H,W,T), mask (H,W,T) -> T-first tensors, scaled data.
+    Internally everything (images, maps, k-space, masks) is ifftshifted once, so the operator uses plain FFTs
+    (the centred FFT's shifts cost 6x the transform on the CPU); all priors here are shift-invariant (cyclic),
+    except the LLR block grid, which is shifted at random anyway. ``out(x)`` undoes the shift; masks passed to
+    solvers must be shifted with ``shift_mask``."""
 
     def __init__(self, ksp, C, mask, device="cpu"):
         k, m, Cn, Ct, mt, yt, x0, s = _dyn_setup(ksp, C, mask, device)
-        self.k, self.mnp, self.Cn, self.C, self.m, self.y, self.x0, self.s = k, m, Cn, Ct, mt, yt, x0, s
+        self.k, self.mnp, self.Cn, self.s = k, m, Cn, s
+        self.C, self.m, self.y, self.x0 = _sh(Ct), _sh(mt), _sh(yt), _sh(x0)
         self.device = device
         self.T = m.shape[0]
 
+    def shift_mask(self, m):
+        return _sh(m)
+
+    def out(self, x):
+        return _ush(x)
+
     def AHA(self, v, m):
-        return (self.C.conj() * _ifft2c(m[:, None] * _fft2c(self.C * v[:, None]))).sum(-3)
+        return (self.C.conj() * _Fi(m[:, None] * _F(self.C * v[:, None]))).sum(-3)
 
     def AHy(self, y, m):
-        return (self.C.conj() * _ifft2c(m[:, None] * y)).sum(-3)
+        return (self.C.conj() * _Fi(m[:, None] * y)).sum(-3)
 
     def start(self, y, m, iters=30):
         fill = float(m.mean())
@@ -173,6 +200,42 @@ def lplus_s(prob: DynProblem, y, m, lam_l, lam_s, iters=50, x0=None, dc=True):
     return L + S
 
 
+def tgv_t(prob: DynProblem, y, m, a1, a0, beta_s, iters=50, cg_iters=5, rho=0.5, lam=1e-6, x0=None):
+    """Temporal TGV2 (+ spatial TV beta_s): min 1/2||Ax-y||^2 + a1 ||D_t x - w||_1 + a0 ||D_t w||_1 + beta_s TV(x),
+    ADMM over (x, w) jointly (CG on the stacked variable)."""
+    r_ = rho * float(m.mean())
+    T = y.shape[0]
+    AHy = prob.AHy(y, m)
+    x = (prob.start(y, m) if x0 is None else x0).clone()
+    w = _tgrad(x).clone()
+
+    def lhs(v):
+        xx, ww = v[0, :T], v[0, T:]
+        e = _tgrad(xx) - ww
+        ox = prob.AHA(xx, m) + lam * xx + r_ * _tgrad_adj(e)
+        ow = -r_ * e + r_ * _tgrad_adj(_tgrad(ww)) + lam * ww
+        if beta_s > 0:
+            ox = ox + r_ * _grad_adj(_grad(xx))
+        return torch.cat([ox, ow])[None]
+    z1 = _tgrad(x) - w; u1 = torch.zeros_like(z1)
+    z2 = _tgrad(w); u2 = torch.zeros_like(z2)
+    zs = _grad(x) if beta_s > 0 else None
+    us = torch.zeros_like(zs) if zs is not None else None
+    for _ in range(iters):
+        a = z1 - u1
+        rx = AHy + r_ * _tgrad_adj(a)
+        rw = -r_ * a + r_ * _tgrad_adj(z2 - u2)
+        if zs is not None:
+            rx = rx + r_ * _grad_adj(zs - us)
+        v = _bcg(lhs, torch.cat([rx, rw])[None], torch.cat([x, w])[None], cg_iters)[0]
+        x, w = v[:T], v[T:]
+        q = _tgrad(x) - w + u1; z1 = soft(q, a1 / r_); u1 = q - z1
+        q = _tgrad(w) + u2; z2 = soft(q, a0 / r_); u2 = q - z2
+        if zs is not None:
+            q = _grad(x) + us; zs = soft_group(q, beta_s / r_, -3); us = q - zs
+    return x
+
+
 def view_share(prob: DynProblem, y, m):
     """x0 from view sharing: each frame's missing k-space filled from the nearest frame (cyclic) that sampled it,
     then the light-Tikhonov SENSE of that full-ish k-space with the frame's maps."""
@@ -198,6 +261,7 @@ def make_solver(spec: str, prob: DynProblem, iters=50, cg_iters=5):
       ttvtf:q:r      temporal TV w + temporal Fourier q w + spatial TV r w
       llr:b:r        locally low rank (blocks b) w + spatial TV r w;  ttvllr:q:r temporal TV w + LLR(8) q w + sTV r w
       lr:r           global low rank w + spatial TV r w
+      tgv:q:r        temporal TGV2 (a1 = w, a0 = q w) + spatial TV r w
       ls:q           L+S: S temporal Fourier w, L threshold q w
       ref:q:r        temporal TV w + spatial TV r w + q w ||x_t - x_ref||_1, x_ref the time-averaged SENSE-1 image
       refts:q        temporal TV w + q w TV(x_t - x_ref) (spatial TV of the difference from the reference)"""
@@ -224,8 +288,8 @@ def make_solver(spec: str, prob: DynProblem, iters=50, cg_iters=5):
             ya = (y * m[:, None]).sum(0) / cnt.clamp_min(1)[None]
             ma = (cnt > 0).float()
             Cm = prob.C if prob.C.ndim == 3 else prob.C.mean(0)
-            AHA = lambda v: (Cm.conj() * _ifft2c(ma * _fft2c(Cm * v))).sum(0) + 1e-3 * v  # noqa: E731
-            b = (Cm.conj() * _ifft2c(ma * ya)).sum(0)
+            AHA = lambda v: (Cm.conj() * _Fi(ma * _F(Cm * v))).sum(0) + 1e-3 * v  # noqa: E731
+            b = (Cm.conj() * _Fi(ma * ya)).sum(0)
             xr = _bcg(lambda v: AHA(v[0])[None], b[None], torch.zeros_like(b)[None], 30)[0]
             cache[key] = xr[None]
         return cache[key]
@@ -253,6 +317,9 @@ def make_solver(spec: str, prob: DynProblem, iters=50, cg_iters=5):
         elif name == "refts":
             r = ref_image(y, m)
             sp = [split("tt", w), Split(_grad, _grad_adj, lambda v, t: soft_group(v, t, -3), w * p[0], offset=_grad(r))]
+        elif name == "tgv":
+            with torch.no_grad():
+                return tgv_t(prob, y, m, w, w * p[0], w * p[1], iters, cg_iters, x0=x0_for(y, m))
         elif name == "ls":
             with torch.no_grad():
                 return lplus_s(prob, y, m, w * p[0], w, iters, x0_for(y, m))
@@ -278,10 +345,10 @@ def cv_curve(prob: DynProblem, solver, grid, holdout=0.1, folds=2, seed=0):
             tr, ho = fm[f % len(fm)] if fm else (m[t], np.zeros_like(m[t]))
             tr_t.append(tr); ho_t.append(ho)
         tr, ho = np.stack(tr_t), np.stack(ho_t)
-        trt = torch.from_numpy(tr.astype(np.float32)).to(prob.device)
+        trt = prob.shift_mask(torch.from_numpy(tr.astype(np.float32)).to(prob.device))
         ytr = prob.y * trt[:, None]
         for gi, b in enumerate(grid):
-            X = solver(ytr, trt, float(b)).cpu().numpy()
+            X = prob.out(solver(ytr, trt, float(b))).cpu().numpy()
             Cn = prob.Cn
             P = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(Cn * X[:, None] if Cn.ndim == 4 else Cn[None] * X[:, None],
                                                              axes=(-2, -1)), norm="ortho"), axes=(-2, -1))

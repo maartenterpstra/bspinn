@@ -635,6 +635,8 @@ def _dynamic_via_2d(ksp, mask, *, rank, iters_dynamic, dynamic_options, validate
     gives the static maps (identical to estimate_maps(time average, '2d')); rank > 0 adds per-frame corrections
     of that fixed model, optionally validated on withheld lines (see estimate_maps)."""
     log = print if kw2d.get("verbose", True) else (lambda *a, **k: None)
+    if kw2d.get("solve_image") and rank != 0:
+        raise ValueError("solve_image with dynamic data needs rank=0 (one static map set)")
     t0 = time.time()
     under_info = {}
     if undersample is not None:
@@ -646,14 +648,15 @@ def _dynamic_via_2d(ksp, mask, *, rank, iters_dynamic, dynamic_options, validate
     log(f"dynamic: maps of the time-averaged k-space by the 2-D path ({T} frames, {int(mavg.any(0).sum())} lines)")
     out = estimate_maps(kav, "2d", mask=mavg, return_image=False, _internal=internal, **kw2d)
     C2, info = out[0], dict(out[-1])
-    info.pop("image_joint", None); info.pop("image_tikhonov_joint", None); info.pop("image_prior_joint", None)
+    ij = info.pop("image_joint", None)
+    info.pop("image_tikhonov_joint", None); info.pop("image_prior_joint", None)
     info.update(rank=rank, dynamic_base="2d", time_average_lines=int(mavg.any(0).sum()))
     if rank == 0:
         C = np.repeat(C2[..., None], T, -1)
     else:
         C = _dynamic_corrections(ksp, m_all, C2, internal, info, rank, iters_dynamic, dynamic_options, validate, kw2d, log)
     info.update(under_info)
-    info["image_joint"] = None
+    info["image_joint"] = None if ij is None else np.repeat(np.asarray(ij)[..., None], T, -1)   # the time average's
     info["seconds"] = time.time() - t0
     C = C.astype(np.complex64)
     if not return_image:
@@ -734,7 +737,8 @@ def _dynamic_corrections(ksp, m_all, C2, internal, info, rank, iters_dynamic, dy
         if kw2d.get("normalise", "rss") == "rss":
             Cs = Cs / np.maximum(np.sqrt((np.abs(Cs) ** 2).sum(0, keepdims=True)), 1e-12)
         return np.where(np.abs(C2[..., None]).sum(0, keepdims=True) > 0, Cs, 0).astype(np.complex64)
-    info.update(temporal_modes=dyn.alpha.detach().numpy(), correction_rel=rel, model_dynamic=dyn,
+    info["model_static"] = info.get("model")
+    info.update(temporal_modes=dyn.alpha.detach().numpy(), correction_rel=rel, model=dyn, dynamic_maps_fn=maps,
                 data_loss_dynamic=float(hist["dynamic"][-1]["data"]) if hist.get("dynamic") else None)
     if not validate:
         return maps(1.0)

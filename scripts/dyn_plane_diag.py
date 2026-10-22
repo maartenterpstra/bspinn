@@ -56,6 +56,9 @@ def main():
                                         dynamic_options=parse_set(a.dyn_set) or None, **kw)
                 if rank == 0:
                     C = C[..., 0]
+                elif info.get("dynamic_maps_fn") is not None:          # the unvalidated corrections too
+                    np.save(f"{OUT}/maps/{a.case}_R{a.R:g}_{w}{a.tag}_full.npy", info["dynamic_maps_fn"](1.0))
+                    np.save(f"{OUT}/maps/{a.case}_R{a.R:g}_{w}{a.tag}_base.npy", info["dynamic_maps_fn"](0.0))
                 extra = {"plane": info["plane"], "plane_scores": info.get("plane_scores"),
                          "plane_heldout": info.get("plane_heldout"), "handedness": info.get("handedness"),
                          "fold": (info.get("fold") or {}).get("corrected"),

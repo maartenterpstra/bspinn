@@ -43,11 +43,16 @@ def main():
     ap.add_argument("--cv", action="store_true", help="also the k-space CV curve (2 folds)")
     ap.add_argument("--out", default=f"{OUT}/image_lab.jsonl")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--crop-x", type=int, default=0, help="prototype: central readout crop (exact sub-problem)")
+    ap.add_argument("--vc", type=int, default=0, help="prototype: compress to this many virtual coils")
     a = ap.parse_args()
     setup_threads()
     from bspinn import prior_dyn as pd
-    c = load(a.case, a.R, a.max_frames)
+    c = load(a.case, a.R, a.max_frames, crop_x=a.crop_x)
     C = get_maps(c, a.maps)
+    if a.vc:
+        from dyn_common import compress
+        c, C = compress(c, C, a.vc)
     prob = pd.DynProblem(c["ku"], C, c["m"])
     grid = np.logspace(a.grid[0], a.grid[1], int(a.grid[2]))
     for spec in a.methods:
@@ -57,12 +62,12 @@ def main():
         dyn = []
         for w in grid:
             X = solver(prob.y, prob.m, float(w))
-            x = np.moveaxis(X.cpu().numpy() * prob.s, 0, -1)
+            x = np.moveaxis(prob.out(X).cpu().numpy() * prob.s, 0, -1)
             e, de = nrmse(x, c)
             errs.append(e); dyn.append(de)
             if e < best[0]:
                 best = (e, float(w))
-        rec = {"case": a.case, "R": a.R, "maps": a.maps, "method": spec, "tag": a.tag, "iters": a.iters,
+        rec = {"vc": a.vc, "crop_x": a.crop_x, "case": a.case, "R": a.R, "maps": a.maps, "method": spec, "tag": a.tag, "iters": a.iters,
                "grid": grid.tolist(), "nrmse": errs, "dyn_nrmse": dyn, "oracle_nrmse": best[0], "oracle_weight": best[1],
                "oracle_dyn": dyn[int(np.argmin(errs))]}
         if a.cv:
@@ -70,7 +75,7 @@ def main():
             from bspinn.prior import select_weight
             w, rule = select_weight(grid, cv, 1.0)
             X = solver(prob.y, prob.m, w)
-            e, de = nrmse(np.moveaxis(X.cpu().numpy() * prob.s, 0, -1), c)
+            e, de = nrmse(np.moveaxis(prob.out(X).cpu().numpy() * prob.s, 0, -1), c)
             rec.update(cv_error=cv, cv_weight=w, cv_rule=rule, cv_nrmse=e, cv_dyn=de)
         rec["seconds"] = time.time() - t0
         with open(a.out, "a") as f:
