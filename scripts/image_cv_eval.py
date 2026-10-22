@@ -39,6 +39,7 @@ def main():
         for R in a.R:
             for mp in a.maps:
                 c = Case(cn, R, mp, a.crop or None)
+                s_scale = float(P._setup(c.ksp, c.C, c.m, "cpu")[-1])     # p99 data scale (noise sigma = 1: whitened)
                 for v in a.variants:
                     if (cn, R, mp, v, a.crop) in done:
                         continue
@@ -46,7 +47,7 @@ def main():
                     t = time.time(); rep = {}
                     x = P.prior_image(c.ksp, c.C, c.m, prior, "auto", report=rep, cv_options={"calib": c.acs}, **kw)
                     q = c.score(x)
-                    rec = {"case": cn, "R": R, "maps": mp, "variant": v, "crop": a.crop, "auto": q,
+                    rec = {"case": cn, "R": R, "maps": mp, "variant": v, "crop": a.crop, "auto": q, "s": s_scale,
                            "weight": rep["weight"], "rule": rep["rule"], "cv_error": rep["cv_error"], "secs_auto": time.time() - t}
                     if not a.no_oracle:
                         X = solve_grid(c, prior, og, **kw)

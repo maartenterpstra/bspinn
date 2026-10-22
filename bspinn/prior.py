@@ -392,8 +392,9 @@ def smooth_phase(x, width=24):
     """Low-resolution phase of x (H,W) or (L,H,W): Hann window of ``width`` k-space lines in both directions."""
     xx = x if x.dim() == 2 else x[0]
     H, W = xx.shape
-    wh = torch.zeros(H); wh[H // 2 - width // 2:H // 2 + width // 2] = torch.hann_window(width, periodic=False)
-    ww = torch.zeros(W); ww[W // 2 - width // 2:W // 2 + width // 2] = torch.hann_window(width, periodic=False)
+    width = int(max(2, min(width, H, W)))
+    wh = torch.zeros(H); wh[H // 2 - width // 2:H // 2 - width // 2 + width] = torch.hann_window(width, periodic=False)
+    ww = torch.zeros(W); ww[W // 2 - width // 2:W // 2 - width // 2 + width] = torch.hann_window(width, periodic=False)
     k = _fft2c(xx) * (wh[:, None] * ww[None]).to(xx.device)
     return torch.angle(_ifft2c(k)).float()
 
@@ -404,11 +405,11 @@ def noise_map(C, m, lam=1e-2, probes=4, smooth=9, seed=0):
     g = torch.Generator().manual_seed(seed)
     fill = float(m.mean())
     AHA = lambda v: (C.conj() * _ifft2c(m * _fft2c(C * v[:, None]))).sum(-3) + lam * fill * v  # noqa: E731
-    n = (torch.randn((probes,) + tuple(C.shape), generator=g) + 1j * torch.randn((probes,) + tuple(C.shape), generator=g)).to(C.dtype)
+    n = (torch.randn((probes,) + tuple(C.shape), generator=g) + 1j * torch.randn((probes,) + tuple(C.shape), generator=g)).to(C.dtype).to(C.device)
     b = (C.conj() * _ifft2c(m * n)).sum(-3)
     xn = _bcg(AHA, b, torch.zeros_like(b), 30)
     v = (xn.abs() ** 2).mean(0)
-    k = torch.ones(1, 1, smooth, smooth) / smooth ** 2
+    k = torch.ones(1, 1, smooth, smooth, device=C.device) / smooth ** 2
     v = torch.nn.functional.conv2d(v[None, None].float(), k, padding=smooth // 2)[0, 0]
     sd = v.sqrt()
     sup = (C.abs() ** 2).sum(0) > 0.5

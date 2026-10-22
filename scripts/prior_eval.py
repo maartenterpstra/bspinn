@@ -23,7 +23,10 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, HERE)
 
-PRIOR_METHODS = {"tv": "tv", "wavelet": "wavelet", "tvw": "tv+wavelet"}
+PRIOR_METHODS = {"tv": "tv", "wavelet": "wavelet", "tvw": "tv+wavelet",
+                 # r2-image opt-ins (bspinn.prior): TGV^2, the soft low-resolution phase constraint, both
+                 "tgv": "tgv", "tv_phase": ("tv", {"phase": "lowres", "phase_weight": 0.3}),
+                 "tgv_phase": ("tgv", {"phase": "lowres", "phase_weight": 0.3})}
 
 
 def main():
@@ -64,7 +67,7 @@ def main():
     from bspinn import evaluation as ev
     from bspinn import methods as bm
     from bspinn.api import acquired_extent, sense_image
-    from bspinn.prior import AUTO_SCALE, admm, prior_image, _setup
+    from bspinn.prior import AUTO_SCALE, admm, prior_image, resolve_options, _setup
     if a.device.startswith("cuda") and not torch.cuda.is_available():
         print("CUDA not available: using the CPU (slow)"); a.device = "cpu"
     grid = np.logspace(a.grid[0], a.grid[1], int(a.grid[2]))
@@ -133,16 +136,18 @@ def main():
                         record(meth, reconstruct(net, fit.ksp, Cn, fit.sampled, a.device), {"seconds": time.time() - t0})
                     else:
                         pr = PRIOR_METHODS[meth]
+                        pr, pkw = pr if isinstance(pr, tuple) else (pr, {})
                         rep = {}
                         x = prior_image(fit.ksp, Cn, fit.sampled, pr, "auto", device=a.device, report=rep, grid=grid,
-                                        ratio=a.ratio, scale=AUTO_SCALE if a.scale is None else a.scale, **kw)
+                                        ratio=a.ratio, scale=AUTO_SCALE if a.scale is None else a.scale, **kw, **pkw)
                         extra = {"weight": rep["weight"], "weight_grid": rep["weight_grid"], "cv_error": rep["cv_error"], "rule": rep.get("rule"),
                                  "at_grid_edge": rep["at_grid_edge"], "seconds": time.time() - t0}
                         if a.oracle:          # every grid weight against the reference
                             _, _, Ct, mt, yt, x0, s = _setup(fit.ksp, Cn, fit.sampled, a.device)
+                            okw = resolve_options(pkw, Ct, mt, x0, 24)
                             with torch.no_grad():
                                 X = admm(yt, Ct, mt, torch.tensor(grid, dtype=torch.float32, device=a.device), pr,
-                                         ratio=a.ratio, x0=x0, **kw).cpu().numpy() * s
+                                         ratio=a.ratio, x0=x0, **kw, **okw).cpu().numpy() * s
                             curve = [metrics(band_limit(xx, ext), rss, obj)["nrmse"] for xx in X]
                             io = int(np.argmin(curve))
                             extra.update(oracle_weight=float(grid[io]), oracle_nrmse=float(curve[io]), grid_nrmse=curve)
