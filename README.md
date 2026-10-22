@@ -1549,6 +1549,11 @@ from the correction fit; the series is scored on them (spatio-temporal TV image 
 the corrections scaled by 0, 0.25, 0.5, 1; the corrections are kept (scaled) only if they beat the base by 2 %.
 `info['dynamic_validation']`, `dynamic_options`: holdout, shrink_grid, min_gain, val_weight, val_iters. By
 construction the dynamic layout can then only return the base (= pinn_avg) or something better on held-out lines.
+Prospective check, OCMR us_0001_3T (first 24 frames, rank 2, CPU fit 2.9 h): held-out score (relative k-space
+error on the withheld lines) at correction scale 0 / 0.25 / 0.5 / 1 = 0.145 / 0.231 / 0.359 / 0.529; scale 0 chosen, i.e.
+the unvalidated rank-2 corrections would have made the held-out error 3.7x worse (the earlier divergence), and the
+check returns the time-average maps. With 16 lines per frame the corrections fit aliasing, not coil changes; keep
+rank 0 unless your data have per-frame calibration lines.
 
 **Cine prior: spatial TV of the difference from the time average** (`dynamic_prior_image(..., spatial_on='difference')`,
 `--spatial-on difference` in scripts/ocmr_eval.py and ocmr_prospective.py): temporal TV w + 0.25 w TV(x_t - x_ref),
@@ -1569,6 +1574,33 @@ difference from the reference 0.0895 / 0.0389, temporal TGV 0.0902 / 0.0398, vie
 locally low rank 0.0908, global low rank 0.0907, L+S 0.0948, spatial/temporal ratio 0 / 0.1 / 0.5 / 1: 0.0945 / 0.0912
 / 0.0908 / 0.0924 (0.25: 0.0902). Also: `dynamic_admm` uses unshifted FFTs internally (same result, ~3x faster on a
 CPU).
+
+### 8.15 IRGNM refinement of the PINN maps (`refine='irgnm'`, opt-in)
+
+`estimate_maps(..., refine='irgnm', refine_options={'holdout': 0, 'steps': 8})` (bspinn/irgnm.py): after the PINN
+fit, NLINV-style iteratively regularised Gauss-Newton on the image and a Sobolev-weighted free per-coil correction of
+the maps (alpha continuation 1, 1/2, 1/4, ...), regularised towards the PINN maps (and image, `x_ref='pinn'`; or
+towards zero, `x_ref='zero'`). `holdout=0.1` (the default) picks the number of steps on withheld samples; the
+knee lab only validated the fixed 8 steps. The returned image is recomputed with the refined maps.
+
+CPU lab, joint protocol R = 4 (cached v33 maps), combine->expand residual inside the ACS / floor, leave-coil-out
+outside the ACS, SENSE R4 NRMSE:
+
+| case | PINN v33 | + IRGNM 8 steps | NLINV |
+|---|---|---|---|
+| k19870 (knee, high SNR) | 35.1 / 1.048 / 0.0761 | 6.40 / 1.007 / 0.0741 | 6.61 / 1.014 / 0.0749 |
+| val_outlier (knee) | 42.8 / 1.112 / 0.0255 | 6.46 / 1.055 / 0.0237 | 4.40 / 1.056 / 0.0238 |
+| val_cc (brain) | 2.49 / 1.036 / 0.0982 | 1.12 / 1.034 / 0.0982 | 1.45 / 1.034 / 0.0985 |
+
+TV image NRMSE: val_outlier 0.0357 -> 0.0349, val_cc 0.0740 -> 0.0740. The PINN's calibration-region gap closes
+(the last known map-quality gap on high-SNR data); the image gain is small, as the maps no longer limit it.
+Not fixed: the brain phase-pole plane at ACS 3 (lco 8.5 -> 8.3, 5.9 with `x_ref='zero'`, 12 steps; NLINV corrected 2.1):
+the refinement stays near the PINN maps, whose error there is global (a field fitted to an aliased calibration image).
+An ensemble of PINN and NLINV projectors landed in between (rejected).
+
+```
+bash bspinn/scripts/run_r2.sh      # all round-2 confirmations (image priors, IRGNM, cine, phase-pole planes)
+```
 
 ## 9. Code map
 
