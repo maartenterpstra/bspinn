@@ -1773,3 +1773,29 @@ def test_joint_lbfgs_finish_gradient_image(capsys):
     assert line
     a, b = [float(v) for v in line[-1].split("data ")[1].split(" -> ")]
     assert b <= a * 1.001
+
+
+def test_irgnm_refine_reduces_smooth_map_error():
+    """bspinn.irgnm: a smooth per-coil error of the anchor maps is largely removed by the Gauss-Newton refinement
+    on undersampled data; the held-out step choice runs and never makes the anchor worse."""
+    from bspinn.data import make_synthetic
+    from bspinn.irgnm import irgnm_refine
+    from bspinn.masks import cartesian_mask
+    data, gt, _ = make_synthetic(6, (64, 64), noise=0.002, seed=3)
+    C, k = gt[0], np.asarray(data.kspace)[0]
+    m = cartesian_mask(C.shape[1:], R=2, acs=16, pattern="uniform")
+    y, x = np.mgrid[-1:1:64j, -1:1:64j]
+    rng = np.random.default_rng(1)
+    pert = np.stack([np.exp(0.15 * (rng.normal() * x + rng.normal() * y + 1j * rng.normal() * x * y)) for _ in C])
+    C0 = C * pert
+
+    def err(Cm):
+        a = Cm / np.sqrt((np.abs(Cm) ** 2).sum(0, keepdims=True)); b = C / np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True))
+        ph = np.exp(1j * np.angle((a.conj() * b).sum(0)))
+        return float(np.linalg.norm(a * ph[None] - b) / np.linalg.norm(b))
+    C1, x1, info = irgnm_refine(k * m[None], C0, m, steps=6, holdout=0)
+    assert info["steps"] == 6 and np.isfinite(C1).all() and x1.shape == C.shape[1:]
+    assert err(C1) < 0.6 * err(C0)
+    C2, _, info2 = irgnm_refine(k * m[None], C0, m, holdout=0.1, max_steps=6)
+    assert 0 <= info2["steps"] <= 6 and len(info2["heldout_err"]) == 7
+    assert err(C2) <= err(C0) + 1e-6

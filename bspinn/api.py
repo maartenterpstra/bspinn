@@ -35,7 +35,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda="auto", sense_lambda_scale=1.0, sense_lambda_options=None, sense_iters=60, mask_maps=False, support_threshold=0.1,
                   support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout",
                   image_prior=None, image_prior_weight="auto", image_prior_options=None, dynamic_static="average",
-                  dynamic_options=None,
+                  dynamic_options=None, refine=None, refine_options=None,
                   **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
@@ -118,6 +118,12 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         image (calibration region, Hann window, 5-pixel smoothing) above ``support_threshold`` x its
         99th percentile, holes filled, dilated by ``support_dilate`` pixels. Lower the threshold or
         dilate more if the mask clips the object edge (masked maps make SENSE zero there).
+    refine, refine_options : 2-D only. ``'irgnm'``: after the PINN fit, refine the maps NLINV-style
+        (bspinn.irgnm.irgnm_refine): iteratively regularised Gauss-Newton on the image and a Sobolev-weighted
+        free per-coil correction on ALL acquired samples, regularised towards the PINN solution with a
+        decreasing weight (alpha0 * q^n); the number of steps is chosen by held-out k-space prediction unless
+        ``refine_options={'steps': n, 'holdout': 0}``. The returned image is then recomputed with the refined
+        maps (sense_image, same weight / prior options). ``info['refine']`` has the path and the choice.
     solve_image : solve for the full-resolution image jointly with the maps (NLINV-style): after the
         calibration fit, maps and image are refined together on ALL acquired k-space (the maps stay
         physics-constrained; the image is solved by CG-SENSE inside the acquired k-space extent at every
@@ -258,6 +264,18 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     # channels M @ (original channels): map back to the original channels.
     prob = info["problem"]
     M = prob.data.meta.get("mix")
+    if refine is not None:
+        if refine != "irgnm" or layout != "2d":
+            raise ValueError("refine='irgnm' is implemented for 2-D data")
+        from .irgnm import irgnm_refine
+        with accel.phase("refine", device):
+            kw = ksp if M is None else np.einsum("ij,j...->i...", np.asarray(M), ksp)      # data channels of C
+            mr = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
+            ro = {"holdout": 0.1, **(refine_options or {})}
+            C, _, info["refine"] = irgnm_refine(kw, C, mr, device=device, seed=seed, **ro)
+            log(f"IRGNM refinement: {info['refine']['steps']} Gauss-Newton steps")
+        if info.pop("_xfull", None) is not None:  # the joint image belongs to the unrefined maps: recomputed below
+            info["image_solved_jointly"] = False
     fold_maps = info.pop("_fold_maps", None) or {}
     if M is not None:
         Minv = np.linalg.inv(np.asarray(M))
