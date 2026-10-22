@@ -106,6 +106,8 @@ def main():
                     "(e.g. lambda_corr=0.01 freeze_static=False alpha_init=data)")
     ap.add_argument("--pinn-set", nargs="*", default=[])
     ap.add_argument("--plane", default="auto")
+    ap.add_argument("--spatial-on", default="image", choices=["image", "difference"],
+                    help="tv: spatial TV of the frames or of their difference from the time average (v57)")
     ap.add_argument("--spatial-ratio", type=float, default=0.25)
     ap.add_argument("--tv-iters", type=int, default=50)
     ap.add_argument("--tv-grid", type=float, nargs=3, default=None, metavar=("LOG10_MIN", "LOG10_MAX", "N"))
@@ -207,7 +209,7 @@ def main():
                 elif rc == "tv":
                     rep = {}
                     grid = None if a.tv_grid is None else np.logspace(a.tv_grid[0], a.tv_grid[1], int(a.tv_grid[2]))
-                    x = dynamic_prior_image(ktr, Cn, tr, "auto", spatial_ratio=a.spatial_ratio, device=a.device,
+                    x = dynamic_prior_image(ktr, Cn, tr, "auto", spatial_ratio=a.spatial_ratio, spatial_on=a.spatial_on, device=a.device,
                                             report=rep, iters=a.tv_iters, grid=grid, folds=a.tv_folds)
                     extra.update({kk: rep.get(kk) for kk in ("weight", "rule", "grid", "cv_error")})
                 else:

@@ -35,7 +35,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda="auto", sense_lambda_scale=1.0, sense_lambda_options=None, sense_iters=60, mask_maps=False, support_threshold=0.1,
                   support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout",
                   image_prior=None, image_prior_weight="auto", image_prior_options=None, dynamic_static="average",
-                  dynamic_options=None,
+                  dynamic_options=None, dynamic_base="2d", dynamic_validate="auto",
                   **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
@@ -71,6 +71,18 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         learned (v55), started at zero and shrunk towards the base.
     dynamic_options : dynamic only. dict of bspinn.dynamic.DynConfig fields, e.g. {'lambda_corr': 1e-2,
         'freeze_static': True, 'alpha_init': 'auto' | 'dct' | 'data', 'parts': 'both' | 'wires' | 'fields'}.
+    dynamic_base : dynamic with dynamic_static='average' only. '2d' (default, v57): the time-averaged k-space is
+        fitted by the full 2-D path (held-out B0-plane decision, handedness from the plane search, fold-over
+        correction, joint stage with ``solve_image``), so rank 0 returns exactly the 2-D maps of the time average
+        for every frame; rank > 0 learns per-frame corrections on top of that FIXED model, and the returned
+        frame maps are the 2-D maps plus the corrections (same phase convention and normalisation). 'legacy':
+        the v50-v56 path (B0 plane from the probe alone, no fold correction).
+    dynamic_validate : dynamic_base='2d', rank > 0. 'auto' (default) | True | False. Withholds
+        ``dynamic_options['holdout']`` (default 10 %, at least one) of the acquired lines of every frame from the
+        correction fit, then scores the series with the base maps and with the corrections scaled by
+        ``shrink_grid`` (default 0.25, 0.5, 1) on them (spatio-temporal TV image from the other lines, fixed
+        weight); the corrections are kept, scaled, only if they beat the base by ``min_gain`` (default 2 %),
+        otherwise the base maps are returned. ``info['dynamic_validation']``. 'auto' = True.
     rank : dynamic only. Number of temporal motion modes of the coil array; 0 = one static map set
         shared by all frames (frames are then only used as extra data).
     quality : 'fast' | 'default'. Iteration presets (see PRESETS); override with iters_wires=...,
@@ -188,6 +200,24 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         raise ValueError(f"spacing needs {nsp} values")
     if noise is not None:
         noise = np.asarray(noise).reshape(-1, ksp.shape[0])
+    _internal = cfg_overrides.pop("_internal", None)
+    if layout == "dynamic" and dynamic_static == "average" and dynamic_base == "2d":
+        return _dynamic_via_2d(
+            ksp, mask, rank=rank, iters_dynamic=iters_dynamic, dynamic_options=dynamic_options,
+            validate=dynamic_validate, undersample=undersample, return_image=return_image or solve_image,
+            image_kw=dict(noise=noise, lam=sense_lambda, iters=sense_iters, device=device, lam_scale=sense_lambda_scale,
+                          lam_options=sense_lambda_options, prior=image_prior, prior_weight=image_prior_weight,
+                          prior_options=image_prior_options),
+            kw2d=dict(spacing=spacing, plane=plane, calib=calib, noise=noise, physics=physics, b0_tesla=b0_tesla,
+                      model=model, quality=quality, normalise=normalise, phase_ref=phase_ref, device=device,
+                      threads=threads, seed=seed, verbose=verbose, mask_maps=mask_maps,
+                      support_threshold=support_threshold, support_dilate=support_dilate, solve_image=solve_image,
+                      fold=fold, readout_axis=readout_axis, plane_select=plane_select, image_prior=image_prior,
+                      image_prior_weight=image_prior_weight, image_prior_options=image_prior_options,
+                      sense_lambda=sense_lambda, sense_lambda_scale=sense_lambda_scale,
+                      sense_lambda_options=sense_lambda_options, sense_iters=sense_iters, **cfg_overrides))
+    if dynamic_base not in ("2d", "legacy"):
+        raise ValueError("dynamic_base must be '2d' or 'legacy'")
 
     ia, iw, ip = PRESETS[layout][quality]
     cfg = FitConfig(model=model, physics=physics, b0_tesla=b0_tesla, phase_ref="model", device=device,
@@ -274,6 +304,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
             log("fold-over corrected maps: the full-resolution image is recomputed by SENSE with them "
                 "(the joint solution used the uncorrected maps)")
             info.pop("_xfull", None)
+    if _internal is not None:                  # the dynamic layout's base (v57): model, raw maps, its config
+        _internal.update(cfg=cfg, C_pre_finish=C, model=info.get("model"), problem=prob, m=info.get("_m"))
     # common phase + normalisation (per-pixel complex scalars, identical for all coils)
     if isinstance(mask_maps, (bool, np.bool_)) or mask_maps is None:
         sup = _support(ksp, mask, layout, cfg.calib, support_threshold, support_dilate)
@@ -584,6 +616,160 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
     return C, {"handedness": extra["handedness"], "rank": rank, "temporal_modes": dyn.alpha.detach().numpy(),
                "data_loss": float(hist["dynamic"][-1]["data"]) if hist.get("dynamic") else None,
                "model": dyn, "problem": prob, "_m": extra["m"], "plane": plane, "plane_scores": scores}
+
+
+# ---------------------------------------------------------------------------------- dynamic from the 2-D fit (v57)
+def _time_average(ksp, m_all):
+    N, X, Y, T = ksp.shape
+    cnt = m_all.sum(-1)
+    kav = np.zeros((N, X, Y), np.complex64)
+    for t in range(T):
+        kav += ksp[..., t] * m_all[..., t]
+    kav /= np.maximum(cnt, 1)[None]
+    return kav, cnt > 0
+
+
+def _dynamic_via_2d(ksp, mask, *, rank, iters_dynamic, dynamic_options, validate, undersample, return_image,
+                    image_kw, kw2d):
+    """layout='dynamic', dynamic_static='average', dynamic_base='2d': the 2-D path on the time-averaged k-space
+    gives the static maps (identical to estimate_maps(time average, '2d')); rank > 0 adds per-frame corrections
+    of that fixed model, optionally validated on withheld lines (see estimate_maps)."""
+    log = print if kw2d.get("verbose", True) else (lambda *a, **k: None)
+    if kw2d.get("solve_image") and rank != 0:
+        raise ValueError("solve_image with dynamic data needs rank=0 (one static map set)")
+    t0 = time.time()
+    under_info = {}
+    if undersample is not None:
+        ksp, mask, under_info = _apply_undersampling(ksp, mask, undersample, "dynamic", int(max(_calib(kw2d.get("calib"), 24, 1))))
+    N, X, Y, T = ksp.shape
+    m_all = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
+    kav, mavg = _time_average(ksp, m_all)
+    internal = {}
+    log(f"dynamic: maps of the time-averaged k-space by the 2-D path ({T} frames, {int(mavg.any(0).sum())} lines)")
+    out = estimate_maps(kav, "2d", mask=mavg, return_image=False, _internal=internal, **kw2d)
+    C2, info = out[0], dict(out[-1])
+    ij = info.pop("image_joint", None)
+    info.pop("image_tikhonov_joint", None); info.pop("image_prior_joint", None)
+    info.update(rank=rank, dynamic_base="2d", time_average_lines=int(mavg.any(0).sum()))
+    if rank == 0:
+        C = np.repeat(C2[..., None], T, -1)
+    else:
+        C = _dynamic_corrections(ksp, m_all, C2, internal, info, rank, iters_dynamic, dynamic_options, validate, kw2d, log)
+    info.update(under_info)
+    info["image_joint"] = None if ij is None else np.repeat(np.asarray(ij)[..., None], T, -1)   # the time average's
+    info["seconds"] = time.time() - t0
+    C = C.astype(np.complex64)
+    if not return_image:
+        return C, info
+    rep = {}
+    img = sense_image(ksp, C, "dynamic", mask=m_all, report=rep, **image_kw)
+    info["image_solved_jointly"] = False
+    info["image_prior" if image_kw.get("prior") is not None else "sense_lambda"] = rep
+    info["seconds"] = time.time() - t0
+    return C, img, info
+
+
+def _holdout_lines(m_all, frac, seed=0):
+    """(X,Y,T) mask -> held-out mask: round(frac x acquired lines) (>= 1) whole phase-encode lines per frame, never
+    a frame's only line."""
+    rng = np.random.default_rng(seed + 4242)
+    lines = m_all.any(0)                                   # (Y,T)
+    ho = np.zeros_like(lines)
+    for t in range(lines.shape[1]):
+        acq = np.flatnonzero(lines[:, t])
+        n = min(max(1, int(round(frac * acq.size))), acq.size - 1)
+        if n > 0:
+            ho[rng.choice(acq, n, replace=False), t] = True
+    return m_all & ho[None]
+
+
+def _dynamic_corrections(ksp, m_all, C2, internal, info, rank, iters_dynamic, dynamic_options, validate, kw2d, log):
+    from .data import MultiCoilData
+    from .dynamic import DynConfig, fit_dynamic
+    from .geometry import SliceGeometry
+    N, X, Y, T = ksp.shape
+    opts = dict(dynamic_options or {})
+    vopt = {k: opts.pop(k) for k in ("holdout", "shrink_grid", "min_gain", "val_weight", "val_iters") if k in opts}
+    validate = True if validate == "auto" else bool(validate)
+    cfg = copy.deepcopy(internal["cfg"])
+    cfg.joint_full = False
+    cfg.joint_prior = None
+    cfg.handedness = int(info["handedness"])
+    if "slice_batch" not in kw2d:
+        cfg.slice_batch = min(4, max(1, 80 // max(1, N)), T)
+    ho = _holdout_lines(m_all, vopt.get("holdout", 0.1), cfg.seed) if validate else np.zeros_like(m_all)
+    tr = m_all & ~ho
+    kt = np.ascontiguousarray(np.moveaxis(ksp * tr[None], -1, 0))          # (T,N,X,Y) training samples
+    mt = np.moveaxis(tr, -1, 0)[:, None]
+    geom = SliceGeometry((X, Y), tuple(kw2d["spacing"]), np.zeros(T), info["plane"])
+    data = MultiCoilData(kt, geom, mask=mt, noise=kw2d.get("noise"), meta={"dynamic": True})
+    dcfg = DynConfig(rank=rank, iters_dyn=iters_dynamic or max(300, cfg.iters_pinn // 2), **opts)
+    dyn, prob, hist, extra = fit_dynamic(data, cfg, dcfg, log=log, static_fit=(
+        internal["model"], internal["problem"], internal["m"], info["handedness"]))
+    del kt, data
+    # per-frame corrections at full resolution, data channels -> original channels (as the 2-D maps)
+    pts = geom.grid((X, Y))[0].reshape(-1, 3).to(cfg.device)
+    dyn.to(cfg.device)
+    chunk = max(1024, 4096 * 16 // max(16, prob.N_model))
+    M = prob.data.meta.get("mix")
+    Minv = None if M is None else np.linalg.inv(np.asarray(M)).astype(np.complex64)
+
+    def frame(t):
+        c = torch.cat([dyn.sensitivity_frames(pts[j:j + chunk], [t], create_graph=False).detach().cpu()
+                       for j in range(0, pts.shape[0], chunk)], -1)
+        return prob.mixC(c, -2).numpy()[0].reshape(-1, X, Y)
+    with torch.no_grad():
+        a = dyn.alpha.data.clone()
+        dyn.alpha.data.zero_()
+        base = frame(0)
+        dyn.alpha.data.copy_(a)
+        D = np.stack([frame(t) - base for t in range(T)], -1)                    # (N,X,Y,T)
+    dyn.cpu()
+    if Minv is not None:
+        D = np.einsum("ij,j...->i...", Minv, D)
+    Craw = np.asarray(internal["C_pre_finish"])
+    g = (Craw.conj() * C2).sum(0) / np.maximum((np.abs(Craw) ** 2).sum(0), 1e-30)   # per-pixel gauge/normalisation
+    rel = float(np.sqrt((np.abs(D) ** 2).mean() / max((np.abs(Craw) ** 2).mean(), 1e-30)))
+    log(f"dynamic corrections: relative size {rel:.4f} (RMS over frames, vs the base maps)")
+
+    def maps(s):
+        Cs = g[..., None] * (Craw[..., None] + s * D)
+        if kw2d.get("normalise", "rss") == "rss":
+            Cs = Cs / np.maximum(np.sqrt((np.abs(Cs) ** 2).sum(0, keepdims=True)), 1e-12)
+        return np.where(np.abs(C2[..., None]).sum(0, keepdims=True) > 0, Cs, 0).astype(np.complex64)
+    info["model_static"] = info.get("model")
+    info.update(temporal_modes=dyn.alpha.detach().numpy(), correction_rel=rel, model=dyn, dynamic_maps_fn=maps,
+                data_loss_dynamic=float(hist["dynamic"][-1]["data"]) if hist.get("dynamic") else None)
+    if not validate:
+        return maps(1.0)
+    shrink = list(vopt.get("shrink_grid", (0.25, 0.5, 1.0)))
+    scores = {0.0: _heldout_series(ksp, np.repeat(C2[..., None], T, -1), tr, ho, vopt, kw2d.get("device", "cpu"))}
+    for s in shrink:
+        scores[float(s)] = _heldout_series(ksp, maps(s), tr, ho, vopt, kw2d.get("device", "cpu"))
+    best = min(scores, key=scores.get)
+    keep = best > 0 and scores[best] < (1 - vopt.get("min_gain", 0.02)) * scores[0.0]
+    s_use = best if keep else 0.0
+    log("dynamic corrections, held-out error by scale: " + ", ".join(f"{k:g} {v:.4f}" for k, v in scores.items())
+        + f" -> {s_use:g}")
+    info["dynamic_validation"] = {"scores": {str(k): v for k, v in scores.items()}, "scale": s_use,
+                                  "heldout_samples": int(ho.sum())}
+    return maps(s_use) if s_use > 0 else np.repeat(C2[..., None], T, -1)
+
+
+def _heldout_series(ksp, C, tr, ho, vopt, device):
+    """Relative error predicting the held-out samples ho (X,Y,T) from a spatio-temporal TV image of the training
+    samples tr with maps C (N,X,Y,T); fixed weight (relative, bspinn.prior scaling)."""
+    from .prior import _dyn_setup, _fft2c, dynamic_admm
+    k, m, Cn, Ct, mt, yt, x0, s = _dyn_setup(ksp * tr[None], C, tr, device)
+    w = float(vopt.get("val_weight", 3e-3))
+    with torch.no_grad():
+        x = dynamic_admm(yt, Ct, mt, w, 0.25 * w, int(vopt.get("val_iters", 40)), x0=x0)
+        P = _fft2c(Ct * x[:, None]) * s                                          # (T,N,X,Y)
+    hot = torch.from_numpy(np.moveaxis(ho, -1, 0)).to(P.device)                  # (T,X,Y)
+    y = torch.from_numpy(np.moveaxis(np.asarray(ksp), -1, 0).astype(np.complex64)).to(P.device)
+    num = (P - y).abs().pow(2).permute(0, 2, 3, 1)[hot].sum()
+    den = y.abs().pow(2).permute(0, 2, 3, 1)[hot].sum().clamp_min(1e-30)
+    return float(torch.sqrt(num / den))
 
 
 # ---------------------------------------------------------------------------------- helpers

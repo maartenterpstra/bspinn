@@ -160,14 +160,29 @@ class DynConfig:
                                       #   the coil-energy PCA then sees the sampling pattern, not the coils)
 
 
-def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print, static_data=None):
+def fit_dynamic(data: MultiCoilData, cfg: FitConfig, dcfg: DynConfig, log=print, static_data=None, static_fit=None):
     """Stage 1: static Biot–Savart fit, over all frames (per-frame images) or, with ``static_data`` (one
-    co-located slice, e.g. the time-averaged k-space), on that.
+    co-located slice, e.g. the time-averaged k-space), on that; or, with ``static_fit`` = (model, problem,
+    image_lowres, handedness) of an existing fit to the time average (the 2-D path of estimate_maps, v57),
+    none: that model is the base.
     Stage 2: low-rank dynamic coils, initialised at the static solution."""
     cfg.validate("dynamic")
     t0 = time.time()
     scfg = copy.deepcopy(cfg)
-    if static_data is None:
+    if static_fit is not None:
+        from .fit import Problem
+        static_model, sprob, m_lr, hand = static_fit
+        static_model = copy.deepcopy(static_model)
+        hist, extra = {}, {"handedness": hand, "image_lowres": m_lr}
+        data.prewhiten()
+        prob = Problem(data, cfg)
+        m_static = None
+        if m_lr is not None:
+            m1 = m_lr.to(cfg.device) * (sprob.scale / prob.scale)
+            m_static = m1.expand(prob.S, *m1.shape[1:]).clone()
+        log(f"dynamic: static base = the 2-D fit of the time average, temporal modes from {prob.S} frames")
+        static_data = True                         # base fixed by default (freeze_static=None)
+    elif static_data is None:
         static_model, prob, hist, extra = fit(data, scfg, log=log)
         m_static = extra["image_lowres"].to(cfg.device) if extra["image_lowres"] is not None else None
     else:
