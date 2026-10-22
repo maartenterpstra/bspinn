@@ -1509,6 +1509,28 @@ BART=bart/bart python scripts/phase_pole_eval.py --files data/ksp_2D data/ksp_2D
 ```
 (BART >= 1.0 for `--phase-pole`; inputs: BART cfl bases of one 2-D plane each, or .npy (coils, x, y).)
 
+### 8.13 Better static image priors: TGV and a soft low-resolution phase constraint (r2-image, opt-in)
+
+`sense_image(..., prior="tgv", prior_options={"phase": "lowres", "phase_weight": 0.3})`:
+* `prior="tgv"`: second-order total generalised variation (ADMM with a joint (x, v) CG step; `tgv_ratio` =
+  alpha0 / alpha1, default 2). Alone ~1 % better than TV (like TV + wavelet at ratio 0.5).
+* `phase="lowres"`: adds `phase_weight/2 ||Im(e^{-i phi} x)||^2`, phi = phase of the light-Tikhonov SENSE image
+  low-passed by a Hann window of `phase_width` (= calib) lines: a soft real-valued image (virtual conjugate
+  coils). Works with 'tv', 'tv+wavelet' and 'tgv'. Weight 0.3 (1 and 10 are worse: the phase is not that smooth).
+* Also implemented, not recommended: `pnp:bm3d` (+1 % over TGV + phase at ~20x the cost), `pnp:nlm` (worse than
+  TV), `w_map="noise"` (g-factor-weighted TV: no gain), `bregman=k` (no gain).
+
+CPU lab (cached joint-protocol PINN maps j_v33, readout-cropped 64 rows, same CV rule; `scripts/image_cv_eval.py`):
+median NRMSE over 4 cases, CV-chosen weight: R=4 TV 0.0648 -> TGV+phase 0.0619 (oracle 0.0639 -> 0.0614), R=6
+0.0848 -> 0.0750 (oracle 0.0809 -> 0.0739); worst auto/oracle 1.086 -> 1.023. Wins on 3 of 4 cases; knee15
+(noise-dominated reference) +1 % at R=4, tie at R=6. GPU check:
+
+```
+python scripts/prior_eval.py --loader dataloader_v2:get_dataloader --base-folder ... --n 20 --R 4 6 \
+    --maps pinn_api nlinv --maps-cache runs/eval_joint --methods tikhonov tv tgv tv_phase tgv_phase \
+    --oracle --device cuda --out runs/prior_eval_r2image.jsonl
+```
+
 ## 9. Code map
 
 | file | content |
