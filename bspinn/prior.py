@@ -277,14 +277,16 @@ def _tgrad_adj(z):
     return torch.roll(z, 1, 0) - z
 
 
-def dynamic_admm(y, C, m, beta_t, beta_s, iters=50, cg_iters=5, rho=0.5, lam=1e-6, x0=None):
-    """min 1/2 sum_t ||M_t F (C_t x_t) - y_t||^2 + beta_t sum |x_{t+1} - x_t| + beta_s sum_t TV(x_t), ADMM.
-    y (T,N,H,W), C (T,N,H,W) or (N,H,W) RSS-normalised maps, m (T,H,W) float masks -> x (T,H,W)."""
+def dynamic_admm(y, C, m, beta_t, beta_s, iters=50, cg_iters=5, rho=0.5, lam=1e-6, x0=None, ref=None):
+    """min 1/2 sum_t ||M_t F (C_t x_t) - y_t||^2 + beta_t sum |x_{t+1} - x_t| + beta_s sum_t TV(x_t - ref), ADMM.
+    y (T,N,H,W), C (T,N,H,W) or (N,H,W) RSS-normalised maps, m (T,H,W) float masks, ref None (spatial TV of the
+    frames) or (H,W) a reference image (v57: spatial TV of each frame's difference from it) -> x (T,H,W)."""
     # v57: everything ifftshifted once, plain FFTs inside (the centred FFT's shifts cost ~5x the transform on a
     # CPU); temporal and spatial TV are cyclic, so the solution is the same, shifted back at the end
     sh = lambda a: torch.fft.ifftshift(a, dim=(-2, -1))  # noqa: E731
     y, C, m = sh(y), sh(C), sh(m)
     x0 = None if x0 is None else sh(x0)
+    gref = 0 if ref is None else _grad(sh(ref))[None]
     mm = m[:, None]                                       # (T,1,H,W)
     r_ = rho * float(m.mean())
     F = lambda a: torch.fft.fft2(a, norm="ortho")  # noqa: E731
@@ -303,19 +305,19 @@ def dynamic_admm(y, C, m, beta_t, beta_s, iters=50, cg_iters=5, rho=0.5, lam=1e-
     x = AHy.clone() if x0 is None else x0.clone()
     zt, ut = _tgrad(x), None
     ut = torch.zeros_like(zt)
-    zs = _grad(x) if beta_s > 0 else None
+    zs = _grad(x) - gref if beta_s > 0 else None
     us = torch.zeros_like(zs) if zs is not None else None
     for _ in range(iters):
         rhs = AHy + r_ * _tgrad_adj(zt - ut)
         if zs is not None:
-            rhs = rhs + r_ * _grad_adj(zs - us)
+            rhs = rhs + r_ * _grad_adj(zs + gref - us)
         # one batch of T coupled frames: CG over all of them at once (dims 0..2 summed)
         x = _bcg(lambda v: lhs(v[0])[None], rhs[None], x[None], cg_iters)[0]
         v = _tgrad(x) + ut
         zt = v * torch.clamp(1 - (beta_t / r_) / v.abs().clamp_min(1e-12), min=0)
         ut = v - zt
         if zs is not None:
-            v = _grad(x) + us
+            v = _grad(x) - gref + us
             mag = torch.sqrt((v.abs() ** 2).sum(-3, keepdim=True)).clamp_min(1e-12)
             zs = v * torch.clamp(1 - (beta_s / r_) / mag, min=0)
             us = v - zs
@@ -346,17 +348,38 @@ DYN_SCALE = 1.0   # dynamic: the CV interior minimum sat at the oracle weight on
 
 def dynamic_prior_image(ksp, C, mask, weight="auto", spatial_ratio=0.25, device="cpu", grid=None, report=None,
                         holdout=0.1, folds=2, calib=0, seed=0, iters=50, cg_iters=5, scale=DYN_SCALE,
-                        oracle_ref=None, oracle_fn=None):
+                        oracle_ref=None, oracle_fn=None, spatial_on="image"):
     """Cine image series with temporal TV (+ spatial_ratio x the weight of spatial TV). ksp (N,H,W,T)
     acquired k-space (zeros elsewhere), C static (N,H,W) or per-frame (N,H,W,T) maps, mask (H,W,T).
     weight 'auto': k-space cross-validation with whole phase-encode lines withheld from every frame,
     ``select_weight`` rule. ``oracle_fn(x (T,H,W)) -> error`` optionally scores every grid weight (report).
+    spatial_on: 'image' (default: TV of every frame) | 'difference' (v57: TV of every frame's difference from the
+    time-averaged image, the SENSE-1 combination of the time-averaged k-space with the mean maps; README 8.13).
     Returns x (H,W,T) complex64."""
     k, m, Cn, Ct, mt, yt, x0, s = _dyn_setup(ksp, C, mask, device)
     T = k.shape[0]
     grid = np.asarray(grid if grid is not None else np.logspace(-4, 0, 9))      # dynamic optima reach ~0.1
-    solve = lambda yy, mm, b: dynamic_admm(yy, Ct, mm, b, b * spatial_ratio, iters, cg_iters, x0=x0)  # noqa: E731
-    info = {"spatial_ratio": spatial_ratio}
+    if spatial_on not in ("image", "difference"):
+        raise ValueError("spatial_on must be 'image' or 'difference'")
+    refs = {}
+
+    def ref_of(yy, mm):                       # time-averaged reference of the samples in use (CV: training lines)
+        if spatial_on == "image":
+            return None
+        key = id(mm)
+        if key not in refs:
+            refs.clear()
+            cnt = mm.sum(0)
+            ya = (yy * mm[:, None]).sum(0) / cnt.clamp_min(1)[None]
+            Cm = Ct if Ct.ndim == 3 else Ct.mean(0)
+            ma = (cnt > 0).float()
+            AHA = lambda v: (Cm.conj() * _ifft2c(ma * _fft2c(Cm * v))).sum(0) + 1e-3 * v  # noqa: E731
+            b = (Cm.conj() * _ifft2c(ma * ya)).sum(0)
+            refs[key] = _bcg(lambda v: AHA(v[0])[None], b[None], torch.zeros_like(b)[None], 30)[0]
+        return refs[key]
+    solve = lambda yy, mm, b: dynamic_admm(yy, Ct, mm, b, b * spatial_ratio, iters, cg_iters, x0=x0,  # noqa: E731
+                                           ref=ref_of(yy, mm))
+    info = {"spatial_ratio": spatial_ratio, "spatial_on": spatial_on}
     if isinstance(weight, str):
         err = np.zeros(len(grid))
         rng_seed = seed
