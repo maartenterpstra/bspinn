@@ -26,7 +26,10 @@ sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, HERE)
 PRIOR_METHODS = {"tv": "tv", "wavelet": "wavelet", "tvw": "tv+wavelet",
                  # r2-image opt-ins (bspinn.prior): TGV^2, the soft low-resolution phase constraint, both
                  "tgv": "tgv", "tv_phase": ("tv", {"phase": "lowres", "phase_weight": 0.3}),
-                 "tgv_phase": ("tgv", {"phase": "lowres", "phase_weight": 0.3})}
+                 "tgv_phase": ("tgv", {"phase": "lowres", "phase_weight": 0.3}),
+                 # v58: the phase constraint switched on or off per slice by the cross-validation
+                 "tv_phase_auto": ("tv", {"phase": "auto", "phase_weight": 0.3}),
+                 "tgv_phase_auto": ("tgv", {"phase": "auto", "phase_weight": 0.3})}
 
 
 def main():
@@ -142,6 +145,10 @@ def main():
                                         ratio=a.ratio, scale=AUTO_SCALE if a.scale is None else a.scale, **kw, **pkw)
                         extra = {"weight": rep["weight"], "weight_grid": rep["weight_grid"], "cv_error": rep["cv_error"], "rule": rep.get("rule"),
                                  "at_grid_edge": rep["at_grid_edge"], "seconds": time.time() - t0}
+                        if pkw.get("phase") == "auto":    # the oracle scan uses the option the CV chose
+                            extra["phase_choice"] = rep["phase_choice"]
+                            pkw = dict(pkw, phase="lowres") if rep["phase_choice"] == "lowres" else \
+                                {k: v for k, v in pkw.items() if k not in ("phase", "phase_weight")}
                         if a.oracle:          # every grid weight against the reference
                             _, _, Ct, mt, yt, x0, s = _setup(fit.ksp, Cn, fit.sampled, a.device)
                             okw = resolve_options(pkw, Ct, mt, x0, 24)

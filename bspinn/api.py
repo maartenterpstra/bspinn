@@ -270,7 +270,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         if image_prior in PRIORS and layout == "2d" and "joint_prior" not in cfg_overrides:
             # the prior inside the joint fit as well: the maps are refined against the prior image (v48)
             cfg.joint_prior, cfg.joint_prior_weight = image_prior, image_prior_weight
-            cfg.joint_prior_options = dict(image_prior_options or {})
+            cfg.joint_prior_options = {k: v for k, v in (image_prior_options or {}).items()      # r2 image-only options
+                                       if k not in ("phase", "phase_weight", "phase_width", "w_map", "w_power",
+                                                    "tgv_ratio", "bregman")}
         if "lambda_joint_img" not in cfg_overrides and (not isinstance(sense_lambda, str) or layout == "2d"):
             cfg.lambda_joint_img = sense_lambda              # one image-regularisation knob for both image paths
             cfg._lam_options = sense_lambda_options          # 2-D 'auto': chosen inside the joint stage

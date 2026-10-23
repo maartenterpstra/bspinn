@@ -1855,3 +1855,21 @@ def test_irgnm_refine_reduces_smooth_map_error():
     C2, _, info2 = irgnm_refine(k * m[None], C0, m, holdout=0.1, max_steps=6)
     assert 0 <= info2["steps"] <= 6 and len(info2["heldout_err"]) == 7
     assert err(C2) <= err(C0) + 1e-6
+
+
+def test_image_prior_phase_auto():
+    """v58: prior_options phase='auto' cross-validates with and without the low-resolution phase constraint and
+    reports the choice; the image equals the one of the chosen option."""
+    from bspinn.api import sense_image
+    from bspinn.data import make_synthetic
+    from bspinn.masks import cartesian_mask
+    d, C, _ = make_synthetic(4, (32, 32), noise=0.01, seed=0)
+    k, Cm = np.asarray(d.kspace)[0], C[0]
+    m = cartesian_mask((32, 32), R=2, acs=8, pattern="uniform")
+    rep = {}
+    x = sense_image(k * m[None], Cm, "2d", mask=m, prior="tv", prior_options={"phase": "auto", "phase_weight": 0.3},
+                    report=rep)
+    assert rep["phase_choice"] in ("lowres", "off") and set(rep["phase_cv"]) == {"lowres", "off"}
+    po = {"phase": "lowres", "phase_weight": 0.3} if rep["phase_choice"] == "lowres" else {}
+    y = sense_image(k * m[None], Cm, "2d", mask=m, prior="tv", prior_options=po, prior_weight=rep["weight"])
+    assert np.allclose(x, y, atol=1e-5 * np.abs(y).max())

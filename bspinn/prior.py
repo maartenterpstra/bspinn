@@ -492,7 +492,28 @@ def prior_image(ksp, C, mask, prior="tv", weight="auto", device="cpu", report=No
                 scale=AUTO_SCALE, **kw):
     """Image with a sparsity prior; ``weight`` a number (relative) or 'auto' (k-space cross-validation and
     ``select_weight``; ``scale`` multiplies a CV-selected interior minimum). kw: ratio, iters, cg_iters, rho,
-    lam, levels, wave (see admm). ``cv_options``: holdout, folds, calib, seed, fallback, flat, refine."""
+    lam, levels, wave (see admm). ``cv_options``: holdout, folds, calib, seed, fallback, flat, refine.
+    ``phase='auto'`` (v58): cross-validate with and without the soft low-resolution phase constraint
+    (phase='lowres') and keep the one with the lower held-out error (README 8.13: the phase term gains 5-8 % on
+    most slices but cost up to 27 % on slices whose phase is not smooth; the CV picks correctly in 16-17 of 20)."""
+    if kw.get("phase") == "auto":
+        opts = {}
+        for name, kk in (("lowres", dict(kw, phase="lowres")),
+                         ("off", {k: v for k, v in kw.items() if k not in ("phase", "phase_weight", "phase_width")})):
+            g = grid if isinstance(weight, str) else None
+            w_i, info_i = choose_weight(ksp, C, mask, prior, grid=g, device=device, scale=scale,
+                                        **(cv_options or {}), **kk)
+            opts[name] = (min(info_i["cv_error"]), w_i, info_i, kk)
+        pick = min(opts, key=lambda n: opts[n][0])
+        _, w_p, info_p, kw = opts[pick]
+        if isinstance(weight, str):
+            weight = w_p
+            if report is not None:
+                report.update(info_p, method="cv")
+        elif report is not None:
+            report.update(method="manual", weight=float(weight))
+        if report is not None:
+            report.update(phase_choice=pick, phase_cv={n: float(o[0]) for n, o in opts.items()})
     if isinstance(weight, str):
         weight, info = choose_weight(ksp, C, mask, prior, grid=grid, device=device, scale=scale,
                                      **(cv_options or {}), **kw)
