@@ -1531,6 +1531,20 @@ python scripts/prior_eval.py --loader dataloader_v2:get_dataloader --base-folder
     --oracle --device cuda --out runs/prior_eval_r2image.jsonl
 ```
 
+**GPU confirmation (20 dataloader slices, joint protocol, maps of runs/eval_v56; median NRMSE, wins over TV,
+worst slice / TV).** The phase term alone is unreliable per slice (up to +27 %: slices whose phase is not smooth),
+so v58 adds `phase="auto"`: cross-validation with and without it, per slice (16-17 of 20 picks right).
+
+| R, maps | TV | TGV | TGV + phase | **TGV + phase 'auto'** |
+|---|---|---|---|---|
+| 4, PINN v54 | 0.0759 | 0.0753 (19/20, x1.03) | 0.0721 (12/20, x1.27) | **0.0721 (18/20, x1.03)** |
+| 4, NLINV | 0.0754 | 0.0746 (19/20) | 0.0717 (13/20, x1.20) | **0.0717 (18/20, x1.03)** |
+| 6, PINN v54 | 0.0964 | 0.0950 (15/20) | 0.0933 (15/20, x1.25) | **0.0884 (18/20, x1.02)** |
+| 6, NLINV | 0.0953 | 0.0942 (11/20) | 0.0892 (14/20, x1.13) | **0.0886 (15/20, x1.02)** |
+
+Cost on the GPU: 18 s per slice vs 6.5 s for TV (two CV passes). Recommended final image:
+`sense_image(ksp, maps, "2d", mask=mask, prior="tgv", prior_options={"phase": "auto", "phase_weight": 0.3})`.
+
 ### 8.14 Dynamic layout on the 2-D base, safe per-frame corrections, and a reference-difference cine prior (v57)
 
 **Dynamic layout = the 2-D fit of the time average (`dynamic_base='2d'`, new default).** `estimate_maps(..., 'dynamic')`
@@ -1575,6 +1589,17 @@ locally low rank 0.0908, global low rank 0.0907, L+S 0.0948, spatial/temporal ra
 / 0.0908 / 0.0924 (0.25: 0.0902). Also: `dynamic_admm` uses unshifted FFTs internally (same result, ~3x faster on a
 CPU).
 
+**v58 readout-axis fix and GPU check (9 OCMR cines, R = 4 / 8).** The time average covers every phase-encode
+line, so its mask no longer showed the readout axis and the dynamic path's fold-over search also ran along the
+readout (`pinn_avg` passes `readout_axis=0`). `readout_axis_from_mask` now reads it from the per-frame sampling
+(partial echo allowed; also used in 2-D). After the fix `pinn_dyn0` = `pinn_avg` within 1 % on 7 of 9 cines (before:
+fs_0004 R4 0.1303 vs 0.1155) and on the prospective cines (us_0003 held-out 3.49 -> 1.09 vs 1.05). The remaining
+differences are run-to-run spread on two 3 T cines (GPU fits are otherwise deterministic): fs_0016 R4 0.0397 /
+0.0442 (seeds 0 / 1), fs_0021 R4 0.0683 / 0.0498 / 0.0433 (dyn0), against NLINV 0.0343 / 0.0225; the other 7 cines
+change < 0.5 % with the seed. `scripts/ocmr_pinn_diag.py` logs the decisions of several seeds on such a case.
+Reference-difference prior on the GPU (`--spatial-on difference`): frame NRMSE lower on 15 of 15 cine/R pairs
+(median -4 % at R = 4, -6.5 % at R = 8), `dyn_nrmse` mixed (median +-2 %, up to +19 % on fs_0016).
+
 ### 8.15 IRGNM refinement of the PINN maps (`refine='irgnm'`, opt-in)
 
 `estimate_maps(..., refine='irgnm', refine_options={'holdout': 0, 'steps': 8})` (bspinn/irgnm.py): after the PINN
@@ -1601,6 +1626,13 @@ An ensemble of PINN and NLINV projectors landed in between (rejected).
 ```
 bash bspinn/scripts/run_r2.sh      # all round-2 confirmations (image priors, IRGNM, cine, phase-pole planes)
 ```
+
+GPU check (20 dataloader slices, R = 4, maps of runs/eval_v56, median): calibration residual 1.81 -> 1.49 (8 steps)
+/ 1.42 (`x_ref='zero'`, 12 steps), SENSE 0.0796 -> 0.0786 (15 / 12 of 20 better), TV 0.0771 -> 0.0772: on these
+slices the calibration gap is small and the image does not change. Brain phase-pole planes (3 planes x ACS 3 / 7 / 15,
+mean SENSE NRMSE / lco): `x_ref='zero'`, 12 steps is the best map set at every size: ACS 3 0.201 -> 0.181 (NLINV
+corrected 0.160), ACS 7 0.100 -> 0.091 (0.108), ACS 15 0.084 -> 0.083 (0.089). Recommended when refining:
+`refine="irgnm", refine_options={"holdout": 0, "steps": 12, "x_ref": "zero"}`.
 
 ## 9. Code map
 
