@@ -640,6 +640,40 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
 
 
 # ---------------------------------------------------------------------------------- dynamic from the 2-D fit (v57)
+def readout_axis_from_mask(m):
+    """Readout axis (0 or 1) of a Cartesian mask (X,Y) or (X,Y,T), or None. Axis a is the readout if every frame
+    is separable, mask = (readout profile along a) x (acquired lines), with one contiguous profile shared by all
+    frames (partial echo allowed), while the acquired lines have gaps or change from frame to frame. Exactly one
+    axis must qualify."""
+    m = np.asarray(m, bool)
+    m = m[..., None] if m.ndim == 2 else m
+
+    def contiguous(v):
+        idx = np.flatnonzero(v)
+        return idx.size > 0 and idx[-1] - idx[0] + 1 == idx.size
+
+    cand = []
+    for a in (0, 1):
+        pe = 1 - a
+        profs, lines_all, ok = [], [], True
+        for t in range(m.shape[-1]):
+            mt = m[..., t]
+            prof, lines = mt.any(axis=pe), mt.any(axis=a)
+            if not lines.any():
+                continue
+            outer = prof[:, None] & lines[None, :] if a == 0 else lines[:, None] & prof[None, :]
+            if not np.array_equal(mt, outer):
+                ok = False; break
+            profs.append(prof); lines_all.append(lines)
+        if not ok or not profs:
+            continue
+        same_prof = all(np.array_equal(p, profs[0]) for p in profs) and contiguous(profs[0])
+        lines_vary = any(not contiguous(l) for l in lines_all) or any(not np.array_equal(l, lines_all[0]) for l in lines_all)
+        if same_prof and lines_vary:
+            cand.append(a)
+    return cand[0] if len(cand) == 1 else None
+
+
 def _time_average(ksp, m_all):
     N, X, Y, T = ksp.shape
     cnt = m_all.sum(-1)
@@ -665,6 +699,13 @@ def _dynamic_via_2d(ksp, mask, *, rank, iters_dynamic, dynamic_options, validate
     N, X, Y, T = ksp.shape
     m_all = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
     kav, mavg = _time_average(ksp, m_all)
+    if kw2d.get("readout_axis", "auto") == "auto":
+        # v58: the time average usually covers every phase-encode line, so its mask no longer shows the readout
+        # axis (the fold-over search then also ran along the readout; pinn_dyn0 != pinn_avg on OCMR); the frames do
+        ra = readout_axis_from_mask(m_all)
+        if ra is not None:
+            kw2d = dict(kw2d, readout_axis=ra)
+            log(f"dynamic: readout axis {ra} (from the per-frame sampling)")
     internal = {}
     log(f"dynamic: maps of the time-averaged k-space by the 2-D path ({T} frames, {int(mavg.any(0).sum())} lines)")
     out = estimate_maps(kav, "2d", mask=mavg, return_image=False, _internal=internal, **kw2d)
@@ -928,8 +969,10 @@ def _fold_correct(C, fold_maps, ksp, mask, calib, log, ridge=1e-3, min_gain=0.3,
     if readout_axis in (0, 1):
         ro = [int(readout_axis)]
     else:
-        ro = [a for a in (0, 1) if mask is not None and m.any() and bool((m == m.any(axis=a, keepdims=True)).all())
-              and not m.all()]
+        ra = readout_axis_from_mask(m) if mask is not None and m.any() else None      # v58: partial echo allowed
+        ro = [ra] if ra is not None else \
+            [a for a in (0, 1) if mask is not None and m.any() and bool((m == m.any(axis=a, keepdims=True)).all())
+             and not m.all()]
         if not ro and not m.all():
             log("fold-over search on both image axes: the mask does not show the readout axis "
                 "(pass readout_axis= to exclude it)")

@@ -1873,3 +1873,16 @@ def test_image_prior_phase_auto():
     po = {"phase": "lowres", "phase_weight": 0.3} if rep["phase_choice"] == "lowres" else {}
     y = sense_image(k * m[None], Cm, "2d", mask=m, prior="tv", prior_options=po, prior_weight=rep["weight"])
     assert np.allclose(x, y, atol=1e-5 * np.abs(y).max())
+
+
+def test_readout_axis_from_mask():
+    """v58: the readout axis from per-frame Cartesian sampling (partial echo allowed); None when the mask cannot tell
+    (fully sampled, e.g. a time average that covers every line, or non-Cartesian)."""
+    from bspinn.api import readout_axis_from_mask
+    from bspinn.masks import gro_mask
+    m = gro_mask((64, 48), 8, 4, pe_axis=1)
+    assert readout_axis_from_mask(m) == 0 and readout_axis_from_mask(np.swapaxes(m, 0, 1)) == 1
+    pe = m.copy(); pe[:10] = False
+    assert readout_axis_from_mask(pe) == 0
+    assert readout_axis_from_mask(m.sum(-1) > 0) is None
+    assert readout_axis_from_mask(np.random.default_rng(0).random((32, 32, 3)) < 0.3) is None
