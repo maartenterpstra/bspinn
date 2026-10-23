@@ -389,12 +389,13 @@ class Problem:
             if self.data_term == "varpro" and not fully:
                 raise ValueError("varpro needs a fully sampled Cartesian calibration region")
         self.normal_axis = geom.normal_axis()
+        self.normal_vec = torch.tensor(geom.axis_vec(2), dtype=torch.float32)       # oblique slices: exact normal
         self.Inorm_slice = (self.I.abs() ** 2).sum((1, 2, 3))           # (S,)
         self.ynorm_slice = self.yk.abs().pow(2).reshape(S, -1).sum(1)
         # displacement of one FOV along the folding axis (normalised physical coordinates)
         ax_img = 0 if cfg.fold_axis == "row" else 1
         fov = geom.shape[ax_img] * geom.pixel_spacing[ax_img] / geom.half_fov
-        self.fold_vec = torch.zeros(3); self.fold_vec[PLANES[geom.plane][ax_img]] = fov
+        self.fold_vec = torch.tensor(geom.axis_vec(ax_img) * fov, dtype=torch.float32)
         self.device = torch.device("cpu")
 
     # ---------------------------------------------------------------- support / noise
@@ -480,7 +481,9 @@ class Problem:
         idx = torch.randint(0, self.support_pts.shape[0], (n,), generator=gen, device=dev)
         p = self.support_pts[idx].clone()
         jit = 0.02 * torch.randn(p.shape, generator=gen, device=dev)
-        jit[:, self.normal_axis] = (2 * torch.rand(n, generator=gen, device=dev) - 1) * self.cfg.slab
+        nv = self.normal_vec.to(dev)
+        jit = jit - (jit @ nv)[:, None] * nv[None] \
+            + ((2 * torch.rand(n, generator=gen, device=dev) - 1) * self.cfg.slab)[:, None] * nv[None]
         return p + jit
 
     def data_loss(self, Cs, m=None, sl=None, return_images=False):
@@ -1281,7 +1284,9 @@ def air_points(prob, n, gen, wires, min_dist):
     p = p + 0.5 * step * torch.randn(p.shape, generator=gen, device=dev)
     na = getattr(prob, "normal_axis", None)
     if na is not None and prob.__class__.__name__ == "Problem":
-        p[:, na] = (2 * torch.rand(p.shape[0], generator=gen, device=dev) - 1) * prob.cfg.slab
+        nv = prob.normal_vec.to(dev)
+        p = p - (p @ nv)[:, None] * nv[None] \
+            + ((2 * torch.rand(p.shape[0], generator=gen, device=dev) - 1) * prob.cfg.slab)[:, None] * nv[None]
     with torch.no_grad():
         keep = prob.keep.distance(p) > 0
         if wires:

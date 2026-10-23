@@ -226,7 +226,7 @@ def baselines(val_items, a):
         ext = acquired_extent(np.asarray(s["sampled"], bool))
         rss, obj = _val_reference(s)
         ku = k * m[None]
-        out["tikhonov"].append(metrics(Z.band_limit(sense_image(ku, C, "2d", mask=m, lam="auto", device=a.device), ext), rss, obj))
+        out["tikhonov"].append(metrics(Z.band_limit(sense_image(ku, C, "2d", mask=m, lam="auto", device=a.device, prior=None), ext), rss, obj))
         out["tv"].append(metrics(Z.band_limit(sense_image(ku, C, "2d", mask=m, prior="tv", device=a.device), ext), rss, obj))
     return {meth: {kk: float(np.median([o[kk] for o in v])) for kk in v[0]} for meth, v in out.items() if v}
 
@@ -389,7 +389,7 @@ def evaluate(a):
                     recs.append({"case": fit.name, "R": R, "maps": mname, "method": method, **q, **(extra or {})})
                     print(f"{fit.name} {mname:10s} {method:9s} NRMSE {q['nrmse']:.4f}  SSIM {q['ssim']:.4f}  PSNR {q['psnr']:.2f}", flush=True)
 
-                record("cg_auto", sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device))
+                record("cg_auto", sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device, prior=None))
                 sl = Z.Slice(fit.ksp, Cn, fit.sampled, a.device)
                 net = Z.make_net(a, a.device); net.load_state_dict(state)
                 t0 = time.time()

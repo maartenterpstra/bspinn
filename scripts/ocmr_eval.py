@@ -110,8 +110,8 @@ def main():
     ap.add_argument("--dyn-set", nargs="*", default=[], help="pinn_dyn: bspinn.dynamic.DynConfig fields key=value "
                     "(e.g. lambda_corr=0.01 freeze_static=False alpha_init=data)")
     ap.add_argument("--pinn-set", nargs="*", default=[], help="extra estimate_maps / FitConfig options key=value")
-    ap.add_argument("--plane", default="auto")
-    ap.add_argument("--spatial-on", default="image", choices=["image", "difference"],
+    ap.add_argument("--plane", default="header", help="B0 plane for the PINN: 'header' (v59 default: the B0 direction of the ISMRMRD slice orientation; oblique cardiac views), 'auto' (search) or a named plane")
+    ap.add_argument("--spatial-on", default="difference", choices=["image", "difference"],
                     help="tv: spatial TV of the frames or of their difference from the time average (v57)")
     ap.add_argument("--spatial-ratio", type=float, default=0.25, help="tv: spatial / temporal TV weight")
     ap.add_argument("--tv-iters", type=int, default=50)
@@ -187,7 +187,7 @@ def main():
                         else:
                             case = EvalCase(tag, kavg, mavg, (cal, cal), pixel_spacing=sp, pe_axis=1, joint=True)
                             common = dict(calib=cal, spacing=sp, device=a.device, quality=a.quality, verbose=False,
-                                          plane=a.plane, **pset)
+                                          plane=(info.get('b0_dir') or 'auto') if a.plane == 'header' else a.plane, **pset)
                             if mname == "espirit":
                                 import dataclasses
                                 C = bm.espirit(dataclasses.replace(case, joint=False))
@@ -233,9 +233,9 @@ def main():
                         elif rc == "sense":
                             rep = {}
                             tm = T // 2
-                            sense_image(ku[..., tm], Ct(tm), "2d", mask=m[..., tm], lam="auto", device=a.device, report=rep)
+                            sense_image(ku[..., tm], Ct(tm), "2d", mask=m[..., tm], lam="auto", device=a.device, report=rep, prior=None)
                             lam = rep.get("value") or 1e-2
-                            x = np.stack([sense_image(ku[..., t], Ct(t), "2d", mask=m[..., t], lam=lam, device=a.device)
+                            x = np.stack([sense_image(ku[..., t], Ct(t), "2d", mask=m[..., t], lam=lam, device=a.device, prior=None)
                                           for t in range(T)], -1)
                             extra["lambda"] = float(lam)
                         elif rc == "tv":

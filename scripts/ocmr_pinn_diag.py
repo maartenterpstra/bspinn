@@ -60,6 +60,7 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--calib", type=int, default=24)
+    ap.add_argument("--plane", default="header", help="'header' (B0 from the slice orientation), 'auto' or a named plane")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
@@ -86,8 +87,9 @@ def main():
                     t0 = time.time()
                     print(f"\n######## {name} R={a.R:g} seed {seed}", flush=True)
                     C, inf = estimate_maps(kavg * mavg[None], "2d", mask=mavg, readout_axis=ro, calib=cal, spacing=sp,
-                                           device=a.device, seed=seed, verbose=True)
-                    row = {"file": name, "R": a.R, "maps": f"pinn_seed{seed}", "seconds": time.time() - t0,
+                                           device=a.device, seed=seed, verbose=True,
+                                           plane=(info.get("b0_dir") or "auto") if a.plane == "header" else a.plane)
+                    row = {"file": name, "R": a.R, "maps": f"pinn_{a.plane}_seed{seed}", "seconds": time.time() - t0,
                            **scores(C, I, obj), "info": pick(inf)}
                     print("##", json.dumps({k_: v for k_, v in row.items() if k_ != "info"}), flush=True)
                     with open(a.out, "a") as fh:

@@ -194,7 +194,7 @@ def main():
                 nps = len(gauge_poles(C, obj))
                 lo = refree.leave_coil_out(C, full, obj)["object"]["residual_over_noise_floor"]
                 ln = refree.leave_coil_out(C, full, near)["object"]["residual_over_noise_floor"] if near.any() else float("nan")
-                x = sense_image(ku, C, "2d", mask=m, lam="auto", device=a.device)
+                x = sense_image(ku, C, "2d", mask=m, lam="auto", device=a.device, prior=None)
                 q = series_metrics(x[..., None], ref[..., None], obj)["nrmse"]
                 qn = series_metrics(x[..., None], ref[..., None], near)["nrmse"] if near.any() else float("nan")
                 r = {"file": fname, "cal": cal, "maps": name, "gauge_poles": nps, "lco_object": lo, "lco_near": ln,

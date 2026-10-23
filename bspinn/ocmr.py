@@ -47,6 +47,7 @@ def read_ocmr(path):
         y_off = 0 if ky_c is None else eN[1] // 2 - int(ky_c)
         z_off = 0 if (kz_c is None or eN[2] <= 1) else eN[2] // 2 - int(kz_c)
         noise = []
+        dirs = None
         for i in range(dset.number_of_acquisitions()):
             acq = dset.read_acquisition(i)
             if acq.is_flag_set(ismrmrd.ACQ_IS_NOISE_MEASUREMENT):
@@ -54,6 +55,8 @@ def read_ocmr(path):
                 continue
             d = np.asarray(acq.data)                               # (coils, samples)
             ix = acq.idx
+            if dirs is None:                                       # slice orientation (patient frame, z = B0)
+                dirs = np.array([acq.read_dir, acq.phase_dir, acq.slice_dir], np.float64)
             ns = d.shape[1]
             x0 = eN[0] // 2 - int(acq.center_sample)               # asymmetric echo: zeros before
             x0 = min(max(x0, 0), eN[0] - ns)
@@ -62,7 +65,7 @@ def read_ocmr(path):
                 continue
             k[x0:x0 + ns, ky, kz, :, ix.phase, ix.set, ix.slice, ix.repetition, ix.average] += d.T
         info = {"enc_matrix": eN, "recon_matrix": rN, "fov_mm": fov, "recon_fov_mm": rfov, "n_coils": n_coil,
-                "field_T": getattr(hdr.acquisitionSystemInformation, "systemFieldStrength_T", None)}
+                "field_T": getattr(hdr.acquisitionSystemInformation, "systemFieldStrength_T", None), "dirs": dirs}
     finally:
         dset.close()
     return {"kspace": k, "noise": np.concatenate(noise, 0) if noise else None, **info}
@@ -85,7 +88,8 @@ def _remove_oversampling(k, n_recon):
 def cine_slices(path, slices="all", set_=0, rep=0):
     """Yields (slice index, k (coils, x, y, frames) complex64, info) with info: noise (n, coils) or None,
     pixel_spacing_mm (x, y), field_T, file, kx_range (first, last acquired readout index after the oversampling
-    removal). x = readout (oversampling removed), y = phase encoding."""
+    removal), b0_dir (B0 in image coordinates (x, y, normal), from the header; estimate_maps(plane=b0_dir)).
+    x = readout (oversampling removed), y = phase encoding."""
     d = read_ocmr(path)
     k = d["kspace"]                                                # (kx, ky, kz, coil, phase, set, slice, rep, avg)
     ns = k.shape[6]
@@ -95,6 +99,10 @@ def cine_slices(path, slices="all", set_=0, rep=0):
     # acquired readout range on the decimated grid (raw index i <-> i * rx / nx): an asymmetric echo leaves the
     # start empty; after the image-domain crop that region only holds leakage
     kx_range = (int(np.ceil(nz[0] * rx / k.shape[0])), int(np.floor(nz[-1] * rx / k.shape[0]))) if nz.size else (0, rx - 1)
+    # B0 (patient z) in image coordinates: z components of the read (rows), phase (columns), slice (normal) directions
+    b0_dir = None if d.get("dirs") is None else tuple(float(v) for v in np.asarray(d["dirs"])[:, 2])
+    if b0_dir is not None and np.linalg.norm(b0_dir) < 1e-3:       # no orientation in the header (synthetic files)
+        b0_dir = None
     for s in sel:
         ks = k[:, :, 0, :, :, set_, s, rep, :].sum(-1)            # (kx, ky, coil, frames), averages summed
         ks = np.transpose(ks, (2, 0, 1, 3))                        # (coil, kx, ky, frames)
@@ -102,4 +110,5 @@ def cine_slices(path, slices="all", set_=0, rep=0):
         fov_x = d["recon_fov_mm"][0] or d["fov_mm"][0] / 2
         sp = (fov_x / ks.shape[1], d["fov_mm"][1] / ks.shape[2])
         yield s, ks.astype(np.complex64), {"noise": d["noise"], "pixel_spacing_mm": sp, "field_T": d["field_T"],
-                                           "file": str(path), "n_slices": ns, "kx_range": kx_range}
+                                           "file": str(path), "n_slices": ns, "kx_range": kx_range,
+                                           "b0_dir": b0_dir}

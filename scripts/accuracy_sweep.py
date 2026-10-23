@@ -201,7 +201,7 @@ def main():
                                         iters_auto=ia, iters_wires=iw, iters_pinn=ip, compile=a.compile)
                 sec = time.time() - t
                 ref_img = (C.conj() * ifft(k, ax)).sum(0) / np.maximum((np.abs(C) ** 2).sum(0), 1e-12)
-                x = sense_image(k * und[None], C, a.layout, mask=und, device=a.device)
+                x = sense_image(k * und[None], C, a.layout, mask=und, device=a.device, prior=None)
                 nr = float(np.linalg.norm((x - ref_img)[obj]) / np.linalg.norm(ref_img[obj]))
                 r = {"budget": b, "seed": seed, "seconds": sec, "phase_seconds": info.get("timings"),
                      "data_loss": float(info["data_loss"]) if info.get("data_loss") is not None else None,

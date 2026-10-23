@@ -490,7 +490,7 @@ def test_api_image_conventions():
                                  iters_auto=20, iters_wires=60, iters_pinn=60)
     x = _cfft(k, (1, 2), True)
     assert img.shape == (32, 32) and np.isfinite(img).all()
-    assert np.abs(sense_image(k, C, "2d") - (C.conj() * x).sum(0) / (np.abs(C) ** 2).sum(0)).max() < 1e-3 * np.abs(img).max()
+    assert np.abs(sense_image(k, C, "2d", prior=None) - (C.conj() * x).sum(0) / (np.abs(C) ** 2).sum(0)).max() < 1e-3 * np.abs(img).max()
     acs = np.zeros((32, 32), bool); acs[10:22, 10:22] = True
     n = d.noise.reshape(-1, 4)
     L = np.linalg.inv(np.linalg.cholesky(n.conj().T @ n / n.shape[0]))
@@ -588,13 +588,13 @@ def test_sense_image_does_not_extrapolate_beyond_acquired_kspace():
     d, G, obj = make_synthetic(6, (48, 48), noise=0.01)
     k = d.kspace[0].copy(); k[:, :, :4] = 0; k[:, :, -3:] = 0          # zero-padded PE edges
     C = G.reshape(k.shape)
-    assert np.allclose(sense_image(k, C), coil_combine(k, C), atol=1e-5)  # fully sampled inside the extent
+    assert np.allclose(sense_image(k, C, prior=None), coil_combine(k, C), atol=1e-5)  # fully sampled inside the extent
     ku = k.copy(); ku[:, :, 5:43:2] = 0; ku[:, :, 20:28] = k[:, :, 20:28]  # R=2 inside the extent (+ ACS)
-    x = sense_image(ku, C)
+    x = sense_image(ku, C, prior=None)
     box = acquired_extent(np.abs(ku).sum(0) > 0)
     K = np.abs(_cfft(x, (0, 1))) ** 2
     assert K[~box].sum() < 1e-10 * K.sum()
-    Ko = np.abs(_cfft(sense_image(ku, C, extrapolate=True), (0, 1))) ** 2
+    Ko = np.abs(_cfft(sense_image(ku, C, extrapolate=True, prior=None), (0, 1))) ** 2
     assert Ko[~box].sum() > 1e-4 * Ko.sum()                                  # the old behaviour did fill them
 
 
@@ -662,7 +662,8 @@ def test_solve_image_joint_full_resolution():
     from bspinn.fit import upsample_maps
     d, _, _ = make_synthetic(4, (32, 40), noise=0.005)
     k = d.kspace[0].copy(); k[:, :, :3] = 0; k[:, :, -3:] = 0          # zero-padded PE edges
-    few = dict(plane="axial", calib=12, iters_auto=5, iters_wires=20, iters_pinn=20, iters_joint=10, verbose=False)
+    few = dict(plane="axial", calib=12, iters_auto=5, iters_wires=20, iters_pinn=20, iters_joint=10, verbose=False,
+               refine=None, image_prior=None)                # the joint Tikhonov path itself (v59 defaults off)
     C, x, info = estimate_maps(k, "2d", solve_image=True, sense_lambda=1e-2, undersample=dict(R=2, pattern="uniform"), **few)
     assert info["image_solved_jointly"] and x.shape == (32, 40) and np.isfinite(x).all()
     m = info["mask"]; ku = k * m[None]
@@ -845,7 +846,7 @@ def test_fold_over_detected_and_corrected():
     ref = np.sqrt((np.abs(Iw) ** 2).sum(0))
     err = {}
     for fold in ("auto", False):
-        C, img, info = estimate_maps(k * m[None], "2d", calib=16, mask=m, verbose=False, return_image=True,
+        C, img, info = estimate_maps(k * m[None], "2d", calib=16, mask=m, verbose=False, return_image=True, refine=None, image_prior=None,
                                      fold=fold, sense_lambda=1e-2, iters_auto=40, iters_wires=150, iters_pinn=150)
         a = np.abs(img); s = (a * ref).sum() / (a ** 2).sum()
         err[fold] = np.linalg.norm(s * a - ref) / np.linalg.norm(ref)
@@ -1136,7 +1137,7 @@ def test_auto_sense_lambda_grows_with_noise():
         _, info = choose_sense_lambda(k, Cn, m, method="gcv", iters=25, probes=2)
         lam[s] = info
         rep = {}
-        x = sense_image(k, Cn, "2d", mask=m, lam="auto-map", iters=25, report=rep)
+        x = sense_image(k, Cn, "2d", mask=m, lam="auto-map", iters=25, report=rep, prior=None)
         assert np.isfinite(x).all() and rep["method"] == "map" and rep["value"] > 0
     assert lam[0.05]["lam_map"] > 2 * lam[0.002]["lam_map"]      # (sharp phantom edges leak into the noise estimate)
     assert lam[0.05]["lam_gcv"] > lam[0.002]["lam_gcv"]
@@ -1145,7 +1146,7 @@ def test_auto_sense_lambda_grows_with_noise():
     la, ia = choose_sense_lambda(k, Cn, m, method="cv+map", calib=16, iters=25)    # = 'auto'
     assert la == max(ia["lam_cv"], ia["lam_map"])
     rep = {}
-    sense_image(k, Cn, "2d", mask=m, lam=3e-2, iters=10, report=rep)
+    sense_image(k, Cn, "2d", mask=m, lam=3e-2, iters=10, report=rep, prior=None)
     assert rep == {"method": "manual", "value": 3e-2}
 
 
@@ -1161,7 +1162,7 @@ def test_true_joint_fit_options():
     k = d.kspace[0] * m[None]
     Gn = C[0] / np.sqrt((np.abs(C[0]) ** 2).sum(0, keepdims=True))
     for ov in (dict(joint_start="wires"), dict(joint_image="gradient"), dict(joint_start="wires", joint_image="gradient")):
-        Cm, img, info = estimate_maps(k, "2d", calib=16, mask=m, plane="axial", verbose=False, iters_auto=20,
+        Cm, img, info = estimate_maps(k, "2d", calib=16, mask=m, plane="axial", verbose=False, refine=None, image_prior=None, iters_auto=20,
                                       iters_wires=100, iters_pinn=100, iters_joint=20, solve_image=True, fold=False,
                                       threads=1, **ov)
         Cn = Cm / np.sqrt((np.abs(Cm) ** 2).sum(0, keepdims=True))
@@ -1286,7 +1287,7 @@ def test_image_priors():
     m = cartesian_mask((H, W), R=4, acs=16, pattern="vd", seed=1)
     ku = (k * m[None]).astype(np.complex64)
     err = lambda v: np.linalg.norm(np.abs(v) * (np.abs(v) * obj).sum() / max((np.abs(v) ** 2 * (obj > 0)).sum(), 1e-12) * (obj > 0) - obj) / np.linalg.norm(obj)  # noqa: E731
-    x_t = sense_image(ku, C, "2d", mask=m, lam="auto", lam_options={"calib": 16})
+    x_t = sense_image(ku, C, "2d", mask=m, lam="auto", lam_options={"calib": 16}, prior=None)
     rep = {}
     x_tv = sense_image(ku, C, "2d", mask=m, prior="tv", prior_options={"cv_options": {"calib": 16}, "iters": 40},
                        report=rep)
@@ -1357,7 +1358,7 @@ def test_estimate_maps_image_prior():
     from bspinn.masks import cartesian_mask
     d, _, _ = make_synthetic(4, (48, 48), noise=0.01, seed=0)
     m = cartesian_mask((48, 48), R=3, acs=12, pattern="vd", seed=1)
-    few = dict(calib=12, verbose=False, iters_auto=2, iters_wires=3, iters_pinn=3, iters_joint=3, sense_lambda=1e-2)
+    few = dict(calib=12, verbose=False, iters_auto=2, iters_wires=3, iters_pinn=3, iters_joint=3, sense_lambda=1e-2, refine=None)
     k = d.kspace[0] * m[None]
     C, img, info = estimate_maps(k, "2d", mask=m, return_image=True, image_prior="tv", image_prior_weight=1e-2, **few)
     assert img.shape == (48, 48) and np.isfinite(img).all() and info["image_prior"]["method"] == "manual"
@@ -1575,7 +1576,7 @@ def test_dynamic_tv_beats_per_frame_sense():
     m = gro_mask((H, W), T, 6)
     ku = k * m[None]
     err = lambda x: np.linalg.norm(np.abs(x) * (np.abs(x) * obj).sum() / (np.abs(x) ** 2).sum() - obj) / np.linalg.norm(obj)  # noqa: E731
-    xs = np.stack([sense_image(ku[..., t], C, "2d", mask=m[..., t], lam=1e-2) for t in range(T)], -1)
+    xs = np.stack([sense_image(ku[..., t], C, "2d", mask=m[..., t], lam=1e-2, prior=None) for t in range(T)], -1)
     rep = {}
     xd = dynamic_prior_image(ku, C, m, "auto", report=rep, iters=30)
     assert err(xd) < 0.5 * err(xs), (err(xd), err(xs), rep["weight"], rep["rule"])
@@ -1826,7 +1827,7 @@ def test_dynamic_rank0_is_the_2d_time_average_fit():
     kav, mavg = _time_average(kd, m)
     C2, _ = estimate_maps(kav, "2d", mask=mavg, **kw)
     assert C0.shape == kd.shape and np.array_equal(C0[..., 2], C2)
-    a = dynamic_prior_image(kd, C2, m, 1e-2, iters=5)
+    a = dynamic_prior_image(kd, C2, m, 1e-2, iters=5, spatial_on="image")
     b = dynamic_prior_image(kd, C2, m, 1e-2, iters=5, spatial_on="difference")
     assert np.isfinite(b).all() and not np.allclose(a, b)
 
@@ -1886,3 +1887,32 @@ def test_readout_axis_from_mask():
     assert readout_axis_from_mask(pe) == 0
     assert readout_axis_from_mask(m.sum(-1) > 0) is None
     assert readout_axis_from_mask(np.random.default_rng(0).random((32, 32, 3)) < 0.3) is None
+
+
+def test_noncart_mrinufft():
+    """Non-Cartesian via MRI-NUFFT: CG-SENSE / TV with the true maps recover a synthetic radial image, and the
+    PINN maps from radial calibration samples are close to the Biot-Savart ground truth (gauge-invariant)."""
+    pytest.importorskip("mrinufft")
+    pytest.importorskip("finufft")
+    from mrinufft import initialize_2D_radial
+    from bspinn.data import make_synthetic
+    from bspinn.noncart import estimate_maps_noncart, nufft_operator, sense_image_noncart, to_mrinufft
+    n = 48
+    d, Cg, obj = make_synthetic(4, (n, n), noise=0.0, seed=0)
+    G, x_true = Cg[0].astype(np.complex64), obj[0].astype(np.complex64)
+    tr = initialize_2D_radial(40, 2 * n).astype(np.float32)
+    t = to_mrinufft(tr, (n, n))
+    y = np.asarray(nufft_operator(t, (n, n), 4, smaps=G, density=False, backend="finufft").op(x_true))
+    sup = np.abs(x_true) > 0.05 * np.abs(x_true).max()
+
+    def nrmse(x):
+        a, b = np.abs(x)[sup], np.abs(x_true)[sup]
+        return np.linalg.norm((a * b).sum() / (a * a).sum() * a - b) / np.linalg.norm(b)
+    x = sense_image_noncart(y, G, t, (n, n), prior=None, iters=40)
+    assert nrmse(x) < 0.1
+    xt = sense_image_noncart(y, G, t, (n, n), prior="tv", prior_weight=1e-4, admm_iters=20)
+    assert np.isfinite(xt).all() and nrmse(xt) < 0.15
+    C, info = estimate_maps_noncart(y, tr, (n, n), spacing=d.geom.pixel_spacing, plane=d.geom.plane, calib=16,
+                                    verbose=False, iters_auto=20, iters_wires=150, iters_pinn=150)
+    a = C / np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)); b = G / np.sqrt((np.abs(G) ** 2).sum(0, keepdims=True))
+    assert C.shape == G.shape and float(np.mean(1 - np.abs((a.conj() * b).sum(0))[sup])) < 0.05

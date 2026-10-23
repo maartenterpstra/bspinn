@@ -328,7 +328,7 @@ def main():
 
             t0 = time.time()
             rep = {}
-            x_cg = sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device, report=rep)
+            x_cg = sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device, report=rep, prior=None)
             record("cg_auto", x_cg, {"lambda": rep.get("value"), "seconds": time.time() - t0})
             sl = Slice(fit.ksp, Cn, fit.sampled, a.device)
             net = make_net(a, a.device)

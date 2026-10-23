@@ -133,7 +133,7 @@ def main():
                     t0 = time.time()
                     if meth == "tikhonov":
                         rep = {}
-                        x = sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device, report=rep)
+                        x = sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device, report=rep, prior=None)
                         record(meth, x, {"weight": rep.get("value"), "seconds": time.time() - t0})
                     elif meth == "net":
                         record(meth, reconstruct(net, fit.ksp, Cn, fit.sampled, a.device), {"seconds": time.time() - t0})

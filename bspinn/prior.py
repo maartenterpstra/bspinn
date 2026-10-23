@@ -496,6 +496,8 @@ def prior_image(ksp, C, mask, prior="tv", weight="auto", device="cpu", report=No
     ``phase='auto'`` (v58): cross-validate with and without the soft low-resolution phase constraint
     (phase='lowres') and keep the one with the lower held-out error (README 8.13: the phase term gains 5-8 % on
     most slices but cost up to 27 % on slices whose phase is not smooth; the CV picks correctly in 16-17 of 20)."""
+    if kw.get("phase") is not None:
+        kw.setdefault("phase_weight", 0.3)
     if kw.get("phase") == "auto":
         opts = {}
         for name, kk in (("lowres", dict(kw, phase="lowres")),
@@ -608,7 +610,7 @@ DYN_SCALE = 1.0   # dynamic: the CV interior minimum sat at the oracle weight on
 
 def dynamic_prior_image(ksp, C, mask, weight="auto", spatial_ratio=0.25, device="cpu", grid=None, report=None,
                         holdout=0.1, folds=2, calib=0, seed=0, iters=50, cg_iters=5, scale=DYN_SCALE,
-                        oracle_ref=None, oracle_fn=None, spatial_on="image"):
+                        oracle_ref=None, oracle_fn=None, spatial_on="difference"):
     """Cine image series with temporal TV (+ spatial_ratio x the weight of spatial TV). ksp (N,H,W,T)
     acquired k-space (zeros elsewhere), C static (N,H,W) or per-frame (N,H,W,T) maps, mask (H,W,T).
     weight 'auto': k-space cross-validation with whole phase-encode lines withheld from every frame,

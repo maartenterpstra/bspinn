@@ -34,9 +34,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   iters_dynamic=None, quality="default", normalise="rss", phase_ref="inati", device="cpu",
                   threads=0, seed=0, verbose=True, return_image=False, sense_lambda="auto", sense_lambda_scale=1.0, sense_lambda_options=None, sense_iters=60, mask_maps=False, support_threshold=0.1,
                   support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout",
-                  image_prior=None, image_prior_weight="auto", image_prior_options=None, dynamic_static="average",
+                  image_prior="auto", image_prior_weight="auto", image_prior_options=None, dynamic_static="average",
                   dynamic_options=None, dynamic_base="2d", dynamic_validate="auto",
-                  refine=None, refine_options=None,
+                  refine="auto", refine_options=None,
                   **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
@@ -53,6 +53,9 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         with B0 through the slice ('axial'), along the image rows ('coronal'; 'sagittal' is the same up
         to a rotation about B0) and along the image columns ('coronal_t'); the lowest calibration loss
         wins (``info['plane_scores']``). Or give it: 'axial' | 'coronal' | 'sagittal' | 'coronal_t'.
+        Oblique slices (v59; e.g. cardiac views): the B0 direction in image coordinates, (row, column, normal),
+        any length and sign, e.g. the B0 (z) components of the read, phase and slice direction vectors of the
+        scanner header (bspinn.ocmr: info['b0_dir']); the OCMR cines are 51-65 deg oblique.
         Through-plane vs in-plane B0 is well identified; rows vs columns for in-plane B0 often is not
         (a warning is issued when the two are within 15 %): pass ``plane`` if you know it.
         A wrong plane fits much worse and can give false zeros inside the object.
@@ -114,8 +117,11 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         iters_pinn + iters_joint iterations); ``joint_image='gradient'`` makes the image a parameter of the
         same optimiser as the maps (simultaneous steps, Adam or L-BFGS) instead of an exact CG-SENSE solve
         after every map step (default 'cg').
-    image_prior, image_prior_weight, image_prior_options : the returned image with a sparsity prior instead
-        of Tikhonov (2-D): 'tv' | 'wavelet' | 'tv+wavelet' (weight 'auto' = k-space cross-validation, or a
+    image_prior, image_prior_weight, image_prior_options : the returned image (with ``return_image`` /
+        ``solve_image``). Default 'auto' (v59): the best prior of the GPU checks, see sense_image (2-D: TGV with
+        the low-resolution phase constraint switched per slice by cross-validation; dynamic: spatio-temporal TV
+        with spatial TV of the difference from the time average); None = Tikhonov (CG-SENSE). Others (2-D):
+        'tgv' | 'tv' | 'wavelet' | 'tv+wavelet' (weight 'auto' = k-space cross-validation, or a
         relative number), or 'net:<weights.pt>' (a network from scripts/train_recon.py / zs_ssl.py); see
         sense_image. With ``solve_image`` and a built-in prior the joint fit uses the same prior for its image
         updates (warm-started ADMM after every map step, weight by cross-validation with the calibration maps;
@@ -131,7 +137,11 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         image (calibration region, Hann window, 5-pixel smoothing) above ``support_threshold`` x its
         99th percentile, holes filled, dilated by ``support_dilate`` pixels. Lower the threshold or
         dilate more if the mask clips the object edge (masked maps make SENSE zero there).
-    refine, refine_options : 2-D only. ``'irgnm'``: after the PINN fit, refine the maps NLINV-style
+    refine, refine_options : default 'auto' (v59) = 'irgnm' for 2-D data (also the time average of the dynamic
+        layout), None otherwise; options default to REFINE_DEFAULTS = {'holdout': 0, 'steps': 12,
+        'x_ref': 'zero'} (README 8.15: maps better on every slice / plane tested, the image unchanged on the
+        fastMRI slices, better on small-calibration brain planes); refine=None switches it off.
+        ``'irgnm'``: after the PINN fit, refine the maps NLINV-style
         (bspinn.irgnm.irgnm_refine): iteratively regularised Gauss-Newton on the image and a Sobolev-weighted
         free per-coil correction on ALL acquired samples, regularised towards the PINN solution with a
         decreasing weight (alpha0 * q^n); the number of steps is chosen by held-out k-space prediction unless
@@ -202,6 +212,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         if mask.shape != ksp.shape[1:]:
             raise ValueError(f"mask must have shape {ksp.shape[1:]}, got {mask.shape}")
     nsp = 3 if layout == "3d" else 2
+    if not isinstance(plane, str):          # oblique slice: B0 direction in image coordinates (row, col, normal)
+        plane = tuple(float(v) for v in np.asarray(plane, float).reshape(3))
+        if np.linalg.norm(plane) < 1e-6:
+            raise ValueError("plane: the B0 direction vector is zero (no slice orientation?)")
     spacing = tuple(float(s) for s in (spacing or (1.0,) * nsp))
     if len(spacing) != nsp:
         raise ValueError(f"spacing needs {nsp} values")
@@ -297,18 +311,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     # channels M @ (original channels): map back to the original channels.
     prob = info["problem"]
     M = prob.data.meta.get("mix")
-    if refine is not None:
-        if refine != "irgnm" or layout != "2d":
-            raise ValueError("refine='irgnm' is implemented for 2-D data")
-        from .irgnm import irgnm_refine
-        with accel.phase("refine", device):
-            kw = ksp if M is None else np.einsum("ij,j...->i...", np.asarray(M), ksp)      # data channels of C
-            mr = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
-            ro = {"holdout": 0.1, **(refine_options or {})}
-            C, _, info["refine"] = irgnm_refine(kw, C, mr, device=device, seed=seed, **ro)
-            log(f"IRGNM refinement: {info['refine']['steps']} Gauss-Newton steps")
-        if info.pop("_xfull", None) is not None:  # the joint image belongs to the unrefined maps: recomputed below
-            info["image_solved_jointly"] = False
+    if refine == "auto":                 # v59 default: IRGNM refinement for 2-D (README 8.15), none otherwise
+        refine = "irgnm" if layout == "2d" else None
+    if refine is not None and (refine != "irgnm" or layout != "2d"):
+        raise ValueError("refine='irgnm' is implemented for 2-D data")
     fold_maps = info.pop("_fold_maps", None) or {}
     if M is not None:
         Minv = np.linalg.inv(np.asarray(M))
@@ -325,6 +331,21 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
             log("fold-over corrected maps: the full-resolution image is recomputed by SENSE with them "
                 "(the joint solution used the uncorrected maps)")
             info.pop("_xfull", None)
+    if refine is not None:
+        # after the fold-over correction (v59: it combines the model's maps with their one-FOV shifts; refining
+        # first made the two inconsistent), in the whitened data channels
+        from .irgnm import irgnm_refine
+        with accel.phase("refine", device):
+            Md = None if M is None else np.asarray(M)
+            Cd = C if Md is None else np.einsum("ij,j...->i...", Md, C)
+            kw = ksp if Md is None else np.einsum("ij,j...->i...", Md, ksp)
+            mr = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
+            ro = {**REFINE_DEFAULTS, **(refine_options or {})}
+            Cd, _, info["refine"] = irgnm_refine(kw, Cd, mr, device=device, seed=seed, **ro)
+            C = Cd if Md is None else np.einsum("ij,j...->i...", np.linalg.inv(Md), Cd)
+            log(f"IRGNM refinement: {info['refine']['steps']} Gauss-Newton steps")
+        if info.pop("_xfull", None) is not None:  # the joint image belongs to the unrefined maps: recomputed below
+            info["image_solved_jointly"] = False
     if _internal is not None:                  # the dynamic layout's base (v57): model, raw maps, its config
         _internal.update(cfg=cfg, C_pre_finish=C, model=info.get("model"), problem=prob, m=info.get("_m"))
     # common phase + normalisation (per-pixel complex scalars, identical for all coils)
@@ -640,6 +661,12 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
 
 
 # ---------------------------------------------------------------------------------- dynamic from the 2-D fit (v57)
+# v59 defaults (README 8.13-8.15, GPU checks on 20 dataloader slices, 9 OCMR cines, the brain phase-pole planes)
+REFINE_DEFAULTS = {"holdout": 0, "steps": 12, "x_ref": "zero"}          # refine='irgnm' / 'auto'
+PRIOR_2D_DEFAULT = ("tgv", {"phase": "auto", "phase_weight": 0.3})      # sense_image(prior='auto'), 2-D
+PRIOR_DYN_DEFAULT = {"spatial_on": "difference"}                         # sense_image(prior='auto'), dynamic
+
+
 def readout_axis_from_mask(m):
     """Readout axis (0 or 1) of a Cartesian mask (X,Y) or (X,Y,T), or None. Axis a is the readout if every frame
     is separable, mask = (readout profile along a) x (acquired lines), with one contiguous profile shared by all
@@ -1183,7 +1210,7 @@ def _sense_torch(ksp, C, m, box, lam, iters, device):
 
 
 def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=60, coil_axis=0, extrapolate=False,
-                device="cpu", lam_scale=1.0, report=None, lam_options=None, prior=None, prior_weight="auto",
+                device="cpu", lam_scale=1.0, report=None, lam_options=None, prior="auto", prior_weight="auto",
                 prior_options=None):
     """Full-resolution image from k-space and maps: argmin ||M F (C x) - y||^2 + lam' ||x||^2 with
     noise pre-whitening (if ``noise`` is given) applied to data and maps alike (``lam`` relative to the
@@ -1198,7 +1225,13 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
     ``lam`` may be 'auto' / 'auto-gcv' / 'auto-map' / 'auto-discrepancy' (bspinn.senselam, times
     ``lam_scale``); the chosen value and the rules' diagnostics go into the dict ``report``.
 
-    ``prior`` replaces the Tikhonov term (2-D): 'tv' (total variation), 'wavelet' (orthonormal db4,
+    ``prior`` default 'auto' (v59, README 8.13 / 8.14): 2-D -> 'tgv' with prior_options {'phase': 'auto',
+    'phase_weight': 0.3} (TGV^2 + the soft low-resolution phase constraint, switched on or off per slice by
+    cross-validation; your prior_options override these); dynamic -> spatio-temporal TV with spatial TV of each
+    frame's difference from the time average (bspinn.prior.dynamic_prior_image, spatial_on='difference'; options
+    spatial_ratio, spatial_on, ...), per-frame SENSE-1 when every frame is fully sampled; 3-D -> Tikhonov.
+    ``prior=None``: Tikhonov (CG-SENSE with ``lam``).
+    Other priors replace the Tikhonov term (2-D): 'tv' (total variation), 'wavelet' (orthonormal db4,
     coarsest band free), 'tv+wavelet' (bspinn.prior; ADMM), with ``prior_weight`` a relative number or
     'auto' (k-space cross-validation on withheld phase-encode lines, as for lam; the choice and the CV curve
     go into ``report``); or 'net:<weights.pt>' for a network trained by scripts/train_recon.py or
@@ -1217,6 +1250,22 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         L = np.linalg.inv(np.linalg.cholesky((n.conj().T @ n) / n.shape[0]))
         ksp = np.einsum("ij,j...->i...", L, ksp)
         C = np.einsum("ij,j...->i...", L, C)
+    if prior == "auto":                     # v59 default: the best prior of the GPU checks (README 8.13 / 8.14)
+        if layout == "dynamic":
+            m4 = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
+            full = all((m4[..., t] | ~acquired_extent(m4[..., t])).all() for t in range(m4.shape[-1]))
+            if not full:                     # undersampled cine: spatio-temporal TV, spatial TV of the difference
+                from .prior import dynamic_prior_image
+                rep_ = {} if report is None else report
+                x = dynamic_prior_image(ksp, C, m4, weight=prior_weight, device=device, report=rep_,
+                                        **{**PRIOR_DYN_DEFAULT, **(prior_options or {})})
+                return np.asarray(x).astype(np.complex64)
+            prior = None                     # fully sampled frames: SENSE-1 per frame
+        elif ksp.ndim == 3:
+            prior, po_ = PRIOR_2D_DEFAULT
+            prior_options = {**po_, **(prior_options or {})}
+        else:
+            prior = None                     # 3-D: Tikhonov (no prior implemented)
     if layout == "dynamic":
         ms = [None if mask is None else mask[..., t] for t in range(ksp.shape[-1])]
         reps = [{} for _ in range(ksp.shape[-1])]

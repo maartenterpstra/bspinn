@@ -1600,7 +1600,7 @@ change < 0.5 % with the seed. `scripts/ocmr_pinn_diag.py` logs the decisions of 
 Reference-difference prior on the GPU (`--spatial-on difference`): frame NRMSE lower on 15 of 15 cine/R pairs
 (median -4 % at R = 4, -6.5 % at R = 8), `dyn_nrmse` mixed (median +-2 %, up to +19 % on fs_0016).
 
-### 8.15 IRGNM refinement of the PINN maps (`refine='irgnm'`, opt-in)
+### 8.15 IRGNM refinement of the PINN maps (`refine="irgnm"`; default since v59, 8.16)
 
 `estimate_maps(..., refine='irgnm', refine_options={'holdout': 0, 'steps': 8})` (bspinn/irgnm.py): after the PINN
 fit, NLINV-style iteratively regularised Gauss-Newton on the image and a Sobolev-weighted free per-coil correction of
@@ -1633,6 +1633,64 @@ slices the calibration gap is small and the image does not change. Brain phase-p
 mean SENSE NRMSE / lco): `x_ref='zero'`, 12 steps is the best map set at every size: ACS 3 0.201 -> 0.181 (NLINV
 corrected 0.160), ACS 7 0.100 -> 0.091 (0.108), ACS 15 0.084 -> 0.083 (0.089). Recommended when refining:
 `refine="irgnm", refine_options={"holdout": 0, "steps": 12, "x_ref": "zero"}`.
+
+### 8.16 v59 defaults: the best options without asking
+
+`estimate_maps(...)` and `sense_image(...)` now default to the best settings of the GPU checks:
+
+| option | default | meaning / evidence |
+|---|---|---|
+| `image_prior` / `prior` | `'auto'` | 2-D: TGV + the low-resolution phase constraint switched per slice by CV (8.13: -5 % NRMSE at R 4, -8 % at R 6, 18/20 slices); dynamic: spatio-temporal TV with spatial TV of the difference from the time average (8.14: -4 % / -6.5 % frame NRMSE, 15/15); 3-D and fully sampled frames: as before. `None` = Tikhonov |
+| `refine` | `'auto'` | 2-D: IRGNM refinement, `REFINE_DEFAULTS = {'holdout': 0, 'steps': 12, 'x_ref': 'zero'}`, after the fold-over correction (8.15: maps better everywhere, the image unchanged on fastMRI, better at small calibration). `None` = off |
+| readout axis | from the sampling | `readout_axis_from_mask` (8.14) |
+| `dynamic_prior_image(spatial_on=)` / `--spatial-on` | `'difference'` | 8.14 |
+| OCMR scripts `--plane` | `'header'` | the B0 direction of the ISMRMRD slice orientation (8.17) |
+
+`solve_image` stays opt-in (it changes the return value). Recommended call:
+
+```python
+maps, image, info = estimate_maps(kspace, mask=mask, device="cuda:0", solve_image=True)   # + plane= if known
+```
+
+### 8.17 Oblique slices: B0 from the slice orientation
+
+The model's B0 is its z axis; a slice was placed axial (B0 through-plane) or coronal / coronal_t (B0 along the
+rows / columns). Cardiac views are double-oblique: in the OCMR headers B0 is 51-65 deg from the slice normal
+(fs_0004 / fs_0005 57, fs_0016 66, fs_0020 51, us_0001 55), so on every cine the PINN fitted the wrong field
+direction; the smooth factor and the channel mixer hid it on most, not on fs_0016 / fs_0021 (all seeds: same
+plane, handedness and fold decisions, leave-coil-out 0.14-0.16 / 0.13-0.14 vs NLINV 0.12 / 0.08; fs_0020: PINN
+0.066 vs NLINV 0.074). Now `plane` also takes the B0 direction in image coordinates, (row, column, normal), any
+length and sign (`geometry.b0_frame`: model z along it); `bspinn.ocmr.cine_slices` returns it as
+`info['b0_dir']` (z components of read, phase and slice direction), and the OCMR scripts use it by default.
+The named planes are the special cases (0, 0, 1), (1, 0, 0), (0, 1, 0). Synthetic check (Biot-Savart coils with
+fs_0020's B0 direction, 96^2, 8 coils, quality fast): ground-truth map error 2.0e-4 with the exact direction, 2.5e-4 with the plane search (it picks axial); small on a clean phantom, the GPU check on fs_0016 / fs_0021 decides.
+
+```
+bash bspinn/scripts/run_r4.sh      # header B0 on the cines + the non-Cartesian check
+```
+
+### 8.18 Non-Cartesian 2-D with MRI-NUFFT
+
+`bspinn.noncart` (`pip install mri-nufft finufft`; GPU: `cufinufft` or `gpunufft`):
+
+```python
+from bspinn.noncart import estimate_maps_noncart, sense_image_noncart
+maps, image, info = estimate_maps_noncart(kspace, traj, (256, 256), fov_mm=220, plane="axial",
+                                          return_image=True, device="cuda")      # traj in [-0.5, 0.5)
+image = sense_image_noncart(kspace, maps, traj, (256, 256), prior="tv")          # or prior=None: CG-SENSE
+```
+
+kspace (coils, samples) or (coils, shots, samples per shot); traj (samples, 2) or (shots, samples, 2) in
+MRI-NUFFT units (`traj_units='cycles'` for BART / bspinn cycles per FOV). The PINN is fitted to the samples in
+the calibration box with bspinn's exact NUDFT; images by density-weighted CG-SENSE (100 steps, Tikhonov 1e-5 x
+lambda_max) or TV by ADMM, weight by cross-validation on withheld shots (plain minimum). `plane` is required
+(named or a B0 vector). Synthetic (64^2, 6 coils, Biot-Savart truth, noise 0.2 %; `scripts/noncart_eval.py
+--synth`; NRMSE against the object times the coils' RSS, the convention of RSS-normalised maps):
+
+| trajectory | map error | CG-SENSE: PINN / true maps | TV: PINN / true maps |
+|---|---|---|---|
+| radial, 48 spokes x 128 | 1.5e-5 | 0.109 / 0.108 | 0.057 / 0.057 |
+| spiral, 12 interleaves x 256 | 1.7e-5 | 0.125 / 0.122 | 0.088 / 0.085 |
 
 ## 9. Code map
 

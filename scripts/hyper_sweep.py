@@ -119,7 +119,7 @@ class Runner:
         sec = time.time() - t
         ax = (1, 2)
         ref = (C.conj() * acc.ifft(it["k"], ax)).sum(0) / np.maximum((np.abs(C) ** 2).sum(0), 1e-12)
-        x = sense_image(it["k"] * it["und"][None], C, "2d", mask=it["und"], device=a.device)
+        x = sense_image(it["k"] * it["und"][None], C, "2d", mask=it["und"], device=a.device, prior=None)
         obj = it["obj"]
         r = {"seconds": sec, "phase_seconds": info.get("timings"),
              "residual": acc.residual_over_floor(it["k"], C, it["sampled"], it["acs"], it["psi"], ax,

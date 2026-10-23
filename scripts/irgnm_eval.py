@@ -131,7 +131,7 @@ def main():
                  **{k: v for k, v in info.items() if k in ("steps", "heldout_err")},
                  **method_lab.score(Cn, case0)}
             if "tikhonov" in a.methods:
-                x = sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device)
+                x = sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device, prior=None)
                 r["tik_nrmse"] = metrics(band_limit(x, ext), rss, obj)["nrmse"]
             if "tv" in a.methods:
                 rep = {}
