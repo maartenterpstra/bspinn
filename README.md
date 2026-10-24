@@ -1665,6 +1665,20 @@ length and sign (`geometry.b0_frame`: model z along it); `bspinn.ocmr.cine_slice
 The named planes are the special cases (0, 0, 1), (1, 0, 0), (0, 1, 0). Synthetic check (Biot-Savart coils with
 fs_0020's B0 direction, 96^2, 8 coils, quality fast): ground-truth map error 2.0e-4 with the exact direction, 2.5e-4 with the plane search (it picks axial); small on a clean phantom, the GPU check on fs_0016 / fs_0021 decides.
 
+GPU check (run_r4.sh; v59 defaults, so also with the IRGNM refinement). Map quality of the time-averaged R 4
+cine against its fully sampled coil images (`ocmr_pinn_diag.py`, combine->expand residual / leave-coil-out, 2 seeds):
+
+| cine | NLINV | PINN, named plane (v58) | PINN, header B0 (v59) |
+|---|---|---|---|
+| fs_0016_3T | 0.098 / 0.118 | 0.112-0.119 / 0.144-0.155 | 0.099-0.100 / 0.125-0.126 |
+| fs_0021_3T | 0.063 / 0.084 | 0.103-0.116 / 0.129-0.136 | **0.047 / 0.058-0.060** |
+| fs_0020_3T | 0.055 / 0.074 | 0.051 / 0.066 | **0.046 / 0.059** |
+
+Cine images (9 OCMR cines, spatio-temporal TV on the difference from the time average, frame NRMSE): median R 4
+NLINV 0.0554, PINN named plane 0.0657, PINN header B0 0.0555 (better than NLINV on 6 / 9; fs_0021 0.0683 -> 0.0209
+vs NLINV 0.0225; worst fs_0016 x1.08); R 8 0.0569 / 0.0595 / 0.0570 (5 / 9). Prospective held-out error / noise:
+us_0001 1.37 (NLINV 1.27), us_0002 1.02 (1.05), us_0003 0.98 (1.02).
+
 ```
 bash bspinn/scripts/run_r4.sh      # header B0 on the cines + the non-Cartesian check
 ```
@@ -1691,6 +1705,8 @@ lambda_max) or TV by ADMM, weight by cross-validation on withheld shots (plain m
 |---|---|---|---|
 | radial, 48 spokes x 128 | 1.5e-5 | 0.109 / 0.108 | 0.057 / 0.057 |
 | spiral, 12 interleaves x 256 | 1.7e-5 | 0.125 / 0.122 | 0.088 / 0.085 |
+| GPU, 128^2, 8 coils: radial 96 spokes | 1.5e-5 | 0.141 / 0.140 | 0.037 / 0.037 |
+| GPU: spiral 24 interleaves | 1.5e-5 | 0.180 / 0.173 | 0.057 / 0.053 |
 
 ## 9. Code map
 
