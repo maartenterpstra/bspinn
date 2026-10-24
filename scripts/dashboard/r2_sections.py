@@ -44,7 +44,7 @@ def txt(s, gstart=False):
     return f'<td class="num{" gstart" if gstart else ""}">{s}</td>'
 
 
-def render(d, base_ocmr):
+def render(d, base_ocmr, v59=None):
     X = d.get("extra") or {}
     if not X:
         return None
@@ -222,7 +222,13 @@ def render(d, base_ocmr):
         {len(ratios[4.0]) + len(ratios[8.0])} cine/R pairs (median ×{med(ratios[4.0]):.3f} at R = 4, ×{med(ratios[8.0]):.3f} at
         R = 8); the frame-to-frame error is mixed (median ×{med(dyn[4.0]):.2f}, up to ×{max(dyn[4.0] + dyn[8.0]):.2f}).</p></div>
 '''
+    static_find = "" if not v59 else f'''      <div class="finding"><span class="tag good">PINN</span><h3>Static slices (full v59 run): PINN maps now ahead of NLINV on leave-coil-out</h3>
+        <p>Leave-coil-out excess {v59["lco_p"]:.4f} vs {v59["lco_n"]:.4f} for NLINV, better on {v59["lco_w"]} slices; SENSE R = 4 better on
+        {v59["s4_w"]}. With the v59 image prior (TGV + phase, auto) the median image NRMSE is {v59["tgv_p"]:.4f} for the PINN,
+        {v59["tgv_n"]:.4f} for NLINV and {v59["tgv_e"]:.4f} for ESPIRiT ({v59["tv_p"]:.4f} with plain TV); PINN better on {v59["tgv_w"]}.</p></div>
+'''
     out["findings"] = f'''    <div class="findings">
+{static_find}
       <div class="finding"><span class="tag good">fixed</span><h3>Cine: with the scanner's B0 direction the PINN ties NLINV</h3>
         <p>Cardiac views are double-oblique (B0 51–65° from the slice normal); the PINN only knew axis-aligned B0. With the
         direction from the ISMRMRD header the median R = 4 frame NRMSE is {c4[2]:.4f} against {c4[0]:.4f} for NLINV
@@ -261,8 +267,8 @@ image = sense_image(kspace, maps, "2d", mask=mask)              # same prior for
         <li><code>image_prior=None</code> / <code>prior=None</code>: the old Tikhonov image; <code>refine=None</code>: no refinement.</li>
       </ul>
     </div>'''
-    out["caveats"] = '''    <ul class="plain">
-      <li>The sections below the round 2–4 results are the v56b baseline run; its cine and static numbers predate the header B0 direction, the new priors and the refinement.</li>
+    out["caveats"] = f'''    <ul class="plain">
+{"      <li>The sections below the round 2–4 results are the full v59 run of 24 Oct 2026 (run_v59.sh: the same slices, cines and planes as the baseline, with the v59 defaults).</li>" if v59 else "      <li>The sections below the round 2–4 results are the v56b baseline run; its cine and static numbers predate the header B0 direction, the new priors and the refinement.</li>"}
       <li>The header-B0 cine run used all v59 defaults, so it also includes the IRGNM refinement; on the static slices the refinement alone changed the images by &lt; 0.2 %, so most of the cine gain is the B0 direction.</li>
       <li>The fully sampled references are noisy: image NRMSE differences of ~1 % are within the slice-to-slice spread; paired wins are more reliable.</li>
       <li>Next: a full v59 rerun of the static benchmark and the brain planes (<code>run_v59.sh</code>); the 3×3 calibration case; us_0001.</li>

@@ -287,17 +287,42 @@ nl_tv, pv_tv = prior_med("nlinv", "tv"), prior_med(MAIN, "tv")
 o_nl, o_pa = med([r["nrmse"] for r in g[(4, "tv", "nlinv")]]), med([r["nrmse"] for r in g[(4, "tv", "pinn_avg")]])
 o_es = med([r["nrmse"] for r in g[(4, "tv", "espirit")]])
 
+V59_TEXT = [
+    ("Medians over the cines (8 at R = 1 and 4, 7 at R = 8; fs_0020 is incomplete and fs_0021 not yet run).",
+     "Medians over the 9 cines. PINN maps with the B0 direction from the scanner header (v59)."),
+    ("<h3>Per cine: where the dynamic layout fails</h3>", "<h3>Per cine</h3>"),
+    ("Red cells: the rank-0 dynamic maps, fitted to the same time average, are more than 10 % worse than the time-averaged maps.",
+     "Red cells would mark rank-0 dynamic maps more than 10 % worse than the time-averaged maps; since v58 both are the 2-D fit of the time average (small differences: separate fits), and the held-out check rejected the per-frame corrections on every cine."),
+    ("Grey rows are v55 with one option switched off.", "Two seeds of the v59 PINN (solve_image=True, v59 defaults)."),
+    ("Grey rows are ablations of v56.", "PINN v59 = estimate_maps(solve_image=True) with the v59 defaults; PINN, maps only = the defaults without solve_image."),
+    ("<b>12</b><span>PINN variants and ablations</span>", "<b>v59</b><span>defaults throughout</span>"),
+    ("<dt>PINN v53</dt>", "<dt>PINN v59</dt><dd><code>estimate_maps(solve_image=True)</code> with the v59 defaults: joint calibration and full-resolution fit, IRGNM refinement after the fold-over correction, readout axis from the sampling, B0 direction from the header where given.</dd>\n      <dt>PINN v53</dt>"),
+]
 page = open(sys.argv[3]).read()
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from r2_sections import render  # noqa: E402
-R2 = render(d, [r for r in d["ocmr"] if r["run"] == "ocmr_v56"])
+v59 = None
+if MAIN == "pinn_v59":
+    pr = [r for r in REAL if r["method"] == "pinn_v59"]
+    nr = [r for r in REAL if r["method"] == "nlinv"]
+    v59 = {"lco_p": med([r["lco_outside_acs_over_floor"] for r in pr]) - 1, "lco_n": med([r["lco_outside_acs_over_floor"] for r in nr]) - 1,
+           "lco_w": wins("pinn_v59", "lco_outside_acs_over_floor"), "s4_w": wins("pinn_v59", "sense_R4_support_nrmse_vs_rss_or_truth"),
+           "tgv_p": prior_med("pinn_v59", "tgv_phase_auto"), "tgv_n": prior_med("nlinv", "tgv_phase_auto"),
+           "tv_p": prior_med("pinn_v59", "tv"), "tgv_w": prior_wins("pinn_v59", "tgv_phase_auto"),
+           "tgv_e": prior_med("espirit", "tgv_phase_auto")}
+R2 = render(d, [r for r in d["ocmr"] if r["run"] == "ocmr_v56"], v59)
 blocks = {"{{EYEBROW}}": LEGACY["eyebrow"], "{{FINDINGS}}": LEGACY["findings"], "{{RECO}}": LEGACY["reco"],
           "{{CAVEATS}}": LEGACY["caveats"], "{{R2}}": ""}
 if R2:
     blocks.update({"{{EYEBROW}}": R2["eyebrow"], "{{FINDINGS}}": R2["findings"], "{{RECO}}": R2["reco"],
                    "{{CAVEATS}}": R2["caveats"], "{{R2}}": R2["r2"]})
+    V59 = ORUN == "ocmr_v59" and MAIN == "pinn_v59"
+    tag = "Full v59 run" if V59 else "Baseline v56b"
     for e in ("Static slices · joint", "Static slices · images", "OCMR cine · fully", "OCMR cine · prosp", "Brain MPRAGE", "All numbers"):
-        page = page.replace(f'<div class="eyebrow">{e}', f'<div class="eyebrow">Baseline v56b · {e}')
+        page = page.replace(f'<div class="eyebrow">{e}', f'<div class="eyebrow">{tag} · {e}')
+    if V59:
+        for a, b in V59_TEXT:
+            page = page.replace(a, b)
 for k, v in blocks.items():
     page = page.replace(k, v)
 rep = {
