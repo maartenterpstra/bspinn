@@ -110,11 +110,12 @@ dl.defs dt { font-weight: 600; font-size: 14px; }
 dl.defs dd { margin: 0; color: var(--ink-2); font-size: 14px; max-width: 82ch; }
 @media (max-width: 640px) { dl.defs { grid-template-columns: 1fr; } dl.defs dd { margin-bottom: 8px; } .wrap { gap: 42px; } }
 @media (prefers-reduced-motion: no-preference) { .tab { transition: background .12s, border-color .12s; } }
+.reco > * { min-width: 0; } .reco pre { overflow-x: auto; max-width: 100%; } .reco code, .finding code { overflow-wrap: anywhere; }
 </style>
 
 <div class="wrap">
   <header>
-    <div class="eyebrow">bspinn v56b · coil sensitivity estimation · run of 20–21 Oct 2026</div>
+    {{EYEBROW}}
     <h1>Reference-Free Coil Benchmark</h1>
     <p class="lede">Four data sets, one question: where do the Biot–Savart PINN's coil maps stand against NLINV and ESPIRiT? Static slices from your dataloader (fastMRI knee and brain, Calgary-Campinas) at R = 4 with 24 ACS lines; fully sampled OCMR cardiac cines with GRO undersampling at R = 4 and 8; prospectively undersampled OCMR cines (R ≈ 9); and the MPRAGE brain planes of the phase-pole paper with tiny calibration regions. Every method sees the same samples. Maps are scored against fully sampled data where there is any, and on held-out k-space where there is none.</p>
     <div class="facts">
@@ -128,36 +129,15 @@ dl.defs dd { margin: 0; color: var(--ink-2); font-size: 14px; max-width: 82ch; }
 
   <section aria-labelledby="h-find">
     <div class="sec-head"><div class="eyebrow">Summary</div><h2 id="h-find">What the run shows</h2></div>
-    <div class="findings">
-      <div class="finding"><span class="tag even">tie</span><h3>Static slices: PINN maps equal NLINV's</h3>
-        <p>With TV reconstruction the median image NRMSE is {{PV_TV}} for the PINN (v53) and {{NL_TV}} for NLINV; the PINN is better on {{N_BETTER}} of {{N_PAIRS}} slices. NLINV keeps a slightly lower leave-coil-out excess (0.052 vs 0.053), the PINN variants win R = 4 SENSE on 12–14 of 20 slices. ESPIRiT trails both (TV 0.084).</p></div>
-      <div class="finding"><span class="tag even">tie</span><h3>Cine: time-averaged PINN maps equal NLINV's</h3>
-        <p>On {{N_OCMR}} OCMR cines at R = 4 the TV image NRMSE is {{O_PA}} (PINN) against {{O_NL}} (NLINV) and {{O_ES}} (ESPIRiT). The same holds at R = 8 and on the prospective R ≈ 9 cines, where both predict held-out k-space at 1.1–1.3× the noise level and ESPIRiT at 4–13×.</p></div>
-      <div class="finding"><span class="tag bad">broken</span><h3>The per-dynamic PINN does not work yet</h3>
-        <p>Its rank-0 version, which fits the same time average, is much worse than the time-averaged maps on {{N_DYN_BAD}} of {{N_OCMR}} cines: the dynamic layout picks the B0 plane from a quick probe, the 2-D path settles ambiguous planes on held-out data. The per-frame corrections add error on top, and on the prospective cines they diverge (held-out 44–82× noise).</p></div>
-      <div class="finding"><span class="tag bad">reverted</span><h3>The v55 options bring nothing</h3>
-        <p>Support from the ACS block, the L-BFGS joint finish and the zero-mean smooth factor are indistinguishable on the static slices and, on the brain planes at ACS 7×7, worse and seed-unstable (SENSE 0.129 vs 0.100 for v54; 0.101 with another seed). They are off by default again in v56b.</p></div>
-      <div class="finding"><span class="tag good">PINN</span><h3>No phase poles in the PINN maps</h3>
-        <p>On the brain planes of Blumenthal &amp; Uecker, uncorrected NLINV has a gauge pole in the head in 4 of 9 cases (maps 2–6× worse near it); with the paper's correction none. The default PINN (v54) has none in any case (one v55 run with another seed has one), and at ACS 7×7 and 15×15 it matches corrected NLINV.</p></div>
-      <div class="finding"><span class="tag bad">open</span><h3>Tiny calibration regions remain the PINN's weak spot</h3>
-        <p>With a 3×3 ACS the PINN's maps are about twice as far from the data as corrected NLINV's (leave-coil-out 4.8 vs 2.1; SENSE 0.208 vs 0.165 for v54) and vary with the seed. This is where a Gauss–Newton solver with regularisation continuation is worth trying.</p></div>
-    </div>
+{{FINDINGS}}
   </section>
 
   <section aria-labelledby="h-reco">
     <div class="sec-head"><div class="eyebrow">Recommendation</div><h2 id="h-reco">Settings to use now</h2></div>
-    <div class="reco">
-      <pre>maps, _, info = estimate_maps(kspace, mask=mask, calib=24, device="cuda:0",
-                              solve_image=True)                  # v56b defaults otherwise
-image = sense_image(kspace, maps, "2d", mask=mask, prior="tv")   # TV weight by cross-validation</pre>
-      <ul>
-        <li>Static imaging: maps from the joint stage (<code>solve_image=True</code>), then the image with TV, as benchmarked here. v53 and v54 tie; v54 (the joint-stage penalties) is the default. TV inside the joint fit (<code>image_prior="tv"</code> in <code>estimate_maps</code>) was not part of this run.</li>
-        <li>Cine: time-averaged maps (<code>layout="2d"</code> on the time-averaged k-space), reconstructed with spatio-temporal TV. Avoid <code>layout="dynamic"</code> until its plane selection is fixed.</li>
-        <li>Pass <code>plane=</code> when you know the B0 orientation: it skips the second fit for ambiguous orientations and avoids the rows-versus-columns ambiguity behind the dynamic layout's failures.</li>
-      </ul>
-    </div>
+{{RECO}}
   </section>
 
+{{R2}}
   <section aria-labelledby="h-static">
     <div class="sec-head"><div class="eyebrow">Static slices · joint protocol, R = 4</div><h2 id="h-static">Map quality on 20 real slices</h2>
       <p class="note">Excess = residual / noise floor − 1: the part of the residual the maps are responsible for (0 = as good as the true maps). Leave-coil-out cannot be lowered by fitting noise. SENSE uses uniform undersampling inside one shared support. The phantom column is the true map error on the 4 synthetic cases. Grey rows are ablations of v56. ● marks the best value in each column.</p></div>
@@ -207,12 +187,7 @@ image = sense_image(kspace, maps, "2d", mask=mask, prior="tv")   # TV weight by 
 
   <section aria-labelledby="h-cav">
     <div class="sec-head"><div class="eyebrow">Reading the numbers</div><h2 id="h-cav">Caveats and next steps</h2></div>
-    <ul class="plain">
-      <li>The top methods differ by fractions of a percent in absolute terms; paired wins per slice are the more reliable comparison.</li>
-      <li>ESPIRiT's plain SENSE error is flattered by its zeroed background, which limits noise amplification; with TV that advantage disappears.</li>
-      <li>OCMR fs_0020 is incomplete and fs_0021 missing (the run was interrupted); the old-settings comparison (v54) covers 3 cines.</li>
-      <li>Next: make the dynamic layout reuse the 2-D held-out plane decision; then retest per-frame corrections. For small ACS: a Gauss–Newton joint solver with regularisation continuation, tested on the 3×3 and 7×7 brain planes with two seeds.</li>
-    </ul>
+{{CAVEATS}}
   </section>
 
   <section aria-labelledby="h-def">

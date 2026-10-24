@@ -46,7 +46,8 @@ def jsonl(paths):
                     print(f"{p}: line {n_} is not valid JSON, skipped")
                     continue
                 r.pop("per_frame_nrmse", None); r.pop("per_frame_ssim", None)          # keep the bundle small
-                r.pop("cv_error", None); r.pop("grid_error", None)
+                r.pop("cv_error", None); r.pop("grid_error", None); r.pop("grid_nrmse", None)
+                r.pop("grid", None); r.pop("info", None)
                 r["run"] = tag
                 rows.append(r)
     return rows
@@ -59,11 +60,15 @@ def main():
     ap.add_argument("--ocmr", nargs="*", default=[])
     ap.add_argument("--ocmr-us", nargs="*", default=[])
     ap.add_argument("--poles", nargs="*", default=[])
+    ap.add_argument("--extra", nargs="*", default=[], metavar="NAME=FILE",
+                    help="round-2+ result files by section name (r2_image, r2_irgnm, r2_ocmr, r3_ocmr, r3_ocmr_seed1, "
+                         "r4_ocmr, r2_ocmr_us, r3_ocmr_us, r4_ocmr_us, r2_poles, r3_diag, r4_diag, r4_noncart, ...)")
     ap.add_argument("--note", default="", help="free text shown with the run (code version, settings)")
     ap.add_argument("--out", default="dashboard_data.json")
     a = ap.parse_args()
     out = {"note": a.note, "eval": [], "ranks": [], "prior": jsonl(a.prior), "ocmr": jsonl(a.ocmr),
-           "ocmr_us": jsonl(a.ocmr_us), "poles": jsonl(a.poles)}
+           "ocmr_us": jsonl(a.ocmr_us), "poles": jsonl(a.poles),
+           "extra": {n: jsonl([f]) for n, f in (e.split("=", 1) for e in a.extra)}}
     for d in a.eval:
         tag = os.path.basename(os.path.abspath(d))
         for r in tsv(os.path.join(d, "summary.tsv")):
@@ -71,7 +76,8 @@ def main():
         for r in tsv(os.path.join(d, "ranks.tsv")):
             r["run"] = tag; out["ranks"].append(r)
     json.dump(out, open(a.out, "w"))
-    print(f"{a.out}: " + ", ".join(f"{k} {len(v)} rows" for k, v in out.items() if isinstance(v, list)))
+    print(f"{a.out}: " + ", ".join(f"{k} {len(v)} rows" for k, v in out.items() if isinstance(v, list))
+          + "".join(f", {k} {len(v)} rows" for k, v in out["extra"].items()))
 
 
 if __name__ == "__main__":

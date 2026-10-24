@@ -16,6 +16,7 @@ Maps from the undersampled data (--maps):
   pinn      estimate_maps 2-D, maps only (the --box calibration box), v54 options
   pinn_v54  estimate_maps with the joint full-resolution stage (solve_image=True, all samples), v54 options
   pinn_v55  the same with the v55 defaults (init_from_acs, resid_zero_mean, joint_lbfgs)
+  pinn_v59  estimate_maps with solve_image=True and the current (v59) defaults: IRGNM refinement, ...
   <maps>+irgnm[@key=value...]  IRGNM refinement (bspinn.irgnm, held-out step choice) of the cached <maps>
             (list <maps> first), e.g. pinn_v54+irgnm  pinn_v54+irgnm@steps=8@holdout=0
   <pinn*>@key=value[@key=value...]   a variant with extra estimate_maps / FitConfig options, its own cache and
@@ -163,13 +164,13 @@ def main():
                         C, _, rinfo = irgnm_refine(ku, C0, m, device=a.device, **ro)
                         print(f"   ACS {cal:2d} {name}: {rinfo['steps']} steps, held-out {rinfo.get('heldout_err')}",
                               flush=True)
-                    elif name.split("@")[0] in ("pinn", "pinn_v54", "pinn_v55"):
+                    elif name.split("@")[0] in ("pinn", "pinn_v54", "pinn_v55", "pinn_v59"):
                         base, *opts = name.split("@")             # e.g. pinn_v55@resid_zero_mean=False@seed=1
                         kw = dict(mask=m, calib=a.box, spacing=sp, quality=a.quality, verbose=False, device=a.device,
                                   readout_axis=0)
                         if base != "pinn":
                             kw.update(solve_image=True, optimizer="adam+lbfgs")
-                        if base != "pinn_v55":
+                        if base not in ("pinn_v55", "pinn_v59"):         # pinn_v59: the current defaults
                             kw.update(V54)
                         kw.update(pset)
                         kw.update(parse_set(opts))

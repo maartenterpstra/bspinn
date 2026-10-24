@@ -18,11 +18,12 @@ LABEL = {"nlinv": "NLINV", "espirit": "ESPIRiT", "walsh": "Walsh", "inati": "Ina
          "pinn_v56_grad": "v56, gradient image", "bs_pinn": "Biot–Savart PINN (bench)", "bs_wires": "Biot–Savart wires",
          "free": "Free (no physics)", "oracle": "Ground truth",
          "pinn_avg": "PINN, time-averaged", "pinn_dyn0": "PINN dynamic, rank 0", "pinn_dyn": "PINN per-dynamic (K=2)",
-         "nlinv_pp": "NLINV + pole correction", "pinn_v55": "PINN v55"}
+         "nlinv_pp": "NLINV + pole correction", "pinn_v55": "PINN v55", "pinn_v59": "PINN v59 (defaults)",
+         "pinn_v59@seed=1": "PINN v59, seed 1"}
 COLOR = {"nlinv": "--m-nlinv", "espirit": "--m-espirit", "walsh": "--m-walsh", "inati": "--m-inati",
          "lowres": "--m-lowres", "pinn_api": "--m-pinn-old", "pinn_v53": "--m-pinn", "pinn_v54": "--m-pinn-joint",
          "pinn_v56": "--m-pinn-js", "pinn_avg": "--m-pinn", "pinn_dyn0": "--m-pinn-lr", "pinn_dyn": "--m-pinn-js",
-         "nlinv_pp": "--m-nlinv", "pinn_v55": "--m-pinn-js"}
+         "nlinv_pp": "--m-nlinv", "pinn_v55": "--m-pinn-js", "pinn_v59": "--m-pinn"}
 esc = html.escape
 
 
@@ -71,6 +72,14 @@ def table(head_groups, heads, rows, best_cols=(), lower=True, ref_rows=(), abl_r
     return "".join(out)
 
 
+LEGACY = {
+ "eyebrow": "<div class=\"eyebrow\">bspinn v56b · coil sensitivity estimation · run of 20–21 Oct 2026</div>",
+ "findings": "    <div class=\"findings\">\n      <div class=\"finding\"><span class=\"tag even\">tie</span><h3>Static slices: PINN maps equal NLINV's</h3>\n        <p>With TV reconstruction the median image NRMSE is {{PV_TV}} for the PINN (v53) and {{NL_TV}} for NLINV; the PINN is better on {{N_BETTER}} of {{N_PAIRS}} slices. NLINV keeps a slightly lower leave-coil-out excess (0.052 vs 0.053), the PINN variants win R = 4 SENSE on 12–14 of 20 slices. ESPIRiT trails both (TV 0.084).</p></div>\n      <div class=\"finding\"><span class=\"tag even\">tie</span><h3>Cine: time-averaged PINN maps equal NLINV's</h3>\n        <p>On {{N_OCMR}} OCMR cines at R = 4 the TV image NRMSE is {{O_PA}} (PINN) against {{O_NL}} (NLINV) and {{O_ES}} (ESPIRiT). The same holds at R = 8 and on the prospective R ≈ 9 cines, where both predict held-out k-space at 1.1–1.3× the noise level and ESPIRiT at 4–13×.</p></div>\n      <div class=\"finding\"><span class=\"tag bad\">broken</span><h3>The per-dynamic PINN does not work yet</h3>\n        <p>Its rank-0 version, which fits the same time average, is much worse than the time-averaged maps on {{N_DYN_BAD}} of {{N_OCMR}} cines: the dynamic layout picks the B0 plane from a quick probe, the 2-D path settles ambiguous planes on held-out data. The per-frame corrections add error on top, and on the prospective cines they diverge (held-out 44–82× noise).</p></div>\n      <div class=\"finding\"><span class=\"tag bad\">reverted</span><h3>The v55 options bring nothing</h3>\n        <p>Support from the ACS block, the L-BFGS joint finish and the zero-mean smooth factor are indistinguishable on the static slices and, on the brain planes at ACS 7×7, worse and seed-unstable (SENSE 0.129 vs 0.100 for v54; 0.101 with another seed). They are off by default again in v56b.</p></div>\n      <div class=\"finding\"><span class=\"tag good\">PINN</span><h3>No phase poles in the PINN maps</h3>\n        <p>On the brain planes of Blumenthal &amp; Uecker, uncorrected NLINV has a gauge pole in the head in 4 of 9 cases (maps 2–6× worse near it); with the paper's correction none. The default PINN (v54) has none in any case (one v55 run with another seed has one), and at ACS 7×7 and 15×15 it matches corrected NLINV.</p></div>\n      <div class=\"finding\"><span class=\"tag bad\">open</span><h3>Tiny calibration regions remain the PINN's weak spot</h3>\n        <p>With a 3×3 ACS the PINN's maps are about twice as far from the data as corrected NLINV's (leave-coil-out 4.8 vs 2.1; SENSE 0.208 vs 0.165 for v54) and vary with the seed. This is where a Gauss–Newton solver with regularisation continuation is worth trying.</p></div>\n    </div>\n  </section>\n\n  <section aria-labelledby=\"h-reco\">",
+ "reco": "    <div class=\"reco\">\n      <pre>maps, _, info = estimate_maps(kspace, mask=mask, calib=24, device=\"cuda:0\",\n                              solve_image=True)                  # v56b defaults otherwise\nimage = sense_image(kspace, maps, \"2d\", mask=mask, prior=\"tv\")   # TV weight by cross-validation</pre>\n      <ul>\n        <li>Static imaging: maps from the joint stage (<code>solve_image=True</code>), then the image with TV, as benchmarked here. v53 and v54 tie; v54 (the joint-stage penalties) is the default. TV inside the joint fit (<code>image_prior=\"tv\"</code> in <code>estimate_maps</code>) was not part of this run.</li>\n        <li>Cine: time-averaged maps (<code>layout=\"2d\"</code> on the time-averaged k-space), reconstructed with spatio-temporal TV. Avoid <code>layout=\"dynamic\"</code> until its plane selection is fixed.</li>\n        <li>Pass <code>plane=</code> when you know the B0 orientation: it skips the second fit for ambiguous orientations and avoids the rows-versus-columns ambiguity behind the dynamic layout's failures.</li>\n      </ul>\n    </div>\n  </section>\n\n  <section aria-labelledby=\"h-static\">",
+ "caveats": "    <ul class=\"plain\">\n      <li>The top methods differ by fractions of a percent in absolute terms; paired wins per slice are the more reliable comparison.</li>\n      <li>ESPIRiT's plain SENSE error is flattered by its zeroed background, which limits noise amplification; with TV that advantage disappears.</li>\n      <li>OCMR fs_0020 is incomplete and fs_0021 missing (the run was interrupted); the old-settings comparison (v54) covers 3 cines.</li>\n      <li>Next: make the dynamic layout reuse the 2-D held-out plane decision; then retest per-frame corrections. For small ACS: a Gauss–Newton joint solver with regularisation continuation, tested on the 3×3 and 7×7 brain planes with two seeds.</li>\n    </ul>\n  </section>\n\n  <section aria-labelledby=\"h-def\">"
+}
+
+
 # ------------------------------------------------------------------ static benchmark
 by_case = collections.defaultdict(dict)
 for r in REAL:
@@ -94,7 +103,7 @@ def prior_wins(m, meth, ref="nlinv"):
     return f"{sum(prior[k][m]['nrmse'] < prior[k][ref]['nrmse'] for k in ks)}/{len(ks)}"
 
 
-ORDER = ["nlinv", "espirit", "pinn_v53", "pinn_v54", "pinn_v56", "pinn_api", "lowres", "walsh", "inati",
+ORDER = ["nlinv", "espirit", "pinn_v59", "pinn_v53", "pinn_v54", "pinn_v56", "pinn_api", "lowres", "walsh", "inati",
          "pinn_v56_vp0", "pinn_v56_nolbfgs", "pinn_v56_nozm", "pinn_v56_grad"]
 ABL = {"pinn_v56_vp0", "pinn_v56_nolbfgs", "pinn_v56_nozm", "pinn_v56_grad"}
 srows = []
@@ -116,12 +125,16 @@ static_tbl = table([("Maps on 20 real slices (medians)", 5), ("Slices better tha
                    srows, best_cols=(0, 1, 2, 3, 4, 7), abl_rows=ABL)
 
 prows = []
-for m in ["nlinv", "espirit", "pinn_v53", "pinn_v54", "pinn_v56"]:
-    prows.append((m, [prior_med(m, "tikhonov"), prior_med(m, "tv"), prior_med(m, "tvw"),
+PRIOR_MAPS = [m for m in ["nlinv", "espirit", "pinn_v59", "pinn_v53", "pinn_v54", "pinn_v56"]
+              if any(m in v for v in prior.values())]
+HAS_AUTO = any(k[1] == "tgv_phase_auto" for k in prior)
+for m in PRIOR_MAPS:
+    prows.append((m, [prior_med(m, "tikhonov"), prior_med(m, "tv"), prior_med(m, "tgv_phase_auto" if HAS_AUTO else "tvw"),
                       med([v[m]["psnr"] for (c, mm), v in prior.items() if mm == "tv" and m in v]),
                       "–" if m == "nlinv" else prior_wins(m, "tv"), "–" if m == "nlinv" else prior_wins(m, "tikhonov")]))
 prior_tbl = table([("Image NRMSE on 20 real slices (medians, R = 4)", 4), ("Slices better than NLINV", 2)],
-                  ["Tikhonov (CG-SENSE)", "Total variation", "TV + wavelets", "TV PSNR (dB)", "with TV", "with Tikhonov"],
+                  ["Tikhonov (CG-SENSE)", "Total variation", "TGV + phase (auto)" if HAS_AUTO else "TV + wavelets",
+                   "TV PSNR (dB)", "with TV", "with Tikhonov"],
                   prows, best_cols=(0, 1, 2))
 
 
@@ -150,13 +163,15 @@ def scatter(pairs, xlab, ylab, w=520, h=380):
     return "".join(s)
 
 
-pairs = [(k[0].replace("_j4", ""), v["nlinv"]["nrmse"], v["pinn_v53"]["nrmse"])
-         for k, v in prior.items() if k[1] == "tv" and "nlinv" in v and "pinn_v53" in v]
-scatter_tv = scatter(pairs, "NLINV maps: TV image NRMSE", "PINN v53 maps: TV image NRMSE")
+MAIN = "pinn_v59" if "pinn_v59" in PRIOR_MAPS else "pinn_v53"
+pairs = [(k[0].replace("_j4", ""), v["nlinv"]["nrmse"], v[MAIN]["nrmse"])
+         for k, v in prior.items() if k[1] == "tv" and "nlinv" in v and MAIN in v]
+scatter_tv = scatter(pairs, "NLINV maps: TV image NRMSE", f"{LABEL[MAIN]} maps: TV image NRMSE")
 n_pinn_better = sum(p[2] < p[1] for p in pairs)
 
 # ------------------------------------------------------------------ OCMR
-O = [r for r in d["ocmr"] if r["run"] == "ocmr_v56"]
+ORUN = "ocmr_v59" if any(r["run"] == "ocmr_v59" for r in d["ocmr"]) else "ocmr_v56"
+O = [r for r in d["ocmr"] if r["run"] == ORUN]
 O54 = [r for r in d["ocmr"] if r["run"] == "ocmr_v54"]
 ofiles = sorted({r["file"] for r in O})
 g = collections.defaultdict(list)
@@ -224,13 +239,14 @@ P = d["poles"]
 pg = collections.defaultdict(list)
 for r in P:
     pg[(r["cal"], r["maps"])].append(r)
-PM = ["nlinv", "nlinv_pp", "espirit", "pinn_v54", "pinn_v54@seed=1", "pinn_v55", "pinn_v55@seed=1",
+PM = ["nlinv", "nlinv_pp", "espirit", "pinn_v59", "pinn_v59@seed=1", "pinn_v54", "pinn_v54@seed=1", "pinn_v55", "pinn_v55@seed=1",
       "pinn_v55@init_from_acs=False", "pinn_v55@joint_lbfgs=0", "pinn_v55@resid_zero_mean=False", "pinn_v55@joint_lbfgs_cg=0"]
 PLAB = {"pinn_v54@seed=1": "PINN v54, seed 1", "pinn_v55@seed=1": "PINN v55, seed 1",
         "pinn_v55@init_from_acs=False": "v55 without ACS support fix", "pinn_v55@joint_lbfgs=0": "v55 without L-BFGS finish",
         "pinn_v55@resid_zero_mean=False": "v55 without zero-mean factor", "pinn_v55@joint_lbfgs_cg=0": "v55 without var. projection",
         "pinn_v54": "PINN v54 (joint, default)"}
 LABEL.update(PLAB)
+PM = [m for m in PM if any(k[1] == m for k in pg)]
 bh = ['<table><thead><tr class="group"><th></th>' + "".join(
     f'<th colspan="3" class="{"gstart" if i else ""}">ACS {c}×{c}</th>' for i, c in enumerate((3, 7, 15)))
       + '</tr><tr><th>Maps</th>' + "<th>Poles</th><th>lco</th><th>SENSE</th>" * 3 + "</tr></thead><tbody>"]
@@ -267,11 +283,23 @@ for r in E:
 explorer_json = json.dumps(EX, separators=(",", ":"))
 
 # headline numbers
-nl_tv, pv_tv = prior_med("nlinv", "tv"), prior_med("pinn_v53", "tv")
+nl_tv, pv_tv = prior_med("nlinv", "tv"), prior_med(MAIN, "tv")
 o_nl, o_pa = med([r["nrmse"] for r in g[(4, "tv", "nlinv")]]), med([r["nrmse"] for r in g[(4, "tv", "pinn_avg")]])
 o_es = med([r["nrmse"] for r in g[(4, "tv", "espirit")]])
 
 page = open(sys.argv[3]).read()
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+from r2_sections import render  # noqa: E402
+R2 = render(d, [r for r in d["ocmr"] if r["run"] == "ocmr_v56"])
+blocks = {"{{EYEBROW}}": LEGACY["eyebrow"], "{{FINDINGS}}": LEGACY["findings"], "{{RECO}}": LEGACY["reco"],
+          "{{CAVEATS}}": LEGACY["caveats"], "{{R2}}": ""}
+if R2:
+    blocks.update({"{{EYEBROW}}": R2["eyebrow"], "{{FINDINGS}}": R2["findings"], "{{RECO}}": R2["reco"],
+                   "{{CAVEATS}}": R2["caveats"], "{{R2}}": R2["r2"]})
+    for e in ("Static slices · joint", "Static slices · images", "OCMR cine · fully", "OCMR cine · prosp", "Brain MPRAGE", "All numbers"):
+        page = page.replace(f'<div class="eyebrow">{e}', f'<div class="eyebrow">Baseline v56b · {e}')
+for k, v in blocks.items():
+    page = page.replace(k, v)
 rep = {
     "{{STATIC}}": static_tbl, "{{PRIOR}}": prior_tbl, "{{SCATTER}}": scatter_tv, "{{OCMR}}": ocmr_tbl,
     "{{OCMR_PF}}": ocmr_pf, "{{US}}": us_tbl, "{{BRAIN}}": brain_tbl, "{{EXPLORER}}": explorer_json,
