@@ -170,6 +170,11 @@ def static_live(a, index, R):
     est_kw = {"threads": 1, "cfg_overrides": {}, "device": a.device, "quality": "default"}
     out = {"obj": obj, "sup": sup, "ref": ref, "x": {}, "C": {}, "R_eff": float(case0.sampled.sum() / fit.sampled.sum())}
     for key, m in (("espirit", "espirit"), ("nlinv", "nlinv"), (a.pinn_key, "pinn")):
+        if m in a.refit or "all" in a.refit:            # drop the cached maps: estimated again below
+            for ext in (".npy", ".time"):
+                if os.path.exists(os.path.join(cdir, key + ext)):
+                    os.remove(os.path.join(cdir, key + ext))
+            print(f"fig2: item{index} R = {R:g} {key}: re-estimating", flush=True)
         try:
             C = bm.estimate(fit, [key], cache_dir=cdir, log=print, **est_kw)[0][key]
         except Exception as e:          # noqa: BLE001  (e.g. BART missing: show the other methods)
@@ -488,6 +493,8 @@ def fig5(d, a):
 
 
 def main():
+    if not os.environ.get("BART") and os.path.exists("bart/bart"):      # as run_v59.sh: BART=${BART:-bart/bart}
+        os.environ["BART"] = os.path.abspath("bart/bart")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default="dashboard_data.json")
     ap.add_argument("--out", default="figs")
@@ -503,6 +510,8 @@ def main():
     g2.add_argument("--maps-cache", default=None, help="maps cache root (default: --eval, so the benchmark's R = 4 "
                     "maps are reused; other R are fitted and stored there as item<i>_j<R>/maps)")
     g2.add_argument("--pinn-set", nargs="*", default=["solve_image=true"], help="options of the proposed maps (run_v59)")
+    g2.add_argument("--refit", nargs="*", default=[], choices=["pinn", "espirit", "nlinv", "all"],
+                    help="estimate these maps again instead of reading the cache (the new maps replace the cached ones)")
     g2.add_argument("--key", default="kspace")
     g2.add_argument("--coil-axis", type=int, default=0)
     g2.add_argument("--device", default="cuda")
