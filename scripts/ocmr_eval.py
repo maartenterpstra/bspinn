@@ -124,6 +124,9 @@ def main():
     ap.add_argument("--gro-alpha", type=float, default=3.0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--save-images", action="store_true")
+    ap.add_argument("--save-gif", action="store_true", help="per file and R > 1: animated GIF comparing the methods' "
+                    "reconstructions and coil maps (<out dir>/gifs; see scripts/cine_gif.py)")
+    ap.add_argument("--gif-recon", default="tv")
     ap.add_argument("--out", default="runs/ocmr/results.jsonl")
     a = ap.parse_args()
 
@@ -265,6 +268,19 @@ def main():
                             fh.write(json.dumps(r) + "\n")
             if a.save_images:
                 np.savez_compressed(os.path.join(root, f"{fname}_s{s}_images.npz"), **imgs)
+            if a.save_gif:
+                from cine_gif import load_maps, make_cine_gif
+                for R in a.R:
+                    recons = {k.split("/")[1]: v.astype(np.float32) for k, v in imgs.items()
+                              if k.startswith(f"R{R:g}/") and k.endswith(f"/{a.gif_recon}")}
+                    if R <= 1 or not recons:
+                        continue
+                    try:
+                        make_cine_gif(ref, recons, load_maps(os.path.join(root, "maps"), f"{fname}_s{s}_R{R:g}", recons),
+                                      os.path.join(root, "gifs", f"{fname}_s{s}_R{R:g}.gif"),
+                                      title=f"{fname} slice {s}, R = {R:g}, {a.gif_recon.upper()}")
+                    except Exception as e:      # noqa: BLE001  (a figure must not stop the benchmark)
+                        print(f"   GIF failed: {type(e).__name__}: {e}", flush=True)
     rows = [json.loads(l) for l in open(a.out) if l.strip()] if os.path.exists(a.out) else []
     if not rows:
         return
