@@ -65,14 +65,19 @@ def synth(a):
                                         calib=a.calib, quality=a.quality, device=a.device, verbose=False)
         row = {"case": f"synth_{kind}", "shots": int(tr.shape[0]), "samples": int(t.shape[0]), "coils": a.coils,
                "maps_seconds": time.time() - t0, "map_error_pinn": map_error(C, G, sup)}
+        imgs = {}
         for name, maps in (("pinn", C), ("true", Gn)):
             for prior in (None, "tv"):
                 rep = {}
                 x = sense_image_noncart(y, maps, tr, (n, n), prior=prior, device=a.device, report=rep)
                 row[f"nrmse_{name}_{prior or 'cg'}"] = nrmse(x, x_ref, sup)
+                imgs[f"{name}_{prior or 'cg'}"] = np.asarray(x, np.complex64)
                 if prior:
                     row[f"tv_weight_{name}"] = rep.get("weight")
         write(a.out, row)
+        if a.save:                      # images, maps and trajectory for the figures (scripts/ismrm_figures.py)
+            np.savez_compressed(f"{os.path.splitext(a.out)[0]}_{kind}.npz", traj=tr, maps_pinn=np.asarray(C, np.complex64),
+                                maps_true=Gn, x_ref=x_ref, support=sup, **imgs)
 
 
 def radial16(a):
