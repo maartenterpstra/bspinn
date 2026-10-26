@@ -144,6 +144,32 @@ def static_from_npz(path, image_key, pinn_key):
     return out
 
 
+def recon_title(rc, m):
+    if rc == "bart":
+        return "BART nlinv" if m == "nlinv" else f"BART pics ℓ2"
+    return {"tikhonov": "SENSE", "tv": "TV", "tgv": "TGV", "tgv_phase_auto": "TGV + phase",
+            "tv_phase_auto": "TV + phase"}.get(rc, rc)
+
+
+def bart_pics(k, C, lam):
+    """BART pics -l2 (Tikhonov-regularised CG-SENSE), k (N,X,Y) zero where not sampled, C (N,X,Y) -> (X,Y)."""
+    import shutil
+    import subprocess
+    import tempfile
+    from bspinn import methods as bm
+    from bspinn.data import _read_cfl
+    from bspinn.methods import _write_cfl
+    tmp = tempfile.mkdtemp()
+    try:
+        _write_cfl(os.path.join(tmp, "k"), np.moveaxis(k, 0, -1)[:, :, None, :].astype(np.complex64))
+        _write_cfl(os.path.join(tmp, "s"), np.moveaxis(C, 0, -1)[:, :, None, :].astype(np.complex64))
+        subprocess.run([bm._bart(), "pics", "-S", "-l2", "-r", f"{lam:g}", os.path.join(tmp, "k"),
+                        os.path.join(tmp, "s"), os.path.join(tmp, "x")], check=True, capture_output=True)
+        return np.squeeze(_read_cfl(os.path.join(tmp, "x")))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def static_live(a, index, R):
     """One dataset item undersampled at R (the benchmark's variable-density mask, 24 ACS lines); maps estimated
     on it (or read from the maps cache of the benchmark, <maps-cache>/item<i>_j<R>/maps) and the image
@@ -181,15 +207,23 @@ def static_live(a, index, R):
             print(f"fig2: item{index} R = {R:g} {key} failed ({type(e).__name__}: {e}); left out", flush=True)
             continue
         Cn = ev.normalise(C)
-        if a.recon == "tikhonov":
+        rc = getattr(a, f"recon_{m}") or a.recon
+        if rc == "bart" and m == "nlinv":        # BART nlinv's own joint image (and its own maps)
+            from phase_pole_eval import nlinv_full
+            Cb, x = nlinv_full(fit.ksp, [])
+            Cn = ev.normalise(Cb)
+        elif rc == "bart":                       # BART pics, l2 (Tikhonov) SENSE with these maps
+            x = bart_pics(fit.ksp, Cn, a.bart_l2)
+        elif rc == "tikhonov":
             x = sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device, prior=None)
         else:
-            pr = PRIOR_METHODS[a.recon]
+            pr = PRIOR_METHODS[rc]
             pr, pkw = pr if isinstance(pr, tuple) else (pr, {})
             x = prior_image(fit.ksp, Cn, fit.sampled, pr, "auto", device=a.device, scale=AUTO_SCALE,
                             grid=np.logspace(-4, -1, 10), iters=50, cg_iters=5, **pkw)
         out["x"][m] = np.abs(band_limit(x, ext))
         out["C"][m] = Cn.astype(np.complex64)
+        out.setdefault("titles", {})[m] = f"R = {R:g}, {recon_title(rc, m)}"
         print(f"fig2: item{index} R = {R:g} {m}: done", flush=True)
     return out
 
@@ -249,7 +283,8 @@ def fig2(d, a):
             if m in xs:
                 x = xs[m]
                 e = np.linalg.norm((x - ref)[obj]) / np.linalg.norm(ref[obj])
-                ax = fig.add_subplot(g[0, col]); gray(ax, x[box], vmax, f"{LAB[m]}, {title}")
+                ax = fig.add_subplot(g[0, col])
+                gray(ax, x[box], vmax, f"{LAB[m]}\n{s_.get('titles', {}).get(m, title)}")
                 ax = fig.add_subplot(g[1, col]); gray(ax, (np.abs(x - ref) * obj)[box] * a.err_gain, vmax)
                 ax.text(0.03, 0.03, f"NRMSE {e:.3f}", transform=ax.transAxes, color="white", fontsize=6)
                 ax = fig.add_subplot(g[2, col])
@@ -507,6 +542,12 @@ def main():
     g2.add_argument("--index", type=int, nargs="+", default=[], help="dataset item(s), e.g. 1066 for item1066")
     g2.add_argument("--R-static", type=float, nargs="+", default=[4.0], help="undersampling factor(s)")
     g2.add_argument("--recon", default="tgv_phase_auto", choices=["tikhonov", "tv", "tgv", "tgv_phase_auto", "tv_phase_auto"])
+    for m_ in ("espirit", "nlinv", "pinn"):
+        g2.add_argument(f"--recon-{m_}", default=None,
+                        choices=["tikhonov", "tv", "tgv", "tgv_phase_auto", "tv_phase_auto", "bart"],
+                        help=f"reconstruction for the {m_} maps (default: --recon); 'bart': " +
+                             ("BART nlinv's own joint image and maps" if m_ == "nlinv" else "BART pics -l2 with these maps"))
+    g2.add_argument("--bart-l2", type=float, default=0.01, help="pics -r for --recon-... bart")
     g2.add_argument("--maps-cache", default=None, help="maps cache root (default: --eval, so the benchmark's R = 4 "
                     "maps are reused; other R are fitted and stored there as item<i>_j<R>/maps)")
     g2.add_argument("--pinn-set", nargs="*", default=["solve_image=true"], help="options of the proposed maps (run_v59)")
