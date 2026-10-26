@@ -197,9 +197,9 @@ def static_live(a, index, R):
     out = {"obj": obj, "sup": sup, "ref": ref, "x": {}, "C": {}, "R_eff": float(case0.sampled.sum() / fit.sampled.sum())}
     for key, m in (("espirit", "espirit"), ("nlinv", "nlinv"), (a.pinn_key, "pinn")):
         if m in a.refit or "all" in a.refit:            # drop the cached maps: estimated again below
-            for ext in (".npy", ".time"):
-                if os.path.exists(os.path.join(cdir, key + ext)):
-                    os.remove(os.path.join(cdir, key + ext))
+            for suffix in (".npy", ".time"):
+                if os.path.exists(os.path.join(cdir, key + suffix)):
+                    os.remove(os.path.join(cdir, key + suffix))
             print(f"fig2: item{index} R = {R:g} {key}: re-estimating", flush=True)
         try:
             C = bm.estimate(fit, [key], cache_dir=cdir, log=print, **est_kw)[0][key]
