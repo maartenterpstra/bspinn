@@ -290,6 +290,103 @@ def fig4(d, a):
     save(fig, a.out, "fig4_summary")
 
 
+# ------------------------------------------------------------------------------------- Fig. 5: every metric
+def bars(ax, groups, title, ylabel, fmt="{:.3f}", log=False, ref_line=None):
+    """groups: [(label, {method: value})]; methods espirit / nlinv / pinn (and 'true', hatched)."""
+    w = 0.27
+    for gi, (lab, v) in enumerate(groups):
+        ks = [k for k in ("espirit", "nlinv", "true", "pinn") if k in v and v[k] is not None and np.isfinite(v[k])]
+        for i, k in enumerate(ks):
+            x, y = gi + (i - (len(ks) - 1) / 2) * w, v[k]
+            if k == "true":
+                ax.bar(x, y, w, facecolor="white", edgecolor="0.3", lw=0.6, hatch="////")
+            else:
+                ax.bar(x, y, w, color=COL[k])
+            ax.text(x, y * (1.06 if log else 1) + (0 if log else 0.01 * ax.get_ylim()[1]), fmt.format(y),
+                    ha="center", va="bottom", fontsize=5, rotation=90)
+    ax.set_xticks(range(len(groups)), [g[0] for g in groups], fontsize=6)
+    ax.set_title(title, fontsize=7.5); ax.set_ylabel(ylabel, fontsize=6.5)
+    if log:
+        ax.set_yscale("log")
+    if ref_line is not None:
+        ax.axhline(ref_line, color="0.4", lw=0.6, ls="--")
+    vals = [y for _, v in groups for y in v.values() if y is not None and np.isfinite(y)]
+    if vals and not log:
+        lo = min(vals)
+        ax.set_ylim(min(0, lo * 1.2), max(vals) * 1.3)
+    elif vals:
+        ax.set_ylim(min(vals) / 1.5, max(vals) * 4)
+
+
+def fig5(d, a):
+    M3 = (("espirit", "espirit"), ("nlinv", "nlinv"), (a.pinn_key, "pinn"))
+    MC = (("espirit", "espirit"), ("nlinv", "nlinv"), ("pinn_avg", "pinn"))
+    MB = (("espirit", "espirit"), ("nlinv_pp", "nlinv"), ("pinn_v59", "pinn"))
+    pr = [r for r in d.get("prior", []) if r["method"] == a.static_prior]
+    oc = [r for r in d.get("ocmr", []) if r.get("run") == a.cine_run]
+    ev = [r for r in d.get("eval", []) if r.get("group") != "synthetic"]
+    po = d.get("poles", [])
+    us = [r for r in d.get("ocmr_us", []) if r["recon"] == "tv"]
+    cals = sorted({r["cal"] for r in po})
+
+    def static(key):
+        return ("Static\nR = 4", {m: med([r[key] for r in pr if r["maps"] == k]) for k, m in M3})
+
+    def cine(key, R, recon="tv", f=lambda x: x):
+        return (f"Cine\nR = {R:g}", {m: med([f(r[key]) for r in oc if r["maps"] == k and r["R"] == R
+                                              and r["recon"] == recon]) for k, m in MC})
+
+    fig = plt.figure(figsize=(7.2, 9.4))
+    gsm = GridSpec(4, 3, figure=fig, height_ratios=[1.1, 1, 1, 1])
+    axs = [fig.add_subplot(gsm[0, :])] + [fig.add_subplot(gsm[1 + i // 3, i % 3]) for i in range(8)]
+    nc = {r["case"]: r for r in d.get("extra", {}).get("r4_noncart", [])}
+    g = [static("nrmse"), cine("nrmse", 4.0), cine("nrmse", 8.0)]
+    g += [(f"Brain\n{c}×{c}", {m: med([r["sense_nrmse"] for r in po if r["maps"] == k and r["cal"] == c])
+                               for k, m in MB}) for c in cals]
+    g += [(f"{k[:6].capitalize()}\n(sim.)", {"true": nc[f"synth_{k}"]["nrmse_true_tv"],
+                                             "pinn": nc[f"synth_{k}"]["nrmse_pinn_tv"]})
+          for k in ("radial", "spiral") if f"synth_{k}" in nc]
+    bars(axs[0], g, "Image NRMSE ↓ (static: TGV + phase; cine: TV; brain: SENSE; simulations: TV)", "median NRMSE")
+    bars(axs[1], [static("ssim"), cine("ssim", 4.0), cine("ssim", 8.0)], "SSIM ↑", "median SSIM")
+    axs[1].set_ylim(0.8, 1.0)
+    bars(axs[2], [static("psnr"), cine("psnr", 4.0), cine("psnr", 8.0)], "PSNR ↑", "median PSNR (dB)", "{:.1f}")
+    bars(axs[3], [cine("dyn_nrmse", 4.0), cine("dyn_nrmse", 8.0)], "Temporal NRMSE (frame − mean) ↓",
+         "median NRMSE")
+    ex = lambda x: x - 1  # noqa: E731
+    lco = [("Static\nR = 4", {m: med([r["lco_outside_acs_over_floor"] - 1 for r in ev if r["method"] == k])
+                                for k, m in M3}),
+           ("Cine, fully\nsampled", {m: med([r["lco_outside_over_floor"] - 1 for r in oc if r["maps"] == k
+                                              and r["R"] == 1.0 and r.get("lco_outside_over_floor") is not None])
+                                      for k, m in MC})]
+    lco += [(f"Brain\n{c}×{c}", {m: med([r["lco_object"] - 1 for r in po if r["maps"] == k and r["cal"] == c])
+                                 for k, m in MB}) for c in cals]
+    bars(axs[4], lco, "Leave-one-coil-out error above noise ↓", "median (error / noise − 1)", log=True)
+    sg = [(f"R = {R}", {m: med([r[f"sense_R{R}_support_nrmse_vs_rss_or_truth"] for r in ev if r["method"] == k])
+                        for k, m in M3}) for R in (2, 4, 8)]
+    bars(axs[5], sg, "Static: SENSE (Tikhonov) NRMSE ↓", "median NRMSE")
+    gf = [(f"R = {R}", {m: med([r[f"gfactor_R{R}_mean"] for r in ev if r["method"] == k]) for k, m in M3})
+          for R in (2, 4, 8)]
+    bars(axs[6], gf, "Static: mean g-factor ↓", "median of slice means", "{:.2f}")
+    files = sorted({r["file"] for r in us})
+    bars(axs[7], [(f"cine {i + 1}", {m: next((r["heldout"] for r in us if r["file"] == f and r["maps"] == k), None)
+                                     for k, m in MC}) for i, f in enumerate(files)],
+         "Prospective (R ≈ 9): withheld lines ↓", "error / noise", "{:.2f}", log=True, ref_line=1)
+    def count(k, c):
+        rr = [r["gauge_poles"] for r in po if r["maps"] == k and r["cal"] == c]
+        return float(sum(rr)) if rr else None
+
+    pg = [(f"{c}×{c}", {m: count(k, c) for k, m in (("espirit", "espirit"), ("nlinv", "nlinv"), ("pinn_v59", "pinn"))})
+          for c in cals]
+    bars(axs[8], pg, "Brain: phase singularities ↓\n(NLINV without correction)", "count over 3 planes", "{:.0f}")
+    axs[8].set_xlabel("calibration region", fontsize=6.5)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=COL[k]) for k in ("espirit", "nlinv", "pinn")]
+    handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="white", edgecolor="0.3", hatch="////"))
+    fig.legend(handles, ["ESPIRiT", "NLINV (brain: with pole correction, except singularities)", "Proposed",
+                         "True sensitivities"], loc="upper center", ncol=4, fontsize=6.5, bbox_to_anchor=(0.5, 1.01))
+    fig.tight_layout(rect=(0, 0, 1, 0.98), h_pad=1.0, w_pad=0.8)
+    save(fig, a.out, "fig5_metrics")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default="dashboard_data.json")
@@ -317,7 +414,7 @@ def main():
     a = ap.parse_args()
     d = json.load(open(a.data))
     for n in a.figs:
-        {"2": fig2, "3": fig3, "4": fig4}[n](d, a)
+        {"2": fig2, "3": fig3, "4": fig4, "5": fig5}[n](d, a)
 
 
 if __name__ == "__main__":
