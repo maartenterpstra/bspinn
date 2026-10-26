@@ -100,6 +100,10 @@ def gauge_fix(C, mask):
     return C * np.exp(-1j * np.angle(s[mask].sum()))
 
 
+def normalise(C):
+    return C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)), 1e-12)
+
+
 def montage(maps, coils, rows=2):
     """(N,X,Y) -> one image of the chosen coils on a rows x cols grid."""
     tiles = [maps[c] for c in coils]
@@ -135,9 +139,13 @@ def fig2(d, a):
     cases = [c for c in cases if os.path.exists(os.path.join(a.eval, c, "figures.npz"))]
     if not cases:
         print(f"fig2: no <case>/figures.npz in {a.eval}: skipped"); return
+    from cine_gif import align
     methods = (("espirit", "espirit"), ("nlinv", "nlinv"), (a.pinn_key, "pinn"))
-    fig = plt.figure(figsize=(7.2, 3.7 * len(cases)))
-    outer = GridSpec(len(cases), 1, figure=fig, hspace=0.1)
+    title = {"combined": "coil-combined", "sense_R4": "SENSE, R = 4"}[a.static_image]
+    row_lab = ["", f"Error ×{a.err_gain:g}", f"Difference to\nproposed ×{a.err_gain:g}", None,
+               f"Map difference\nto proposed\n(0–{a.map_vmax:g})"]
+    fig = plt.figure(figsize=(7.2, 8.6 * len(cases)))
+    outer = GridSpec(len(cases), 1, figure=fig, hspace=0.06)
     for i, case in enumerate(cases):
         f = np.load(os.path.join(a.eval, case, "figures.npz"))
         obj = f["object"].astype(bool)
@@ -145,30 +153,61 @@ def fig2(d, a):
         ref = np.abs(f["reference"])
         box = crop_box(sup)
         vmax = np.percentile(ref[obj], 99.5)
-        g = GridSpecFromSubplotSpec(2, 4, outer[i], hspace=0.04, wspace=0.03)
+        g = GridSpecFromSubplotSpec(5, 4, outer[i], hspace=0.04, wspace=0.03)
         ax = fig.add_subplot(g[0, 0])
         gray(ax, ref[box], vmax, "Fully sampled (RSS)" if i == 0 else None)
         ax.text(0.03, 0.97, "ABCDEFGH"[i], transform=ax.transAxes, color="white", fontweight="bold", va="top")
-        phase_wheel(fig.add_subplot(GridSpecFromSubplotSpec(3, 3, g[1, 0])[1, 1]))
-        title = {"combined": "coil-combined", "sense_R4": "SENSE, R = 4"}[a.static_image]
-        for j, (key, m) in enumerate(methods):
-            img_key = f"{key}/{a.static_image}"
-            if img_key not in f.files:
-                print(f"fig2: {case}: {img_key} missing"); continue
-            x = fit_scale(f[img_key], ref, obj)
-            ax = fig.add_subplot(g[0, j + 1])
-            gray(ax, x[box], vmax, f"{LAB[m]}, {title}" if i == 0 else None)
-            if a.static_image == "sense_R4" or a.show_nrmse:
-                e = np.linalg.norm((x - ref)[obj]) / np.linalg.norm(ref[obj])
-                ax.text(0.03, 0.03, f"NRMSE {e:.3f}", transform=ax.transAxes, color="white", fontsize=6)
+        for r in (1, 2, 4):
+            ax = fig.add_subplot(g[r, 0]); ax.axis("off")
+            ax.text(0.5, 0.5, row_lab[r], ha="center", va="center", fontsize=7, color="0.3", transform=ax.transAxes)
+        phase_wheel(fig.add_subplot(GridSpecFromSubplotSpec(3, 3, g[3, 0])[1, 1]))
+        xs, Cs = {}, {}
+        for key, m in methods:
+            if f"{key}/{a.static_image}" in f.files:
+                xs[m] = fit_scale(f[f"{key}/{a.static_image}"], ref, obj)
+            else:
+                print(f"fig2: {case}: {key}/{a.static_image} missing")
             if f"{key}/maps" in f.files:
-                C = gauge_fix(f[f"{key}/maps"][:, box[0], box[1]], sup[box])
-                coils = a.coils if a.coils else list(range(min(4, C.shape[0])))
-                mk = montage(np.repeat(sup[box][None].astype(complex), C.shape[0], 0), coils).real > 0
-                ax = fig.add_subplot(g[1, j + 1])
-                ax.imshow(complex_rgb(montage(C, coils), 1.0, mk), interpolation="nearest"); bare(ax)
+                Cs[m] = f[f"{key}/maps"][:, box[0], box[1]]
+        P = Cs.get("pinn")
+        if P is not None:
+            P = gauge_fix(P, sup[box])
+        coils = a.coils if a.coils else list(range(min(4, next(iter(Cs.values())).shape[0]) if Cs else 0))
+        mk = sup[box]
+        for j, (key, m) in enumerate(methods):
+            col = j + 1
+            if m in xs:
+                x = xs[m]
+                ax = fig.add_subplot(g[0, col]); gray(ax, x[box], vmax, f"{LAB[m]}, {title}" if i == 0 else None)
+                e = np.linalg.norm((x - ref)[obj]) / np.linalg.norm(ref[obj])
+                ax = fig.add_subplot(g[1, col]); gray(ax, (np.abs(x - ref) * obj)[box] * a.err_gain, vmax)
+                ax.text(0.03, 0.03, f"NRMSE {e:.3f}", transform=ax.transAxes, color="white", fontsize=6)
+                ax = fig.add_subplot(g[2, col])
+                if m == "pinn" or "pinn" not in xs:
+                    ax.axis("off")
+                else:
+                    dd = np.linalg.norm((x - xs["pinn"])[obj]) / np.linalg.norm(ref[obj])
+                    gray(ax, (np.abs(x - xs["pinn"]) * obj)[box] * a.err_gain, vmax)
+                    ax.text(0.03, 0.03, f"{dd:.3f}", transform=ax.transAxes, color="white", fontsize=6)
+            if m in Cs:
+                C = Cs[m]
+                if P is not None:
+                    C, dmap = align(normalise(C), normalise(P))
+                else:
+                    C, dmap = gauge_fix(C, mk), None
+                tiles = montage(C, coils)
+                tm = montage(np.repeat(mk[None].astype(complex), C.shape[0], 0), coils).real > 0
+                ax = fig.add_subplot(g[3, col])
+                ax.imshow(complex_rgb(tiles, 1.0, tm), interpolation="nearest"); bare(ax)
                 if j == 0:
                     ax.set_ylabel(f"coil maps {', '.join(str(c + 1) for c in coils)}", fontsize=6.5)
+                ax = fig.add_subplot(g[4, col])
+                if dmap is None or m == "pinn":
+                    ax.axis("off")
+                else:
+                    ax.imshow((dmap * mk), cmap="magma", vmin=0, vmax=a.map_vmax, interpolation="nearest"); bare(ax)
+                    ax.text(0.03, 0.03, f"mean {dmap[obj[box]].mean():.3f}", transform=ax.transAxes, color="white",
+                            fontsize=6)
     save(fig, a.out, "fig2_static")
 
 
@@ -397,6 +436,8 @@ def main():
     ap.add_argument("--cases", nargs="*", default=None, help="static slices to show (default: 2 near the median)")
     ap.add_argument("--static-image", default="combined", choices=["combined", "sense_R4"],
                     help="combined: fully sampled data combined with each method's maps; sense_R4: SENSE at R = 4")
+    ap.add_argument("--err-gain", type=float, default=5.0, help="image errors and differences shown this much brighter")
+    ap.add_argument("--map-vmax", type=float, default=0.3, help="colour range of the map-difference panels")
     ap.add_argument("--show-nrmse", action="store_true", help="NRMSE on the coil-combined images too")
     ap.add_argument("--static-prior", default="tgv_phase_auto")
     ap.add_argument("--coils", type=int, nargs="*", default=None, help="coils to show, 0-based (default 0 1 2 3)")
