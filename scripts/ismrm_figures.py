@@ -29,6 +29,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import matplotlib  # noqa: E402
 
@@ -126,60 +127,124 @@ def phase_wheel(ax):
 
 
 # ------------------------------------------------------------------------------------- Fig. 2: static slices
+STATIC_METHODS = ("espirit", "nlinv", "pinn")
+
+
+def static_from_npz(path, image_key, pinn_key):
+    """One slice from evaluate_methods.py's figures.npz: the stored R = 4 SENSE or fully sampled combination."""
+    f = np.load(path)
+    obj = f["object"].astype(bool)
+    out = {"obj": obj, "sup": f["support"].astype(bool) if "support" in f.files else obj,
+           "ref": np.abs(f["reference"]), "x": {}, "C": {}}
+    for key, m in (("espirit", "espirit"), ("nlinv", "nlinv"), (pinn_key, "pinn")):
+        if f"{key}/{image_key}" in f.files:
+            out["x"][m] = np.abs(f[f"{key}/{image_key}"])
+        if f"{key}/maps" in f.files:
+            out["C"][m] = f[f"{key}/maps"]
+    return out
+
+
+def static_live(a, index, R):
+    """One dataset item undersampled at R (the benchmark's variable-density mask, 24 ACS lines); maps estimated
+    on it (or read from the maps cache of the benchmark, <maps-cache>/item<i>_j<R>/maps) and the image
+    reconstructed with --recon. Needs the dataloader and, for new R, a GPU."""
+    from functools import partial
+    import evaluate_methods as evm
+    from method_lab import parse_set, undersampled
+    from prior_eval import PRIOR_METHODS
+    from scipy.ndimage import binary_dilation
+    from zs_ssl import band_limit
+    from bspinn import evaluation as ev, methods as bm
+    from bspinn.api import acquired_extent, sense_image
+    from bspinn.prior import AUTO_SCALE, prior_image
+    bm.ESTIMATORS[a.pinn_key] = partial(bm.pinn_api, pinn_options=parse_set(a.pinn_set))
+    bm._PASS[a.pinn_key] = bm._PASS["pinn_api"]
+    case0 = next(evm.loader_cases(a.loader, a.base_folder, [index], 1, 0, a.key, a.coil_axis, 24, None, None))()
+    obj = ev.object_mask(case0)
+    sup = binary_dilation(obj, iterations=3)
+    ext = acquired_extent(case0.sampled)
+    ref = np.sqrt((np.abs(ev.ifft2c(case0.ksp * case0.sampled[None])) ** 2).sum(0))
+    fit = undersampled(case0, R)
+    fit.name = f"{case0.name}_j{R:g}"
+    cdir = os.path.join(a.maps_cache or a.eval or "runs/fig2_maps", fit.name, "maps")
+    est_kw = {"threads": 1, "cfg_overrides": {}, "device": a.device, "quality": "default"}
+    out = {"obj": obj, "sup": sup, "ref": ref, "x": {}, "C": {}, "R_eff": float(case0.sampled.sum() / fit.sampled.sum())}
+    for key, m in (("espirit", "espirit"), ("nlinv", "nlinv"), (a.pinn_key, "pinn")):
+        try:
+            C = bm.estimate(fit, [key], cache_dir=cdir, log=print, **est_kw)[0][key]
+        except Exception as e:          # noqa: BLE001  (e.g. BART missing: show the other methods)
+            print(f"fig2: item{index} R = {R:g} {key} failed ({type(e).__name__}: {e}); left out", flush=True)
+            continue
+        Cn = ev.normalise(C)
+        if a.recon == "tikhonov":
+            x = sense_image(fit.ksp, Cn, "2d", mask=fit.sampled, lam="auto", device=a.device, prior=None)
+        else:
+            pr = PRIOR_METHODS[a.recon]
+            pr, pkw = pr if isinstance(pr, tuple) else (pr, {})
+            x = prior_image(fit.ksp, Cn, fit.sampled, pr, "auto", device=a.device, scale=AUTO_SCALE,
+                            grid=np.logspace(-4, -1, 10), iters=50, cg_iters=5, **pkw)
+        out["x"][m] = np.abs(band_limit(x, ext))
+        out["C"][m] = Cn.astype(np.complex64)
+        print(f"fig2: item{index} R = {R:g} {m}: done", flush=True)
+    return out
+
+
 def fig2(d, a):
-    if not a.eval:
-        print("fig2: --eval not given: skipped"); return
-    prior = [r for r in d.get("prior", []) if r["method"] == a.static_prior and r["maps"] == a.pinn_key]
-    by = {r["case"]: r["nrmse"] for r in prior}
-    cases = a.cases
-    if not cases:
-        m = med(list(by.values()))
-        cases = [c for c in sorted(by, key=lambda c: abs(by[c] - m))
-                 if os.path.exists(os.path.join(a.eval, c, "figures.npz"))][:2]
-    cases = [c for c in cases if os.path.exists(os.path.join(a.eval, c, "figures.npz"))]
-    if not cases:
-        print(f"fig2: no <case>/figures.npz in {a.eval}: skipped"); return
+    """Rows per slice: images, error x gain, difference to the proposed image x gain, coil maps (gauge-aligned to
+    the proposed maps), map difference to the proposed maps."""
     from cine_gif import align
-    methods = (("espirit", "espirit"), ("nlinv", "nlinv"), (a.pinn_key, "pinn"))
-    title = {"combined": "coil-combined", "sense_R4": "SENSE, R = 4"}[a.static_image]
+    slices = []                       # (name, data, image title)
+    if a.loader:
+        for idx in a.index:
+            for R in a.R_static:
+                rt = {"tikhonov": "SENSE", "tv": "TV", "tgv_phase_auto": "TGV + phase"}.get(a.recon, a.recon)
+                slices.append((f"item{idx}, R = {R:g}", static_live(a, idx, R), f"R = {R:g}, {rt}"))
+    else:
+        if not a.eval:
+            print("fig2: give --eval (stored R = 4 results) or --loader with --index and --R-static: skipped"); return
+        prior = [r for r in d.get("prior", []) if r["method"] == a.static_prior and r["maps"] == a.pinn_key]
+        by = {r["case"]: r["nrmse"] for r in prior}
+        cases = a.cases
+        if not cases:
+            m = med(list(by.values()))
+            cases = [c for c in sorted(by, key=lambda c: abs(by[c] - m))
+                     if os.path.exists(os.path.join(a.eval, c, "figures.npz"))][:1]
+        for c in cases:
+            p = os.path.join(a.eval, c, "figures.npz")
+            if os.path.exists(p):
+                slices.append((c, static_from_npz(p, a.static_image, a.pinn_key),
+                               {"combined": "coil-combined", "sense_R4": "R = 4, SENSE"}[a.static_image]))
+            else:
+                print(f"fig2: {p} not found")
+    if not slices:
+        print("fig2: nothing to show"); return
     row_lab = ["", f"Error ×{a.err_gain:g}", f"Difference to\nproposed ×{a.err_gain:g}", None,
                f"Map difference\nto proposed\n(0–{a.map_vmax:g})"]
-    fig = plt.figure(figsize=(7.2, 8.6 * len(cases)))
-    outer = GridSpec(len(cases), 1, figure=fig, hspace=0.06)
-    for i, case in enumerate(cases):
-        f = np.load(os.path.join(a.eval, case, "figures.npz"))
-        obj = f["object"].astype(bool)
-        sup = f["support"].astype(bool) if "support" in f.files else obj
-        ref = np.abs(f["reference"])
+    fig = plt.figure(figsize=(7.2, 8.6 * len(slices)))
+    outer = GridSpec(len(slices), 1, figure=fig, hspace=0.06)
+    for i, (name, s_, title) in enumerate(slices):
+        obj, sup, ref = s_["obj"], s_["sup"], s_["ref"]
         box = crop_box(sup)
+        mk = sup[box]
         vmax = np.percentile(ref[obj], 99.5)
         g = GridSpecFromSubplotSpec(5, 4, outer[i], hspace=0.04, wspace=0.03)
         ax = fig.add_subplot(g[0, 0])
-        gray(ax, ref[box], vmax, "Fully sampled (RSS)" if i == 0 else None)
-        ax.text(0.03, 0.97, "ABCDEFGH"[i], transform=ax.transAxes, color="white", fontweight="bold", va="top")
+        gray(ax, ref[box], vmax, "Fully sampled (RSS)")
+        ax.set_ylabel(name, fontsize=7)
         for r in (1, 2, 4):
             ax = fig.add_subplot(g[r, 0]); ax.axis("off")
             ax.text(0.5, 0.5, row_lab[r], ha="center", va="center", fontsize=7, color="0.3", transform=ax.transAxes)
         phase_wheel(fig.add_subplot(GridSpecFromSubplotSpec(3, 3, g[3, 0])[1, 1]))
-        xs, Cs = {}, {}
-        for key, m in methods:
-            if f"{key}/{a.static_image}" in f.files:
-                xs[m] = fit_scale(f[f"{key}/{a.static_image}"], ref, obj)
-            else:
-                print(f"fig2: {case}: {key}/{a.static_image} missing")
-            if f"{key}/maps" in f.files:
-                Cs[m] = f[f"{key}/maps"][:, box[0], box[1]]
-        P = Cs.get("pinn")
-        if P is not None:
-            P = gauge_fix(P, sup[box])
-        coils = a.coils if a.coils else list(range(min(4, next(iter(Cs.values())).shape[0]) if Cs else 0))
-        mk = sup[box]
-        for j, (key, m) in enumerate(methods):
+        xs = {m: fit_scale(x, ref, obj) for m, x in s_["x"].items()}
+        Cs = {m: normalise(C[:, box[0], box[1]]) for m, C in s_["C"].items()}
+        P = gauge_fix(Cs["pinn"], mk) if "pinn" in Cs else None
+        coils = a.coils if a.coils else list(range(min(4, next(iter(Cs.values())).shape[0]))) if Cs else []
+        for j, m in enumerate(STATIC_METHODS):
             col = j + 1
             if m in xs:
                 x = xs[m]
-                ax = fig.add_subplot(g[0, col]); gray(ax, x[box], vmax, f"{LAB[m]}, {title}" if i == 0 else None)
                 e = np.linalg.norm((x - ref)[obj]) / np.linalg.norm(ref[obj])
+                ax = fig.add_subplot(g[0, col]); gray(ax, x[box], vmax, f"{LAB[m]}, {title}")
                 ax = fig.add_subplot(g[1, col]); gray(ax, (np.abs(x - ref) * obj)[box] * a.err_gain, vmax)
                 ax.text(0.03, 0.03, f"NRMSE {e:.3f}", transform=ax.transAxes, color="white", fontsize=6)
                 ax = fig.add_subplot(g[2, col])
@@ -190,25 +255,21 @@ def fig2(d, a):
                     gray(ax, (np.abs(x - xs["pinn"]) * obj)[box] * a.err_gain, vmax)
                     ax.text(0.03, 0.03, f"{dd:.3f}", transform=ax.transAxes, color="white", fontsize=6)
             if m in Cs:
-                C = Cs[m]
-                if P is not None:
-                    C, dmap = align(normalise(C), normalise(P))
-                else:
-                    C, dmap = gauge_fix(C, mk), None
-                tiles = montage(C, coils)
+                C, dmap = align(Cs[m], P) if P is not None else (gauge_fix(Cs[m], mk), None)
                 tm = montage(np.repeat(mk[None].astype(complex), C.shape[0], 0), coils).real > 0
                 ax = fig.add_subplot(g[3, col])
-                ax.imshow(complex_rgb(tiles, 1.0, tm), interpolation="nearest"); bare(ax)
+                ax.imshow(complex_rgb(montage(C, coils), 1.0, tm), interpolation="nearest"); bare(ax)
                 if j == 0:
                     ax.set_ylabel(f"coil maps {', '.join(str(c + 1) for c in coils)}", fontsize=6.5)
                 ax = fig.add_subplot(g[4, col])
                 if dmap is None or m == "pinn":
                     ax.axis("off")
                 else:
-                    ax.imshow((dmap * mk), cmap="magma", vmin=0, vmax=a.map_vmax, interpolation="nearest"); bare(ax)
+                    ax.imshow(dmap * mk, cmap="magma", vmin=0, vmax=a.map_vmax, interpolation="nearest"); bare(ax)
                     ax.text(0.03, 0.03, f"mean {dmap[obj[box]].mean():.3f}", transform=ax.transAxes, color="white",
                             fontsize=6)
-    save(fig, a.out, "fig2_static")
+    tag = "_".join(n.replace(", R = ", "_R").replace(" ", "") for n, _, _ in slices) if a.loader else "static"
+    save(fig, a.out, f"fig2_{tag}" if a.loader else "fig2_static")
 
 
 # ------------------------------------------------------------------------------------- Fig. 3: cine (GIF)
@@ -433,6 +494,18 @@ def main():
     ap.add_argument("--figs", nargs="+", default=["2", "3", "4"])
     ap.add_argument("--pinn-key", default="pinn_v59", help="name of the proposed maps in the static results")
     ap.add_argument("--eval", default=None, help="evaluate_methods.py output folder (runs/eval_v59)")
+    g2 = ap.add_argument_group("fig 2 at any case and R (reconstructs; needs the dataloader, a GPU for new R)")
+    g2.add_argument("--loader", default=None, metavar="MODULE:FUNCTION", help="e.g. dataloader_v2:get_dataloader")
+    g2.add_argument("--base-folder", default=None)
+    g2.add_argument("--index", type=int, nargs="+", default=[], help="dataset item(s), e.g. 1066 for item1066")
+    g2.add_argument("--R-static", type=float, nargs="+", default=[4.0], help="undersampling factor(s)")
+    g2.add_argument("--recon", default="tgv_phase_auto", choices=["tikhonov", "tv", "tgv", "tgv_phase_auto", "tv_phase_auto"])
+    g2.add_argument("--maps-cache", default=None, help="maps cache root (default: --eval, so the benchmark's R = 4 "
+                    "maps are reused; other R are fitted and stored there as item<i>_j<R>/maps)")
+    g2.add_argument("--pinn-set", nargs="*", default=["solve_image=true"], help="options of the proposed maps (run_v59)")
+    g2.add_argument("--key", default="kspace")
+    g2.add_argument("--coil-axis", type=int, default=0)
+    g2.add_argument("--device", default="cuda")
     ap.add_argument("--cases", nargs="*", default=None, help="static slices to show (default: 2 near the median)")
     ap.add_argument("--static-image", default="combined", choices=["combined", "sense_R4"],
                     help="combined: fully sampled data combined with each method's maps; sense_R4: SENSE at R = 4")
