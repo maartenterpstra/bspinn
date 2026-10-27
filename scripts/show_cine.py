@@ -23,6 +23,21 @@ def complex_to_rgb(z, vmax=1.0, mask=None, saturation=0.85):
     return rgb * mask[..., None] if mask is not None else rgb
 
 
+def phase_wheel(ax, fontsize=10, n=101):
+    """Legend of complex_to_rgb: phase around the circle, magnitude from the centre (0) to the rim (1)."""
+    yy, xx = np.mgrid[-1:1:n * 1j, -1:1:n * 1j]
+    w = (xx + 1j * yy) * (np.abs(xx + 1j * yy) <= 1)
+    ax.imshow(complex_to_rgb(w, 1.0), origin="lower")
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_visible(False)
+    ax.set_title("hue: phase\nbrightness: magnitude", fontsize=fontsize * 0.8, pad=fontsize * 1.4)
+    for ang, txt, ha, va in ((0, "0", "left", "center"), (np.pi / 2, "π/2", "center", "bottom"),
+                             (np.pi, "±π", "right", "center"), (-np.pi / 2, "−π/2", "center", "top")):
+        ax.text((n - 1) / 2 * (1 + 1.08 * np.cos(ang)), (n - 1) / 2 * (1 + 1.08 * np.sin(ang)), txt,
+                fontsize=fontsize * 0.7, ha=ha, va=va, color="0.25")
+
+
 def rss_normalise(C, eps=1e-12):
     return C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)), eps)
 
@@ -108,6 +123,9 @@ def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="
                     lambda t: base[..., t][box]))
         for r in range(1, nr):
             axs[r, 0].axis("off")
+        if channels:                                      # colour legend for the coil maps, in the first map row
+            axw = axs[1 + de, 0].inset_axes([0.22, 0.06, 0.56, 0.56])
+            phase_wheel(axw, fs)
         c0 = 1
     for j, k in enumerate(methods):
         c = c0 + j
@@ -140,7 +158,8 @@ def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="
     def draw(t):
         for im, f in upd:
             im.set_data(f(t))
-        lab.set_text(f"frame {t + 1}/{T}   coil maps: hue = phase, brightness = magnitude (RSS-normalised)")
+        lab.set_text(f"frame {t + 1}/{T}" + ("" if ref is not None else
+                                             "   coil maps: hue = phase, brightness = magnitude (RSS-normalised)"))
         return [im for im, _ in upd] + [lab]
 
     anim = FuncAnimation(fig, draw, frames=T, interval=1000 / fps, blit=False)
