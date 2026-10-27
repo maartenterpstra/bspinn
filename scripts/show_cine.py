@@ -38,6 +38,17 @@ def phase_wheel(ax, fontsize=10, n=101):
                 fontsize=fontsize * 0.7, ha=ha, va=va, color="0.25")
 
 
+def _writer(path, fps):
+    """GIF (Pillow) or MP4 / MOV / MKV (ffmpeg, H.264, padded to even pixel sizes) by the file extension."""
+    if path.lower().endswith(".gif"):
+        return PillowWriter(fps=fps)
+    from matplotlib.animation import FFMpegWriter
+    if not FFMpegWriter.isAvailable():
+        raise RuntimeError("ffmpeg not found: install it (e.g. conda install ffmpeg / apt install ffmpeg) or save as .gif")
+    return FFMpegWriter(fps=fps, codec="libx264", bitrate=-1,
+                        extra_args=["-pix_fmt", "yuv420p", "-crf", "18", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"])
+
+
 def rss_normalise(C, eps=1e-12):
     return C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)), eps)
 
@@ -71,6 +82,7 @@ def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="
                every relative phase, phase singularities included); 'pixel' = the per-pixel common phase
                removed relative to ``align_to`` (default: the last method), so identical maps look identical;
                None = as given.
+    out      : file name; .gif (Pillow) or .mp4 (ffmpeg, H.264); None = only return the animation.
     crop     : (slice, slice) to zoom, e.g. (slice(40, 150), slice(20, 130)).
     titles   : optional {method key: column title}; keys not in it keep their name. ref_title: the reference column.
     fontsize : titles and row labels (default 10); the NRMSE (on the reconstruction, bottom left) and the frame
@@ -164,7 +176,7 @@ def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="
 
     anim = FuncAnimation(fig, draw, frames=T, interval=1000 / fps, blit=False)
     if out:
-        anim.save(out, writer=PillowWriter(fps=fps), dpi=dpi)
+        anim.save(out, writer=_writer(out, fps), dpi=dpi)
         if frame_png:
             draw(T // 3)
             fig.savefig(out.rsplit(".", 1)[0] + "_frame.png", dpi=300, bbox_inches="tight", facecolor="white")
