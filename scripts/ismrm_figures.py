@@ -383,51 +383,43 @@ def fig3(d, a):
     save(fig, a.out, "fig3_cine_frame")
 
 
-# ------------------------------------------------------------------------------------- Fig. 4: one graph
+# ------------------------------------------------------------------------------------- Fig. 4: quantitative results
 def fig4(d, a):
-    groups = []                                     # (label, {method: median NRMSE})
+    """The numbers of the Results section: (A) image NRMSE, static (TGV + phase) and cine (TV); (B) LOCO excess,
+    static; (C) mean g-factor, static, R = 2/4/8; (D) prospective cines, error on withheld lines / noise."""
+    M3 = (("espirit", "espirit"), ("nlinv", "nlinv"), (a.pinn_key, "pinn"))
+    MC = (("espirit", "espirit"), ("nlinv", "nlinv"), ("pinn_avg", "pinn"))
     pr = [r for r in d.get("prior", []) if r["method"] == a.static_prior]
-    groups.append((f"Static\nR = 4, n = {len({r['case'] for r in pr})}",
-                   {m: med([r["nrmse"] for r in pr if r["maps"] == k])
-                    for k, m in (("espirit", "espirit"), ("nlinv", "nlinv"), (a.pinn_key, "pinn"))}))
     oc = [r for r in d.get("ocmr", []) if r.get("run") == a.cine_run and r["recon"] == "tv"]
+    ev = [r for r in d.get("eval", []) if r.get("group") != "synthetic"]
+    us = [r for r in d.get("ocmr_us", []) if r["recon"] == "tv"]
+    fig, axs = plt.subplots(2, 2, figsize=(7.2, 5.0))
+    axs = axs.ravel()
+    g = [(f"Static\nR = 4 (n = {len({r['case'] for r in pr})})",
+          {m: med([r["nrmse"] for r in pr if r["maps"] == k]) for k, m in M3})]
     for R in (4.0, 8.0):
-        n = len({r["file"] for r in oc if r["R"] == R})
-        groups.append((f"Cine\nR = {R:g}, n = {n}",
-                       {m: med([r["nrmse"] for r in oc if r["maps"] == k and r["R"] == R])
-                        for k, m in (("espirit", "espirit"), ("nlinv", "nlinv"), ("pinn_avg", "pinn"))}))
-    po = d.get("poles", [])
-    for cal in sorted({r["cal"] for r in po}):
-        groups.append((f"Brain\n{cal}×{cal} calib.",
-                       {m: med([r["sense_nrmse"] for r in po if r["maps"] == k and r["cal"] == cal])
-                        for k, m in (("espirit", "espirit"), ("nlinv_pp", "nlinv"), ("pinn_v59", "pinn"))}))
-    nc = {r["case"]: r for r in d.get("extra", {}).get("r4_noncart", [])}
-    for k in ("radial", "spiral"):
-        r = nc.get(f"synth_{k}")
-        if r:
-            groups.append((f"{k.capitalize()}\n(simulated)", {"true": r["nrmse_true_tv"], "pinn": r["nrmse_pinn_tv"]}))
-
-    fig, ax = plt.subplots(figsize=(7.2, 2.7))
-    w = 0.27
-    for gi, (lab, v) in enumerate(groups):
-        ks = [k for k in ("espirit", "nlinv", "true", "pinn") if k in v and np.isfinite(v[k])]
-        for i, k in enumerate(ks):
-            x, y = gi + (i - (len(ks) - 1) / 2) * w, v[k]
-            if k == "true":
-                ax.bar(x, y, w, facecolor="white", edgecolor="0.3", lw=0.6, hatch="////")
-            else:
-                ax.bar(x, y, w, color=COL[k])
-            ax.text(x, y + 0.004, f"{y:.3f}", ha="center", va="bottom", fontsize=5.5, rotation=90)
-    ax.set_xticks(range(len(groups)), [g[0] for g in groups], fontsize=6.3)
-    ax.set_ylabel("Median image NRMSE")
+        g.append((f"Cine\nR = {R:g} (n = {len({r['file'] for r in oc if r['R'] == R})})",
+                  {m: med([r["nrmse"] for r in oc if r["maps"] == k and r["R"] == R]) for k, m in MC}))
+    bars(axs[0], g, "Image NRMSE ↓", "median NRMSE")
+    cases = sorted({r["case"] for r in ev})
+    lco = {m: {r["case"]: r["lco_outside_acs_over_floor"] - 1 for r in ev if r["method"] == k} for k, m in M3}
+    win = sum(lco["pinn"][c] < lco["nlinv"][c] for c in cases if c in lco["pinn"] and c in lco["nlinv"])
+    bars(axs[1], [(f"Static, R = 4\nproposed better than\nNLINV in {win}/{len(cases)}",
+                   {m: med(list(v.values())) for m, v in lco.items()})],
+         "Leave-one-coil-out excess ↓", "median (error / noise floor − 1)", "{:.4f}")
+    bars(axs[2], [(f"R = {R}", {m: med([r[f"gfactor_R{R}_mean"] for r in ev if r["method"] == k]) for k, m in M3})
+                  for R in (2, 4, 8)], "Static: mean g-factor ↓", "median over slices", "{:.1f}")
+    files = sorted({r["file"] for r in us})
+    bars(axs[3], [(f"cine {i + 1}", {m: next((r["heldout"] for r in us if r["file"] == f and r["maps"] == k), None)
+                                     for k, m in MC}) for i, f in enumerate(files)],
+         "Prospective cines (R ≈ 9) ↓", "error on withheld lines / noise", "{:.2f}", log=True, ref_line=1)
+    for ax, l in zip(axs, "ABCD"):
+        ax.text(-0.02, 1.04, l, transform=ax.transAxes, fontweight="bold", fontsize=10, ha="right", va="bottom")
     handles = [plt.Rectangle((0, 0), 1, 1, color=COL[k]) for k in ("espirit", "nlinv", "pinn")]
-    labels = ["ESPIRiT", "NLINV (brain: with pole correction)", "Proposed"]
-    if any("true" in g[1] for g in groups):
-        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="white", edgecolor="0.3", hatch="////"))
-        labels.append("True sensitivities")
-    ax.legend(handles, labels, loc="lower center", ncol=4, bbox_to_anchor=(0.5, 1.0), fontsize=6.5)
-    ax.set_ylim(0, 1.2 * max(y for g in groups for y in g[1].values() if np.isfinite(y)))
-    save(fig, a.out, "fig4_summary")
+    fig.legend(handles, ["ESPIRiT", "NLINV", "Proposed"], loc="upper center", ncol=3, fontsize=7.5,
+               bbox_to_anchor=(0.5, 1.02))
+    fig.tight_layout(rect=(0, 0, 1, 0.96), h_pad=1.5, w_pad=1.2)
+    save(fig, a.out, "fig4_quantitative")
 
 
 # ------------------------------------------------------------------------------------- Fig. 5: every metric
