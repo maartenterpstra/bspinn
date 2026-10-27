@@ -27,17 +27,25 @@ def rss_normalise(C, eps=1e-12):
     return C / np.maximum(np.sqrt((np.abs(C) ** 2).sum(0, keepdims=True)), eps)
 
 
+def strongest_coils(csm, mask, n):
+    """Indices of the n coils with the most energy |C_j|^2 inside the mask, summed over frames and averaged over
+    methods (on RSS-normalised maps: each coil's share of the signal in that region)."""
+    e = np.mean([(np.abs(C[:, mask]) ** 2).sum(axis=tuple(range(1, C[:, mask].ndim))) for C in csm.values()], 0)
+    return [int(i) for i in np.argsort(e)[::-1][:n]]
+
+
 def _frames(C, T):
     """(coils, x, y) or (coils, x, y, T) -> (coils, x, y, T)."""
     C = np.asarray(C)
     return np.repeat(C[..., None], T, -1) if C.ndim == 3 else C
 
 
-def show_cine(data_dic, channels=(0,), out="cine.gif", ref=None, mask=None, phase="global", align_to=None,
+def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="global", align_to=None,
               fps=10, dpi=100, crop=None, panel=1.6, frame_png=True):
     """data_dic[method] = {'recon': (x, y, T), 'csm': (coils, x, y[, T])}; returns the figure.
 
-    channels : coil indices shown in rows 2.. (same channel for every method: the same physical coil).
+    channels : number of coils to show (default 3: the ones with the most energy inside ``mask``, averaged over
+               methods; printed), or a list of coil indices (the same channel for every method).
     ref      : optional fully sampled cine (x, y, T); every recon is then scaled to it (least squares in the mask)
                and it sets the common grey scale. Without it, every recon is scaled to the first method's.
     mask     : optional (x, y) bool; coil maps black outside (default: where the time-averaged image > 8 % of max).
@@ -65,6 +73,9 @@ def show_cine(data_dic, channels=(0,), out="cine.gif", ref=None, mask=None, phas
 
     # coil maps: RSS = 1, then the phase convention
     csm = {k: rss_normalise(_frames(data_dic[k]["csm"], T)) for k in methods}
+    if channels is None or isinstance(channels, (int, np.integer)):
+        channels = strongest_coils(csm, mask, 3 if channels is None else int(channels))
+        print(f"show_cine: coils {', '.join(str(c + 1) for c in channels)} (most energy inside the mask)")
     if phase == "global":
         for k in methods:
             csm[k] = csm[k] * np.exp(-1j * np.angle(csm[k].sum(0)[m3].sum()))
