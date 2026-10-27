@@ -41,13 +41,15 @@ def _frames(C, T):
 
 
 def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="global", align_to=None,
-              fps=10, dpi=100, crop=None, panel=1.6, frame_png=True):
+              fps=10, dpi=100, crop=None, panel=1.6, frame_png=True, err_gain=5.0):
     """data_dic[method] = {'recon': (x, y, T), 'csm': (coils, x, y[, T])}; returns the figure.
 
     channels : number of coils to show (default 3: the ones with the most energy inside ``mask``, averaged over
                methods; printed), or a list of coil indices (the same channel for every method).
-    ref      : optional fully sampled cine (x, y, T); every recon is then scaled to it (least squares in the mask)
-               and it sets the common grey scale. Without it, every recon is scaled to the first method's.
+    ref      : optional fully sampled cine (x, y, T); every recon is then scaled to it (least squares in the mask),
+               it sets the common grey scale, gets its own first column, and a second row shows
+               |recon - ref| x err_gain (inside the mask) with the NRMSE over the series in the column title.
+               Without it, every recon is scaled to the first method's and there is no error row.
     mask     : optional (x, y) bool; coil maps black outside (default: where the time-averaged image > 8 % of max).
     phase    : 'global' = one phase rotation per method (from the coil sum over all pixels and frames; keeps
                every relative phase, phase singularities included); 'pixel' = the per-pixel common phase
@@ -84,7 +86,8 @@ def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="
         for k in methods:
             csm[k] = csm[k] * np.exp(-1j * np.angle((csm[k] * P.conj()).sum(0)))[None]
 
-    nr, nc = 1 + len(channels), len(methods) + (1 if ref is not None else 0)
+    de = 1 if ref is not None else 0                      # an error row under the reconstructions
+    nr, nc = 1 + de + len(channels), len(methods) + (1 if ref is not None else 0)
     h = (box[0].stop or X) - (box[0].start or 0)
     w = (box[1].stop or Y) - (box[1].start or 0)
     fig, axs = plt.subplots(nr, nc, figsize=(panel * nc, panel * nr * h / w + 0.4), squeeze=False)
@@ -103,14 +106,23 @@ def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="
         c0 = 1
     for j, k in enumerate(methods):
         c = c0 + j
-        axs[0, c].set_title(k, fontsize=8)
+        title = k
+        if ref is not None:
+            e = np.linalg.norm((rec[k] - base)[m3]) / np.linalg.norm(base[m3])
+            title = f"{k}\nNRMSE {e:.3f}"
+            upd.append((axs[1, c].imshow((np.abs(rec[k][..., 0] - base[..., 0]) * mask)[box], cmap="gray", vmin=0,
+                                         vmax=gmax / err_gain),
+                        (lambda k: lambda t: (np.abs(rec[k][..., t] - base[..., t]) * mask)[box])(k)))
+        axs[0, c].set_title(title, fontsize=8)
         upd.append((axs[0, c].imshow(rec[k][..., 0][box], cmap="gray", vmin=0, vmax=gmax),
                     (lambda k: lambda t: rec[k][..., t][box])(k)))
-        for i, ch in enumerate(channels, start=1):
+        for i, ch in enumerate(channels, start=1 + de):
             upd.append((axs[i, c].imshow(complex_to_rgb(csm[k][ch, ..., 0][box], 1.0, mask[box])),
                         (lambda k, ch: lambda t: complex_to_rgb(csm[k][ch, ..., t][box], 1.0, mask[box]))(k, ch)))
     axs[0, c0].set_ylabel("Reconstruction", fontsize=8)
-    for i, ch in enumerate(channels, start=1):
+    if de:
+        axs[1, c0].set_ylabel(f"|error| ×{err_gain:g}", fontsize=8)
+    for i, ch in enumerate(channels, start=1 + de):
         axs[i, c0].set_ylabel(f"Coil {ch + 1}", fontsize=8)
     lab = fig.text(0.5, 0.005, "", ha="center", fontsize=7, color="0.3")
     fig.tight_layout(pad=0.2, h_pad=0.1, w_pad=0.1, rect=(0, 0.03, 1, 1))
