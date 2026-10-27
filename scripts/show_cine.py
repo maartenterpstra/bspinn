@@ -3,14 +3,13 @@ the first row, then one row per chosen coil channel (hue = phase, brightness = m
 
     from show_cine import show_cine
     data_dic = {"ESPIRiT": {"recon": x_esp, "csm": C_esp}, "NLINV": {...}, "Proposed": {...}}
-    show_cine(data_dic, channels=[0, 5, 12], out="cine.gif", ref=ref)
+    anim = show_cine(data_dic, channels=[0, 5, 12], out="cine.gif", ref=ref)
+
+In Jupyter, as the last line of the cell:  show_in_notebook(anim)    (or IPython.display.Image("cine.gif"))
 
 recon: (x, y, frames), complex or magnitude.  csm: (coils, x, y) time-averaged or (coils, x, y, frames).
 """
 import numpy as np
-import matplotlib
-
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.animation import FuncAnimation, PillowWriter  # noqa: E402
 from matplotlib.colors import hsv_to_rgb  # noqa: E402
@@ -111,9 +110,17 @@ def show_cine(data_dic, channels=(0,), out="cine.gif", ref=None, mask=None, phas
         lab.set_text(f"frame {t + 1}/{T}   coil maps: hue = phase, brightness = magnitude (RSS-normalised)")
         return [im for im, _ in upd] + [lab]
 
+    anim = FuncAnimation(fig, draw, frames=T, interval=1000 / fps, blit=False)
     if out:
-        FuncAnimation(fig, draw, frames=T, blit=False).save(out, writer=PillowWriter(fps=fps), dpi=dpi)
+        anim.save(out, writer=PillowWriter(fps=fps), dpi=dpi)
         if frame_png:
             draw(T // 3)
             fig.savefig(out.rsplit(".", 1)[0] + "_frame.png", dpi=300, bbox_inches="tight", facecolor="white")
-    return fig
+    plt.close(fig)                      # no static copy in a notebook; show the animation instead (see below)
+    return anim
+
+
+def show_in_notebook(anim):
+    """Jupyter: interactive player (play / pause / step) of the animation returned by show_cine."""
+    from IPython.display import HTML
+    return HTML(anim.to_jshtml())
