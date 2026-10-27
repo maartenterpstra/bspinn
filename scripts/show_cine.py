@@ -41,7 +41,8 @@ def _frames(C, T):
 
 
 def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="global", align_to=None,
-              fps=10, dpi=100, crop=None, panel=1.6, frame_png=True, err_gain=5.0):
+              fps=10, dpi=100, crop=None, panel=1.6, frame_png=True, err_gain=5.0, titles=None, fontsize=10,
+              ref_title="Fully sampled", nrmse_on_image=True):
     """data_dic[method] = {'recon': (x, y, T), 'csm': (coils, x, y[, T])}; returns the figure.
 
     channels : number of coils to show (default 3: the ones with the most energy inside ``mask``, averaged over
@@ -56,9 +57,13 @@ def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="
                removed relative to ``align_to`` (default: the last method), so identical maps look identical;
                None = as given.
     crop     : (slice, slice) to zoom, e.g. (slice(40, 150), slice(20, 130)).
+    titles   : optional {method key: column title}; keys not in it keep their name. ref_title: the reference column.
+    fontsize : titles and row labels (default 10); the NRMSE (on the reconstruction, bottom left) and the frame
+               counter are 85 % of it. nrmse_on_image=False puts the NRMSE in the title instead.
     Brightness: maps are RSS-normalised, so vmax = 1 for every panel; recon panels share one grey scale.
     """
     methods = list(data_dic)
+    fs = fontsize
     X, Y, T = np.asarray(data_dic[methods[0]]["recon"]).shape
     box = crop or (slice(None), slice(None))
 
@@ -98,7 +103,7 @@ def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="
     upd = []
     c0 = 0
     if ref is not None:                                   # first column: the fully sampled cine
-        axs[0, 0].set_title("Fully sampled", fontsize=8)
+        axs[0, 0].set_title(ref_title, fontsize=fs)
         upd.append((axs[0, 0].imshow(base[..., 0][box], cmap="gray", vmin=0, vmax=gmax),
                     lambda t: base[..., t][box]))
         for r in range(1, nr):
@@ -106,25 +111,30 @@ def show_cine(data_dic, channels=3, out="cine.gif", ref=None, mask=None, phase="
         c0 = 1
     for j, k in enumerate(methods):
         c = c0 + j
-        title = k
+        title = (titles or {}).get(k, k)
         if ref is not None:
             e = np.linalg.norm((rec[k] - base)[m3]) / np.linalg.norm(base[m3])
-            title = f"{k}\nNRMSE {e:.3f}"
+            if nrmse_on_image:
+                axs[0, c].text(0.03, 0.03, f"NRMSE {e:.3f}", transform=axs[0, c].transAxes, color="white",
+                               fontsize=fs * 0.85, va="bottom", ha="left",
+                               bbox=dict(facecolor="black", alpha=0.5, pad=1.5, edgecolor="none"))
+            else:
+                title = f"{title}\nNRMSE {e:.3f}"
             upd.append((axs[1, c].imshow((np.abs(rec[k][..., 0] - base[..., 0]) * mask)[box], cmap="gray", vmin=0,
                                          vmax=gmax / err_gain),
                         (lambda k: lambda t: (np.abs(rec[k][..., t] - base[..., t]) * mask)[box])(k)))
-        axs[0, c].set_title(title, fontsize=8)
+        axs[0, c].set_title(title, fontsize=fs)
         upd.append((axs[0, c].imshow(rec[k][..., 0][box], cmap="gray", vmin=0, vmax=gmax),
                     (lambda k: lambda t: rec[k][..., t][box])(k)))
         for i, ch in enumerate(channels, start=1 + de):
             upd.append((axs[i, c].imshow(complex_to_rgb(csm[k][ch, ..., 0][box], 1.0, mask[box])),
                         (lambda k, ch: lambda t: complex_to_rgb(csm[k][ch, ..., t][box], 1.0, mask[box]))(k, ch)))
-    axs[0, c0].set_ylabel("Reconstruction", fontsize=8)
+    axs[0, c0].set_ylabel("Reconstruction", fontsize=fs)
     if de:
-        axs[1, c0].set_ylabel(f"|error| ×{err_gain:g}", fontsize=8)
+        axs[1, c0].set_ylabel(f"|error| ×{err_gain:g}", fontsize=fs)
     for i, ch in enumerate(channels, start=1 + de):
-        axs[i, c0].set_ylabel(f"Coil {ch + 1}", fontsize=8)
-    lab = fig.text(0.5, 0.005, "", ha="center", fontsize=7, color="0.3")
+        axs[i, c0].set_ylabel(f"Coil {ch + 1}", fontsize=fs)
+    lab = fig.text(0.5, 0.005, "", ha="center", fontsize=fs * 0.85, color="0.3")
     fig.tight_layout(pad=0.2, h_pad=0.1, w_pad=0.1, rect=(0, 0.03, 1, 1))
 
     def draw(t):
