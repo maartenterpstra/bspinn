@@ -8,7 +8,9 @@ version = "0.59.0"
 description = "Coil sensitivity estimation with differentiable Biot–Savart current loops and a physics-informed neural network (experimental)"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Maarten Terpstra" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Maarten Terpstra", email = "m.l.terpstra-5@umcutrecht.nl" }]
 keywords = ["MRI", "parallel imaging", "coil sensitivity", "Biot-Savart", "PINN", "SENSE"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -42,7 +44,7 @@ bspinn = "bspinn.cli:main"
 packages = ["bspinn"]
 
 [tool.hatch.build.targets.sdist]
-include = ["bspinn", "scripts", "tests", "docs", "README.md", "pyproject.toml"]
+include = ["bspinn", "scripts", "tests", "docs", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

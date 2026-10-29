@@ -21,7 +21,7 @@ Requires Python ≥ 3.10. GPU (CUDA) strongly recommended; the CPU works but is 
 With [uv](https://docs.astral.sh/uv/), from a clone (recommended for running the scripts and tests):
 
 ```bash
-git clone https://github.com/<owner>/bspinn.git
+git clone https://github.com/maartenterpstra/bspinn.git
 cd bspinn
 uv sync --extra all          # creates .venv with bspinn + all optional dependencies
 uv run pytest                # optional: the test suite (slow on CPU)
@@ -30,9 +30,9 @@ uv run pytest                # optional: the test suite (slow on CPU)
 Or install it into an existing environment / project:
 
 ```bash
-uv pip install "bspinn[all] @ git+https://github.com/<owner>/bspinn.git"
+uv pip install "bspinn[all] @ git+https://github.com/maartenterpstra/bspinn.git"
 # in a uv project:
-uv add "bspinn[all] @ git+https://github.com/<owner>/bspinn.git"
+uv add "bspinn[all] @ git+https://github.com/maartenterpstra/bspinn.git"
 ```
 
 PyTorch: on Linux the default PyPI wheel includes CUDA. For a specific CUDA version, or to let uv detect
@@ -150,4 +150,4 @@ results by version (the code refers to its sections as §1–§8).
 
 ## License
 
-No license has been chosen yet; all rights reserved until one is added.
+MIT; see [LICENSE](LICENSE).
