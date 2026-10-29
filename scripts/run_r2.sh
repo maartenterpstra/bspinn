@@ -3,7 +3,7 @@
 # Run from the folder that contains bspinn/ and runs/ (the same place as run_all.sh; it reuses the cached maps of
 # runs/eval_v56):
 #
-#   BASE=/home/ds.umcutrecht.nl/mterpst5/netwerkschijven BRAIN=/localscratch/mterpst5 \
+#   BASE=/path/to/fastMRI BRAIN=/path/to/brain_planes \
 #       nohup bash bspinn/scripts/run_r2.sh > runs/run_r2.log 2>&1 &
 #
 # Steps (STEPS, default all):

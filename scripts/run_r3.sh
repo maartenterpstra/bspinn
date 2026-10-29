@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Round-3 follow-up (v58), after run_r2.sh: adds only what is new, resume-safe. Run from the same folder:
 #
-#   BASE=/smb/user/mterpst5/DS-Data/Radiotherapie/Research/Project/fastMRI_NYU \
+#   BASE=/path/to/fastMRI \
 #       bash bspinn/scripts/run_r3.sh 2>&1 | tee runs/run_r3.log
 #
 #   image    the phase constraint switched per slice by CV (tv_phase_auto, tgv_phase_auto); appended to

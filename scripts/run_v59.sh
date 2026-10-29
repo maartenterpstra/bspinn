@@ -3,7 +3,7 @@
 # round 2-4 results included. Resume-safe: re-running skips what is done; a failing step is logged and the next
 # one runs. Run from the folder that contains bspinn/ and runs/ (the same place as run_all.sh):
 #
-#   BASE=/smb/user/mterpst5/DS-Data/Radiotherapie/Research/Project/fastMRI_NYU BRAIN=/localscratch/mterpst5 \
+#   BASE=/path/to/fastMRI BRAIN=/path/to/brain_planes \
 #       bash bspinn/scripts/run_v59.sh 2>&1 | tee runs/run_v59.log
 #
 # Steps (STEPS, default all): static prior ocmr ocmr_us poles bundle. Output for me: dashboard_data.json.

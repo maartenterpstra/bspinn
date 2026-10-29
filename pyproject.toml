@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bspinn"
+version = "0.59.0"
+description = "Coil sensitivity estimation with differentiable Biot–Savart current loops and a physics-informed neural network (experimental)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Maarten Terpstra" }]
+keywords = ["MRI", "parallel imaging", "coil sensitivity", "Biot-Savart", "PINN", "SENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "torch>=2.1",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+# reading fastMRI / HDF5 k-space
+fastmri = ["h5py>=3.8"]
+# OCMR cardiac cines (ISMRMRD)
+ocmr = ["ismrmrd>=1.14", "h5py>=3.8"]
+# non-Cartesian (radial, spiral) via MRI-NUFFT
+noncart = ["mri-nufft>=0.10", "finufft>=2.2"]
+# evaluation scripts: SSIM, figures, GIFs
+eval = ["scikit-image>=0.21", "h5py>=3.8", "pillow>=10"]
+all = ["bspinn[fastmri,ocmr,noncart,eval]"]
+dev = ["bspinn[all]", "pytest>=7"]
+
+[project.scripts]
+bspinn = "bspinn.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bspinn"]
+
+[tool.hatch.build.targets.sdist]
+include = ["bspinn", "scripts", "tests", "docs", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

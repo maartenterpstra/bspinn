@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # All evaluations for the benchmark dashboard, one after another, then the bundle (dashboard_data.json).
 # Every step is resume-safe: re-running the script skips what is done. A failing step is logged and the
-# next one runs. Run from the folder that contains bspinn/ (e.g. /localscratch/mterpst5/VibeCoiling):
+# next one runs. Run from the folder that contains bspinn/ (e.g. /path/to/workdir):
 #
-#   BASE=/home/ds.umcutrecht.nl/mterpst5/netwerkschijven BRAIN=/localscratch/mterpst5 \
+#   BASE=/path/to/fastMRI BRAIN=/path/to/brain_planes \
 #       nohup bash bspinn/scripts/run_all.sh > runs/run_all.log 2>&1 &
 #
 # Settings (environment variables, defaults in brackets):
