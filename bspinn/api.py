@@ -36,7 +36,7 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
                   support_dilate=2, undersample=None, solve_image=False, fold="auto", readout_axis="auto", plane_select="heldout",
                   image_prior="auto", image_prior_weight="auto", image_prior_options=None, dynamic_static="average",
                   dynamic_options=None, dynamic_base="2d", dynamic_validate="auto",
-                  refine="auto", refine_options=None,
+                  refine="auto", refine_options=None, conj_check=True,
                   **cfg_overrides):
     """Estimate coil sensitivity maps from Cartesian multi-coil k-space.
 
@@ -151,8 +151,16 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         calibration fit, maps and image are refined together on ALL acquired k-space (the maps stay
         physics-constrained; the image is solved by CG-SENSE inside the acquired k-space extent at every
         step). Implies ``return_image``; the returned image is that joint solution. 2-D (and dynamic
-        with rank=0) only. Iterations: ``iters_joint`` (default 300), image regularisation
-        ``lambda_joint_img`` (relative, default 1e-2).
+        with rank=0): iterations ``iters_joint`` (default 300), image regularisation ``lambda_joint_img``
+        (relative, default 1e-2). 3-D: the volumetric Biot-Savart / PINN fit followed by the 3-D IRGNM
+        (NLINV-style Gauss-Newton on image and Sobolev-weighted map corrections over all acquired samples,
+        ``refine_options``); the returned image is the IRGNM image with ``image_prior=None``, otherwise it is
+        recomputed with the prior for the refined maps (default 'auto' = 3-D TGV) and the IRGNM image is kept in
+        ``info['image_irgnm']``.
+    conj_check : 3-D, default True. After the fit, the maps and their complex conjugates are compared on the
+        calibration coil images (``conjugation_check``: model-free SENSE-1 residual). If the conjugate explains
+        the data better, the B1- handedness (or the B0 axis that came with it) was picked wrongly, and the fit is
+        repeated with the opposite handedness; the better of the two is kept. ``info['conjugation_check']``.
     fold : 'auto' (default) | False. Objects larger than the field of view fold over: tissue beyond one
         edge appears at the opposite edge, seen by the coils on the far side. Physical maps are not periodic,
         so they would give that band the wrong coils (stripes in undersampled SENSE). 'auto' (2-D) compares,
@@ -273,9 +281,11 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         raise ValueError("compress is not supported by estimate_maps (maps are returned for the input channels)")
     cfg._fold = fold if layout == "2d" else False
     cfg._plane_select = plane_select
-    if solve_image:
-        if layout == "3d":
-            raise ValueError("solve_image is implemented for 2-D (and dynamic with rank=0) data")
+    if solve_image and layout == "3d":            # joint image + maps: volumetric fit, then the 3-D IRGNM
+        return_image = True
+        if refine in ("auto", None):
+            refine = "irgnm"
+    elif solve_image:
         if layout == "dynamic" and rank != 0:
             raise ValueError("solve_image with dynamic data needs rank=0 (one static map set)")
         cfg.joint_full = True
@@ -303,6 +313,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
         C, info = _run_2d(ksp, mask, spacing, plane, noise, cfg, log)
     elif layout == "3d":
         C, info = _run_3d(ksp, mask, spacing, axes, noise, cfg, log)
+        if conj_check:
+            C, info = _conj_guard(C, info, ksp, mask, spacing, noise, cfg, log)
     else:
         C, info = _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log, dynamic_static,
                                dynamic_options)
@@ -313,8 +325,8 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     M = prob.data.meta.get("mix")
     if refine == "auto":                 # v59 default: IRGNM refinement for 2-D (README 8.15), none otherwise
         refine = "irgnm" if layout == "2d" else None
-    if refine is not None and (refine != "irgnm" or layout != "2d"):
-        raise ValueError("refine='irgnm' is implemented for 2-D data")
+    if refine is not None and (refine != "irgnm" or layout == "dynamic"):
+        raise ValueError("refine='irgnm' is implemented for 2-D and 3-D data")
     fold_maps = info.pop("_fold_maps", None) or {}
     if M is not None:
         Minv = np.linalg.inv(np.asarray(M))
@@ -341,8 +353,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
             kw = ksp if Md is None else np.einsum("ij,j...->i...", Md, ksp)
             mr = (np.abs(ksp).sum(0) > 0) if mask is None else np.asarray(mask, bool)
             ro = {**REFINE_DEFAULTS, **(refine_options or {})}
-            Cd, _, info["refine"] = irgnm_refine(kw, Cd, mr, device=device, seed=seed, **ro)
+            Cd, x_ir, info["refine"] = irgnm_refine(kw, Cd, mr, device=device, seed=seed, **ro)
             C = Cd if Md is None else np.einsum("ij,j...->i...", np.linalg.inv(Md), Cd)
+            if layout == "3d" and solve_image:      # the joint image (y ~ F(Cd x)); to the returned maps' gauge below
+                info["_x_irgnm"], info["_C_irgnm"] = x_ir, C
             log(f"IRGNM refinement: {info['refine']['steps']} Gauss-Newton steps")
         if info.pop("_xfull", None) is not None:  # the joint image belongs to the unrefined maps: recomputed below
             info["image_solved_jointly"] = False
@@ -358,6 +372,10 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     with accel.phase("finish"):
         C = _finish(C, sup, layout, phase_ref, normalise, device)
     x_solved = None
+    if info.get("_x_irgnm") is not None:       # 3-D joint image in the convention of the finished maps
+        Cr = info.pop("_C_irgnm")
+        g = (Cr.conj() * C).sum(0) / np.maximum((np.abs(Cr) ** 2).sum(0), 1e-30)
+        x_solved = (info.pop("_x_irgnm") / np.where(np.abs(g) > 0, g, 1)).astype(np.complex64)
     xf = info.pop("_xfull", None)
     if xf is not None:                         # joint full-resolution image, in the convention of the maps
         f = np.asarray(xf) * prob.scale
@@ -390,7 +408,13 @@ def estimate_maps(ksp, layout="2d", *, coil_axis=0, mask=None, spacing=None, pla
     C = C.astype(np.complex64)
     if not return_image:
         return C, info
-    if x_solved is not None and image_prior is not None:      # maps jointly; the returned image with the prior
+    if x_solved is not None and layout == "3d":
+        if image_prior is None:
+            info["image_solved_jointly"] = True
+            return C, x_solved, info
+        info["image_solved_jointly"] = False                   # maps jointly; the returned image with the prior
+        info["image_irgnm"] = x_solved
+    elif x_solved is not None and image_prior is not None:     # maps jointly; the returned image with the prior
         info["image_solved_jointly"] = False
         info["image_prior_joint" if info.get("joint_prior") else "image_tikhonov_joint"] = x_solved
     elif x_solved is not None and (not isinstance(sense_lambda, str) or layout == "2d"):
@@ -594,6 +618,74 @@ def _run_3d(ksp, mask, spacing, axes, noise, cfg, log):
     return C, info
 
 
+def conjugation_check(ksp, maps, mask=None, calib=24, coil_axis=0, noise=None, threshold=0.1):
+    """Are ``maps`` (or their complex conjugates) the sensitivities of ``ksp``? Model-free, 2-D or 3-D.
+
+    Low-resolution coil images I_j from the acquired samples in the central ``calib`` box (Hann window), and the
+    SENSE-1 residual of each map set on the object (low-resolution RSS > ``threshold`` x its 99th percentile):
+
+        r(C) = sum_obj ( ||I||^2 - |C^H I|^2 / ||C||^2 ) / sum_obj ||I||^2
+
+    i.e. the fraction of the coil-image energy that no image value times C explains. Correct maps leave only the
+    blur of the low-resolution images and noise; conjugated maps (wrong B1- handedness, or a k-space / image
+    convention mismatch) give a much larger residual. Use it on any maps (PINN, ESPIRiT, NLINV) to see which
+    convention the data follow. ``noise`` (samples, coils): prewhiten data and maps first.
+
+    Returns dict(residual, residual_conj, ratio = residual_conj / residual, conjugated = residual_conj < residual).
+    """
+    k = np.moveaxis(np.asarray(ksp), coil_axis, 0)
+    C = np.moveaxis(np.asarray(maps), coil_axis, 0)
+    if C.shape != k.shape:
+        raise ValueError(f"maps {C.shape} and k-space {k.shape} must have the same shape")
+    if noise is not None:
+        n = np.asarray(noise).reshape(-1, k.shape[0])
+        L = np.linalg.inv(np.linalg.cholesky((n.conj().T @ n) / n.shape[0]))
+        k = np.einsum("ij,j...->i...", L, k); C = np.einsum("ij,j...->i...", L, C)
+    m = (np.abs(k).sum(0) > 0) if mask is None else np.asarray(mask, bool)
+    w = np.ones(m.shape)
+    for a, n_ in enumerate(m.shape):
+        c = min(int(calib), n_)
+        h = np.zeros(n_); h[n_ // 2 - c // 2: n_ // 2 - c // 2 + c] = np.hanning(c + 2)[1:-1]
+        w = w * h.reshape([-1 if i == a else 1 for i in range(m.ndim)])
+    ax = tuple(range(1, k.ndim))
+    I = _cfft(k * (m * w)[None], ax, inverse=True)
+    rss2 = (np.abs(I) ** 2).sum(0)
+    obj = rss2 > (threshold * np.percentile(np.sqrt(rss2), 99)) ** 2
+    tot = rss2[obj].sum()
+
+    def r(Cm):
+        Cm = Cm[:, obj]; Io = I[:, obj]
+        den = np.maximum((np.abs(Cm) ** 2).sum(0), 1e-30)
+        return float((rss2[obj] - np.abs((Cm.conj() * Io).sum(0)) ** 2 / den).sum() / max(tot, 1e-30))
+    r0, r1 = r(C), r(C.conj())
+    return {"residual": r0, "residual_conj": r1, "ratio": r1 / max(r0, 1e-30), "conjugated": bool(r1 < r0)}
+
+
+def _conj_guard(C, info, ksp, mask, spacing, noise, cfg, log):
+    """3-D: refit with the opposite handedness when the conjugated maps explain the calibration data better."""
+    calib = max(cfg.calib) if isinstance(cfg.calib, (tuple, list)) else cfg.calib
+    chk = conjugation_check(ksp, C, mask, calib=calib, noise=noise)
+    info["conjugation_check"] = dict(chk, refit=False)
+    if not chk["conjugated"]:
+        return C, info
+    h = int(info["handedness"])
+    log(f"conjugation check: the conjugated maps fit the calibration data better (residual {chk['residual_conj']:.3g}"
+        f" vs {chk['residual']:.3g}); refitting with handedness {-h:+d}")
+    h0 = cfg.handedness
+    cfg.handedness = -h
+    try:
+        C2, info2 = _run_3d(ksp, mask, spacing, info["orientation"], noise, cfg, log)
+    finally:
+        cfg.handedness = h0
+    chk2 = conjugation_check(ksp, C2, mask, calib=calib, noise=noise)
+    if chk2["residual"] < chk["residual"]:
+        info2["conjugation_check"] = dict(chk2, refit=True, kept="refit", first=chk)
+        return C2, info2
+    log("conjugation check: the refit did not fit better; keeping the first fit (check the data convention)")
+    info["conjugation_check"] = dict(chk, refit=True, kept="first", second=chk2)
+    return C, info
+
+
 def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log, static="average", options=None):
     from .data import MultiCoilData
     from .geometry import SliceGeometry
@@ -664,6 +756,7 @@ def _run_dynamic(ksp, mask, spacing, plane, noise, cfg, rank, iters_dynamic, log
 # v59 defaults (README 8.13-8.15, GPU checks on 20 dataloader slices, 9 OCMR cines, the brain phase-pole planes)
 REFINE_DEFAULTS = {"holdout": 0, "steps": 12, "x_ref": "zero"}          # refine='irgnm' / 'auto'
 PRIOR_2D_DEFAULT = ("tgv", {"phase": "auto", "phase_weight": 0.3})      # sense_image(prior='auto'), 2-D
+PRIOR_3D_DEFAULT = ("tgv", {})                                           # sense_image(prior='auto'), 3-D (v60)
 PRIOR_DYN_DEFAULT = {"spatial_on": "difference"}                         # sense_image(prior='auto'), dynamic
 
 
@@ -1229,7 +1322,10 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
     'phase_weight': 0.3} (TGV^2 + the soft low-resolution phase constraint, switched on or off per slice by
     cross-validation; your prior_options override these); dynamic -> spatio-temporal TV with spatial TV of each
     frame's difference from the time average (bspinn.prior.dynamic_prior_image, spatial_on='difference'; options
-    spatial_ratio, spatial_on, ...), per-frame SENSE-1 when every frame is fully sampled; 3-D -> Tikhonov.
+    spatial_ratio, spatial_on, ...), per-frame SENSE-1 when every frame is fully sampled; 3-D (v60) -> 'tgv'
+    (bspinn.prior3d: TGV^2 over the three axes, weight by k-space cross-validation on a slab of readout positions;
+    prior_options: iters, cg_iters, ratio, cv_options={'cv_slab': 24, 'holdout': 0.1, 'folds': 2, 'calib': 24});
+    3-D also takes prior='tv'.
     ``prior=None``: Tikhonov (CG-SENSE with ``lam``).
     Other priors replace the Tikhonov term (2-D): 'tv' (total variation), 'wavelet' (orthonormal db4,
     coarsest band free), 'tv+wavelet' (bspinn.prior; ADMM), with ``prior_weight`` a relative number or
@@ -1264,8 +1360,9 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
         elif ksp.ndim == 3:
             prior, po_ = PRIOR_2D_DEFAULT
             prior_options = {**po_, **(prior_options or {})}
-        else:
-            prior = None                     # 3-D: Tikhonov (no prior implemented)
+        else:                                # 3-D (v60): TGV^2, weight by cross-validation on a readout slab
+            prior, po_ = PRIOR_3D_DEFAULT
+            prior_options = {**po_, **(prior_options or {})}
     if layout == "dynamic":
         ms = [None if mask is None else mask[..., t] for t in range(ksp.shape[-1])]
         reps = [{} for _ in range(ksp.shape[-1])]
@@ -1282,9 +1379,18 @@ def sense_image(ksp, maps, layout="2d", mask=None, noise=None, lam=1e-3, iters=6
     box = np.ones(m.shape, bool) if extrapolate else acquired_extent(m)
     if (m | ~box).all():
         return ((C.conj() * _cfft(ksp * m[None], ax, True)).sum(0) / np.maximum(den, 1e-12)).astype(np.complex64)
+    if prior is not None and ksp.ndim == 4:
+        if prior not in ("tgv", "tv"):
+            raise ValueError("3-D priors: 'tgv' or 'tv'")
+        from .prior3d import prior_image_3d
+        po = dict(prior_options or {})
+        x = prior_image_3d(ksp, C, m, prior, prior_weight, device=device, report=report, **po)
+        if not box.all():
+            x = _cfft(_cfft(x, (0, 1, 2)) * box, (0, 1, 2), True)
+        return x.astype(np.complex64)
     if prior is not None:
         if ksp.ndim != 3:
-            raise ValueError("prior= is implemented for 2-D images")
+            raise ValueError("prior= is implemented for 2-D and 3-D images")
         po = dict(prior_options or {})
         if str(prior).startswith("net:"):
             from .unrolled import load_network, reconstruct

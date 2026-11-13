@@ -108,9 +108,27 @@ image = sense_image_noncart(y, maps, traj, (n, n), prior="tv", device="cuda")
 
 ### 3D
 
-`estimate_maps(ksp, "3d", spacing=(dx, dy, dz), axes="auto")` for (coils, x, y, z) data;
-`physics="helmholtz"` uses a wave-aware (full-wave) correction. 3D and Helmholtz are implemented but have
-not been evaluated as thoroughly as 2D.
+```python
+from bspinn.api import estimate_maps, sense_image, conjugation_check
+
+# maps only                                       ksp: (coils, x, y, z), mask: (x, y, z) bool
+maps, info = estimate_maps(ksp, "3d", mask=mask, spacing=(dx, dy, dz), axes="auto", device="cuda")
+
+# maps and image jointly: the volumetric fit, then 3D IRGNM (NLINV-style) on all acquired samples;
+# image_prior=None returns the IRGNM image, the default ('auto') a TGV image with the refined maps
+maps, image, info = estimate_maps(ksp, "3d", mask=mask, spacing=(dx, dy, dz), solve_image=True, device="cuda")
+
+# image for given maps: 3D TGV, weight by k-space cross-validation (prior=None: Tikhonov CG-SENSE)
+image = sense_image(ksp, maps, "3d", mask=mask, device="cuda")
+
+# do maps (any method) follow the data's convention, or their complex conjugates?
+print(conjugation_check(ksp, maps, mask=mask))     # 'conjugated': True means the conjugate fits better
+```
+
+`estimate_maps` runs this check after a 3D fit and refits with the opposite handedness when the conjugate fits
+better (`info['conjugation_check']`). `physics="helmholtz"` uses a wave-aware (full-wave) correction. 3D and
+Helmholtz are implemented but have not been evaluated as thoroughly as 2D; the 3D IRGNM needs about ten
+coil-volume arrays of GPU memory (32 coils × 256 × 256 × 128: ~20 GB).
 
 ### Command line
 

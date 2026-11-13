@@ -1,4 +1,4 @@
-"""PINN-anchored IRGNM refinement of 2-D coil maps (NLINV's Gauss-Newton solver, started from the PINN).
+"""PINN-anchored IRGNM refinement of 2-D or 3-D coil maps (NLINV's Gauss-Newton solver, started from the PINN).
 
 Unknowns: the image x and a Sobolev-weighted free correction d of every map,
 
@@ -20,6 +20,9 @@ the image re-solved from the training samples), and the full-data path is then r
 
     from bspinn.irgnm import irgnm_refine
     C, x, info = irgnm_refine(ksp, C_pinn, mask)          # ksp pre-whitened, (N, H, W); mask (H, W) bool
+    C, x, info = irgnm_refine(ksp, C_pinn, mask)          # 3-D: ksp (N, D, H, W), mask (D, H, W)
+
+3-D memory: about 10 coil-volume arrays in complex64 (32 coils x 256 x 256 x 128: ~20 GB).
 """
 import math
 
@@ -27,12 +30,17 @@ import numpy as np
 import torch
 
 
+_DIMS = [(-2, -1)]            # spatial dims of the current problem (set by irgnm_refine: 2-D or 3-D)
+
+
 def _F(x):
-    return torch.fft.fftshift(torch.fft.fft2(torch.fft.ifftshift(x, dim=(-2, -1)), norm="ortho"), dim=(-2, -1))
+    d = _DIMS[0]
+    return torch.fft.fftshift(torch.fft.fftn(torch.fft.ifftshift(x, dim=d), dim=d, norm="ortho"), dim=d)
 
 
 def _Fh(k):
-    return torch.fft.fftshift(torch.fft.ifft2(torch.fft.ifftshift(k, dim=(-2, -1)), norm="ortho"), dim=(-2, -1))
+    d = _DIMS[0]
+    return torch.fft.fftshift(torch.fft.ifftn(torch.fft.ifftshift(k, dim=d), dim=d, norm="ortho"), dim=d)
 
 
 def _dot(a, b):
@@ -52,10 +60,12 @@ def _cg(A, b, iters):
     return x
 
 
-def sobolev_weight(H, W, a=220.0, b=32.0, device="cpu"):
-    ky = (torch.arange(H, device=device, dtype=torch.float32) - H // 2) / H
-    kx = (torch.arange(W, device=device, dtype=torch.float32) - W // 2) / W
-    k2 = ky[:, None] ** 2 + kx[None, :] ** 2
+def sobolev_weight(*shape, a=220.0, b=32.0, device="cpu"):
+    """(1 + a |k|^2)^(-b/2) on a grid of ``shape`` (2-D or 3-D), k in cycles / FOV-pixel."""
+    k2 = 0.0
+    for i, n in enumerate(shape):
+        k = (torch.arange(n, device=device, dtype=torch.float32) - n // 2) / n
+        k2 = k2 + (k ** 2).view([-1 if j == i else 1 for j in range(len(shape))])
     return (1.0 + a * k2) ** (-b / 2)
 
 
@@ -108,7 +118,8 @@ def _path(y, M, C0, x0, w, alphas, cg_iters, x_weight, Mho=None, xref=None):
 def irgnm_refine(ksp, C0, mask, x0=None, *, steps=8, alpha0=1.0, q=0.5, cg_iters=30, sobolev=(220.0, 32.0),
                  x_weight=1.0, holdout=0.0, folds=1, max_steps=12, lam_x0=1e-2, seed=0, device="cpu",
                  x_ref="pinn"):
-    """Refine maps C0 (N, H, W) on the (pre-whitened) undersampled k-space ksp (N, H, W), mask (H, W).
+    """Refine maps C0 (N, H, W) or (N, D, H, W) on the (pre-whitened) undersampled k-space ksp of the same shape,
+    mask (H, W) / (D, H, W).
 
     holdout > 0: choose the number of Gauss-Newton steps (0..max_steps) by held-out prediction of that fraction
     of the acquired locations (``folds`` disjoint draws, errors summed), then run the full-data path that far.
@@ -122,13 +133,16 @@ def irgnm_refine(ksp, C0, mask, x0=None, *, steps=8, alpha0=1.0, q=0.5, cg_iters
     mask = np.asarray(mask, bool)
     Mfull = torch.as_tensor(mask, device=dev).to(torch.complex64)[None]
     C = torch.as_tensor(np.asarray(C0), dtype=torch.complex64, device=dev)
-    N, H, W = C.shape
+    N, sp = C.shape[0], tuple(C.shape[1:])
+    if len(sp) not in (2, 3):
+        raise ValueError("irgnm_refine: maps must be (N, H, W) or (N, D, H, W)")
+    _DIMS[0] = tuple(range(-len(sp), 0))
     rss = (C.abs() ** 2).sum(0).sqrt()
     rs_in = rss.clone()
     Cn = C / torch.clamp(rss, min=1e-12 * float(rss.max()))[None]          # RSS 1 (unit-norm channel vectors)
     sy = 100.0 / float((y * Mfull).abs().pow(2).sum().sqrt())
     y = y * Mfull * sy
-    w = sobolev_weight(H, W, *sobolev, device=dev)
+    w = sobolev_weight(*sp, a=sobolev[0], b=sobolev[1], device=dev)
     info = {"alpha0": alpha0, "q": q, "sobolev": list(sobolev), "cg_iters": cg_iters}
 
     def start(M):
@@ -146,8 +160,8 @@ def irgnm_refine(ksp, C0, mask, x0=None, *, steps=8, alpha0=1.0, q=0.5, cg_iters
         perm = rng.permutation(acq)
         nho = int(round(holdout * acq.size))
         for f in range(folds):
-            ho = np.zeros(H * W, bool); ho[perm[f * nho:(f + 1) * nho]] = True
-            ho = ho.reshape(H, W)
+            ho = np.zeros(mask.size, bool); ho[perm[f * nho:(f + 1) * nho]] = True
+            ho = ho.reshape(mask.shape)
             Mho = torch.as_tensor(ho, device=dev).to(torch.complex64)[None]
             Mtr = Mfull * (1 - Mho)
             xs, Cs = start(Mtr)
